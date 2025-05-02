@@ -5,3 +5,10 @@ edition = "2021"
 
 [dependencies]
 memmap2 = "0.9.5"
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[[bench]]
+name = "bench"
+harness = false

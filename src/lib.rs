@@ -5,6 +5,8 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+pub const HEADER_SIZE: usize = core::mem::size_of::<SharedQueueHeader>();
+
 const WRAP_MARKER: u32 = 0xFFFF_FFFF;
 
 #[repr(C)]
@@ -13,7 +15,7 @@ struct SharedQueueHeader {
     tail: CacheAlignedAtomicSize,
 }
 
-struct SharedQueue {
+pub struct SharedQueue {
     mmap: MmapMut,
     buffer_start: usize,
     buffer_size: usize,
@@ -42,61 +44,95 @@ impl SharedQueue {
         index % self.buffer_size
     }
 
-    pub fn try_enqueue(&mut self, data: &[u8]) -> bool {
-        let len = data.len();
-        let total = len + 4;
-
+    /// Get a buffer of `size` bytes to write into.
+    pub fn reserve(&mut self, size: usize) -> Option<*mut u8> {
+        let contiguous_size = size.wrapping_add(core::mem::size_of::<u32>());
         let head = self.header().head.load(Ordering::Acquire);
-        let tail = self.header().tail.load(Ordering::Relaxed);
+        let mut tail = self.header().tail.load(Ordering::Relaxed);
 
-        let free_space = if tail >= head {
-            self.buffer_size - (tail - head)
-        } else {
-            head - tail
-        };
+        let remaining = self.buffer_size.wrapping_sub(tail.wrapping_sub(head));
 
-        // Additional 4 for wrap marker if needed.
-        if total + 4 > free_space {
-            return false; // not enough space
+        // This does NOT consider if we must wrap around.
+        if remaining < contiguous_size {
+            return None;
         }
 
-        let pos = self.mask(tail);
-        let remaining = self.buffer_size - pos;
         let buf = self.buffer_ptr();
 
-        if remaining < total {
-            // Write a wrap marker.
-            // TODO: is this guaranteed to be aligned?
-            //       IF not we should probably make it so.
+        // We must now consider if we need to wrap around.
+        let mut starting_pos = self.mask(tail);
+        let remaining_before_wrap = self.buffer_size.wrapping_sub(starting_pos);
+
+        // If we have exactly enough space to write the (len, message) then
+        // we do not need to leave room for a wrap marker.
+        let must_wrap = match remaining_before_wrap.cmp(&contiguous_size) {
+            std::cmp::Ordering::Less => {
+                // We must wrap around - write a wrap marker.
+                true
+            }
+            std::cmp::Ordering::Equal => {
+                // We have exactly enough space to write the (len, message).
+                // We do NOT need to write a wrap marker.
+                false
+            }
+            std::cmp::Ordering::Greater => {
+                // We have enough space to write the (len, message) but we
+                // must make sure we have enough space for a wrap marker
+                // after.
+                remaining_before_wrap.wrapping_sub(contiguous_size) < core::mem::size_of::<u32>()
+            }
+        };
+
+        if must_wrap {
+            // If we must wrap. Before we do so we must make sure we have enough room
+            // AFTER we wrap around.
+            let remaining_after_wrap = remaining.wrapping_sub(remaining_before_wrap);
+            if remaining_after_wrap < contiguous_size {
+                return None;
+            }
+
+            // Write the wrap-around marker.
+            assert!(starting_pos + core::mem::size_of::<u32>() <= self.buffer_size);
             unsafe {
-                buf.add(pos).cast::<u32>().write(WRAP_MARKER);
+                buf.add(starting_pos)
+                    .cast::<u32>()
+                    .write_unaligned(WRAP_MARKER);
             }
             std::sync::atomic::fence(Ordering::Release);
-            self.header()
-                .tail
-                .store(self.mask(tail + remaining), Ordering::Release);
-            return self.try_enqueue(data); // Try again at the beginning.
+            tail = tail.wrapping_add(remaining_before_wrap);
+            starting_pos = 0;
+            // Immediately commit the tail so we do not need to cache this info for `commit`.
+            self.header().tail.store(tail, Ordering::Release);
         }
 
-        // Write the length.
-        // TODO: is this guaranteed to be aligned?
-        //       IF not we should probably make it so.
+        // If wrapped around, local variables have been updated.
+        // Otherwise, we are still at the same position.
+        // Write the size.
+        assert!(starting_pos + core::mem::size_of::<u32>() <= self.buffer_size);
         unsafe {
-            // TODO: do not use `as u32` casting!
-            buf.add(pos).cast::<u32>().write(len as u32);
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                buf.add(pos + core::mem::size_of::<u32>()),
-                data.len(),
-            );
+            buf.add(starting_pos)
+                .cast::<u32>()
+                .write_unaligned(size as u32);
         }
+        // Return a reference to the data.
+        Some(unsafe { buf.add(starting_pos + core::mem::size_of::<u32>()) })
+    }
 
+    pub fn commit_size(&mut self, size: usize) {
         std::sync::atomic::fence(Ordering::Release);
+        let tail = self.header().tail.load(Ordering::Relaxed);
+        let new_tail = tail.wrapping_add(size + core::mem::size_of::<u32>());
+        self.header().tail.store(new_tail, Ordering::Release);
+    }
 
-        self.header()
-            .tail
-            .store(self.mask(tail + total), Ordering::Release);
-
+    pub fn try_enqueue(&mut self, data: &[u8]) -> bool {
+        let Some(reserved_buffer) = self.reserve(data.len()) else {
+            return false;
+        };
+        unsafe {
+            reserved_buffer.copy_from_nonoverlapping(data.as_ptr(), data.len());
+        }
+        self.commit_size(data.len());
         true
     }
 
@@ -111,11 +147,13 @@ impl SharedQueue {
         let mut pos = self.mask(head);
         let buf = self.buffer_ptr();
 
-        let marker = unsafe { buf.cast::<u32>().read_unaligned() };
+        let marker = unsafe { buf.add(pos).cast::<u32>().read_unaligned() };
         if marker == WRAP_MARKER {
             // move head to 0 and retry.
             std::sync::atomic::fence(Ordering::Acquire);
-            head = self.mask(head + (self.buffer_size - pos)); // move to 0
+
+            // wrap-around marker moves head to next increment of buffer-size.
+            head = head.wrapping_add(self.buffer_size - self.mask(head));
             self.header().head.store(head, Ordering::Release);
             pos = self.mask(head);
         }
@@ -125,15 +163,19 @@ impl SharedQueue {
 
         assert!(
             payload_pos + len <= self.buffer_size,
-            "message would wrap buffer"
+            "message would wrap buffer. {} {} {}",
+            payload_pos,
+            len,
+            self.buffer_size
         );
 
         let data = unsafe { core::slice::from_raw_parts(buf.add(payload_pos), len) };
 
         std::sync::atomic::fence(Ordering::Acquire);
-        self.header()
-            .head
-            .store(self.mask(payload_pos + len), Ordering::Release);
+        self.header().head.store(
+            head.wrapping_add(len + core::mem::size_of::<u32>()),
+            Ordering::Release,
+        );
         Some(data)
     }
 }
@@ -244,17 +286,22 @@ mod tests {
     fn test_shared_queue_wrap_around() {
         let path = "/tmp/test_shared_queue_wrap_around";
         let _ = std::fs::remove_file(path);
-        let mut queue = SharedQueue::new(create_mmap(path, 1000));
+        let mut queue = SharedQueue::new(create_mmap(path, 128));
 
         // Put message in and pop out so that there is room at the beginnning of the buffer.
-        assert!(queue.try_enqueue(&[5; 500]));
+        assert!(queue.try_enqueue(&[5; 64]));
         assert!(queue.try_dequeue().is_some());
 
-        // 500 remaining bytes.
-        assert!(!queue.try_enqueue(&[5; 500])); // not enough space because we cannot write the wrap marker.
-        assert!(!queue.try_enqueue(&[5; 500])); // not enough space for the wrap marker and the message.
-        assert!(queue.try_enqueue(&[5; 496])); // enough space for the wrap marker and the message.
-        assert!(!queue.try_enqueue(&[0; 1])); // not enough space for even a single byte (actually 5).
+        // The head is at 68 bytes (64 + 4 for length).
+
+        // There are 60 bytes at the beginning of the buffer, and 64 bytes remaining at the end.
+        assert!(!queue.try_enqueue(&[5; 100])); // Not enough space to write contiguously.
+        assert!(!queue.try_enqueue(&[5; 68])); // Not enough space to write contiguously with the size.
+        assert!(queue.try_enqueue(&[5; 64])); // This should work - we do not need to wrap around.
+
+        // The head is now back at 68.
+        assert_eq!(queue.header().head.load(Ordering::Acquire) % 128, 68);
+        assert_eq!(queue.header().tail.load(Ordering::Acquire) % 128, 68);
     }
 
     #[test]
