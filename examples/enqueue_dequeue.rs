@@ -1,4 +1,16 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 fn main() {
+    let exit = Arc::new(AtomicBool::new(false));
+    ctrlc::set_handler({
+        let exit = exit.clone();
+        move || exit.store(true, Ordering::Relaxed)
+    })
+    .unwrap();
+
     let map_path = "/mnt/hugepages/shaq_enqueue_dequeue";
     let _ = std::fs::remove_file(map_path);
 
@@ -14,27 +26,32 @@ fn main() {
 
     let recver_hdl = std::thread::Builder::new()
         .name("shaqRecver".to_string())
-        .spawn(move || run_recver(recver))
+        .spawn({
+            let exit = exit.clone();
+            move || run_recver(recver, exit)
+        })
         .unwrap();
 
     let sender_hdl = std::thread::Builder::new()
         .name("shaqSender".to_string())
         .spawn(move || {
-            run_sender(sender);
+            run_sender(sender, exit);
         })
         .unwrap();
 
     recver_hdl.join().unwrap();
     sender_hdl.join().unwrap();
+
+    let _ = std::fs::remove_file(map_path);
 }
 
 #[inline(never)]
-fn run_sender(mut sender: shaq::Producer) {
+fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>) {
     const ITEM_SIZE: usize = 512;
 
     let mut sender_count = 0;
     let mut last_time = std::time::Instant::now();
-    loop {
+    while !exit.load(Ordering::Relaxed) {
         // Push in batches.
         const BYTES_PER_BATCH: usize = 100_000;
         const MESSAGES_PER_BATCH: usize = BYTES_PER_BATCH / ITEM_SIZE;
@@ -61,8 +78,8 @@ fn run_sender(mut sender: shaq::Producer) {
 }
 
 #[inline(never)]
-fn run_recver(mut recver: shaq::Consumer) {
-    loop {
+fn run_recver(mut recver: shaq::Consumer, exit: Arc<AtomicBool>) {
+    while !exit.load(Ordering::Relaxed) {
         recver.sync();
         loop {
             let x = recver.try_dequeue();
