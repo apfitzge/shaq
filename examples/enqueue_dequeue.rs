@@ -14,27 +14,28 @@ fn main() {
     let map_path = "/mnt/hugepages/shaq_enqueue_dequeue";
     let _ = std::fs::remove_file(map_path);
 
-    let sender = {
-        let mmap = shaq::create_mmap(map_path, 1024 * 1024 * 1024 - shaq::HEADER_SIZE);
-        shaq::Producer::new(mmap)
-    };
-
-    let recver = {
-        let mmap = shaq::join_mmap(map_path);
-        shaq::Consumer::new(mmap)
-    };
+    let (ptr, file_size) = shaq::create_mmap(map_path, 1024 * 1024 * 10 - shaq::HEADER_SIZE);
+    let ptr = ptr as usize;
 
     let recver_hdl = std::thread::Builder::new()
         .name("shaqRecver".to_string())
         .spawn({
             let exit = exit.clone();
-            move || run_recver(recver, exit)
+            move || {
+                let recver = {
+                    let mmap = shaq::join_mmap(map_path);
+                    shaq::Consumer::new(mmap)
+                };
+                run_recver(recver, exit)
+            }
         })
         .unwrap();
 
     let sender_hdl = std::thread::Builder::new()
         .name("shaqSender".to_string())
         .spawn(move || {
+            let ptr = ptr as *mut u8;
+            let sender = { shaq::Producer::new((ptr, file_size)) };
             run_sender(sender, exit);
         })
         .unwrap();

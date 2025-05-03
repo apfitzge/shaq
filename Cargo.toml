@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-memmap2 = "0.9.5"
+nix = { version = "0.29.0", features = ["feature", "mman"] }
 
 [dev-dependencies]
 criterion = "0.5.1"

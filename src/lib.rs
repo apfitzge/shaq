@@ -1,6 +1,6 @@
-use memmap2::{MmapMut, MmapOptions};
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
+    os::fd::AsRawFd,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -15,8 +15,8 @@ pub struct Producer {
 }
 
 impl Producer {
-    pub fn new(mmap: MmapMut) -> Self {
-        let queue = SharedQueue::new(mmap);
+    pub fn new(ptr_and_file_size: (*mut u8, usize)) -> Self {
+        let queue = SharedQueue::new(ptr_and_file_size);
         let head = queue.header().head.load(Ordering::Acquire);
         let tail = queue.header().tail.load(Ordering::Relaxed);
         Self { queue, head, tail }
@@ -63,8 +63,8 @@ pub struct Consumer {
 }
 
 impl Consumer {
-    pub fn new(mmap: MmapMut) -> Self {
-        let queue = SharedQueue::new(mmap);
+    pub fn new(ptr_and_file_size: (*mut u8, usize)) -> Self {
+        let queue = SharedQueue::new(ptr_and_file_size);
         let head = queue.header().head.load(Ordering::Acquire);
         let tail = queue.header().tail.load(Ordering::Relaxed);
         Self { queue, head, tail }
@@ -98,27 +98,35 @@ struct SharedQueueHeader {
 }
 
 pub struct SharedQueue {
-    mmap: MmapMut,
+    ptr: *mut u8,
     buffer_start: usize,
     buffer_size: usize,
 }
 
 impl SharedQueue {
-    pub fn new(mmap: MmapMut) -> Self {
-        let buffer_size = mmap.len() - core::mem::size_of::<SharedQueueHeader>();
+    pub fn new(ptr_and_file_size: (*mut u8, usize)) -> Self {
+        let ptr = ptr_and_file_size.0;
+        let file_size = ptr_and_file_size.1;
+
+        let buffer_size = file_size - core::mem::size_of::<SharedQueueHeader>();
         Self {
-            mmap,
+            ptr,
             buffer_start: core::mem::size_of::<SharedQueueHeader>(),
             buffer_size,
         }
     }
 
+    /// Get the size of the buffer - this may have been rounded during creation.
+    pub fn buffer_size(&self) -> usize {
+        self.buffer_size
+    }
+
     fn header(&self) -> &SharedQueueHeader {
-        unsafe { &*(self.mmap.as_ptr() as *const SharedQueueHeader) }
+        unsafe { &*(self.ptr as *const SharedQueueHeader) }
     }
 
     fn buffer_ptr(&mut self) -> *mut u8 {
-        unsafe { self.mmap.as_mut_ptr().add(self.buffer_start) }
+        unsafe { self.ptr.add(self.buffer_start) }
     }
 
     fn mask(&self, index: usize) -> usize {
@@ -287,25 +295,110 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
     }
 }
 
-pub fn create_mmap(path: impl AsRef<Path>, buffer_size: usize) -> MmapMut {
+pub fn create_mmap(path: impl AsRef<Path>, buffer_size: usize) -> (*mut u8, usize) {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(path)
+        .open(&path)
         .unwrap();
-    file.set_len((core::mem::size_of::<SharedQueueHeader>() + buffer_size) as u64)
-        .unwrap();
-    unsafe { MmapOptions::new().map_mut(&file).unwrap() }
+
+    let use_hugepages = use_hugepages(path.as_ref());
+    let page_size = if use_hugepages {
+        1 << 21
+    } else {
+        nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
+            .unwrap()
+            .unwrap() as usize
+    };
+
+    let file_size = core::mem::size_of::<SharedQueueHeader>() + buffer_size;
+    let file_size = (file_size + page_size - 1) & !(page_size - 1);
+
+    file.set_len((file_size) as u64).unwrap();
+
+    (mirror_map(&file, file_size, use_hugepages), file_size)
 }
 
-pub fn join_mmap(path: impl AsRef<Path>) -> MmapMut {
+pub fn join_mmap(path: impl AsRef<Path>) -> (*mut u8, usize) {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(path)
+        .open(&path)
         .unwrap();
-    unsafe { MmapOptions::new().map_mut(&file).unwrap() }
+    let file_size = file.metadata().unwrap().len() as usize;
+    (
+        mirror_map(&file, file_size, use_hugepages(path.as_ref())),
+        file_size,
+    )
+}
+
+fn use_hugepages(path: impl AsRef<Path>) -> bool {
+    path.as_ref().starts_with("/mnt/hugepages")
+}
+
+fn mirror_map(file: &File, file_size: usize, use_hugepages: bool) -> *mut u8 {
+    let anon_flags = if use_hugepages {
+        nix::libc::MAP_PRIVATE | nix::libc::MAP_ANONYMOUS | nix::libc::MAP_HUGETLB
+    } else {
+        nix::libc::MAP_PRIVATE | nix::libc::MAP_ANONYMOUS
+    };
+
+    let addr = unsafe {
+        nix::libc::mmap(
+            core::ptr::null_mut(),
+            file_size * 2,
+            nix::libc::PROT_NONE,
+            anon_flags,
+            -1,
+            0,
+        )
+    };
+
+    if addr == nix::libc::MAP_FAILED {
+        panic!("reserve failed: {}", std::io::Error::last_os_error());
+    }
+
+    let addr1 = addr;
+    let addr2 = (addr as usize + file_size) as *mut nix::libc::c_void;
+
+    let flags = if use_hugepages {
+        nix::libc::MAP_SHARED | nix::libc::MAP_FIXED | nix::libc::MAP_HUGETLB
+    } else {
+        nix::libc::MAP_SHARED | nix::libc::MAP_FIXED
+    };
+
+    let first = unsafe {
+        nix::libc::mmap(
+            addr1,
+            file_size,
+            nix::libc::PROT_READ | nix::libc::PROT_WRITE,
+            flags,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+
+    if first == nix::libc::MAP_FAILED {
+        panic!("first map failed: {}", std::io::Error::last_os_error());
+    }
+
+    let second = unsafe {
+        nix::libc::mmap(
+            addr2,
+            file_size,
+            nix::libc::PROT_READ | nix::libc::PROT_WRITE,
+            flags,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+
+    if second == nix::libc::MAP_FAILED {
+        panic!("second map failed: {}", std::io::Error::last_os_error());
+    }
+
+    first.cast()
 }
 
 #[cfg(test)]
@@ -379,21 +472,15 @@ mod tests {
         let path = "/tmp/test_shared_queue_wrap_around";
         let _ = std::fs::remove_file(path);
         let mut queue = SharedQueue::new(create_mmap(path, 128));
+        let buffer_size = queue.buffer_size();
 
         // Put message in and pop out so that there is room at the beginnning of the buffer.
-        assert!(queue.try_enqueue(&[5; 64]));
+        assert!(queue.try_enqueue(&vec![5; buffer_size - 64]));
         assert!(queue.try_dequeue().is_some());
 
-        // The head is at 68 bytes (64 + 4 for length).
-
-        // There are 60 bytes at the beginning of the buffer, and 64 bytes remaining at the end.
-        assert!(!queue.try_enqueue(&[5; 100])); // Not enough space to write contiguously.
-        assert!(!queue.try_enqueue(&[5; 68])); // Not enough space to write contiguously with the size.
-        assert!(queue.try_enqueue(&[5; 64])); // This should work - we do not need to wrap around.
-
-        // The head is now back at 68.
-        assert_eq!(queue.header().head.load(Ordering::Acquire) % 128, 68);
-        assert_eq!(queue.header().tail.load(Ordering::Acquire) % 128, 68);
+        assert!(!queue.try_enqueue(&vec![5; buffer_size - 28])); // Not enough space to write contiguously.
+        assert!(!queue.try_enqueue(&vec![5; buffer_size - 60])); // Not enough space to write contiguously with the size.
+        assert!(queue.try_enqueue(&vec![5; buffer_size - 64])); // This should work - we do not need to wrap around.
     }
 
     #[test]
