@@ -141,10 +141,22 @@ impl SharedQueue {
         true
     }
 
-    pub fn try_dequeue(&mut self) -> Option<&[u8]> {
+    pub fn try_dequeue<'a>(&'a mut self) -> Option<&'a [u8]> {
         let tail = self.header().tail.load(Ordering::Acquire);
-        let mut head = self.header().head.load(Ordering::Relaxed);
+        let head = self.header().head.load(Ordering::Relaxed);
 
+        let (data, len, head) = self.try_pop_with_head_and_tail(head, tail)?;
+        std::sync::atomic::fence(Ordering::Release);
+        self.header().head.store(head, Ordering::Release);
+        Some(unsafe { core::slice::from_raw_parts(data, len) })
+    }
+
+    /// Try to pop a message from the queue, returning the message, length, and new head.
+    fn try_pop_with_head_and_tail(
+        &mut self,
+        mut head: usize,
+        tail: usize,
+    ) -> Option<(*const u8, usize, usize)> {
         if head == tail {
             return None;
         }
@@ -153,19 +165,16 @@ impl SharedQueue {
         let buf = self.buffer_ptr();
 
         let marker = unsafe { buf.add(pos).cast::<u32>().read_unaligned() };
-        if marker == WRAP_MARKER {
-            // move head to 0 and retry.
-            std::sync::atomic::fence(Ordering::Acquire);
-
+        let len = if marker == WRAP_MARKER {
             // wrap-around marker moves head to next increment of buffer-size.
             head = head.wrapping_add(self.buffer_size - self.mask(head));
-            self.header().head.store(head, Ordering::Release);
             pos = self.mask(head);
-        }
+            (unsafe { buf.add(pos).cast::<u32>().read_unaligned() } as usize)
+        } else {
+            marker as usize
+        };
 
-        let len = unsafe { buf.add(pos).cast::<u32>().read_unaligned() } as usize;
         let payload_pos = pos + core::mem::size_of::<u32>();
-
         assert!(
             payload_pos + len <= self.buffer_size,
             "message would wrap buffer. {} {} {}",
@@ -174,14 +183,9 @@ impl SharedQueue {
             self.buffer_size
         );
 
-        let data = unsafe { core::slice::from_raw_parts(buf.add(payload_pos), len) };
-
-        std::sync::atomic::fence(Ordering::Acquire);
-        self.header().head.store(
-            head.wrapping_add(len + core::mem::size_of::<u32>()),
-            Ordering::Release,
-        );
-        Some(data)
+        let data_ptr = unsafe { buf.add(payload_pos) };
+        head = head.wrapping_add(len + core::mem::size_of::<u32>());
+        Some((data_ptr, len, head))
     }
 }
 
