@@ -35,8 +35,10 @@ fn run_sender(mut sender: shaq::Producer) {
     let mut sender_count = 0;
     let mut last_time = std::time::Instant::now();
     loop {
-        // Push in batches of 100.
-        for _ in 0..100 {
+        // Push in batches.
+        const BYTES_PER_BATCH: usize = 100_000;
+        const MESSAGES_PER_BATCH: usize = BYTES_PER_BATCH / ITEM_SIZE;
+        for _ in 0..MESSAGES_PER_BATCH {
             if !sender.try_enqueue(&[5; ITEM_SIZE]) {
                 break;
             }
@@ -49,8 +51,9 @@ fn run_sender(mut sender: shaq::Producer) {
             let elapsed = now.duration_since(last_time);
             last_time = now;
             println!(
-                "{:.02} GB/sec",
-                (10_000_000 * ITEM_SIZE) as f64 / (elapsed.as_secs_f64()) / 1e9
+                "{:.02} GB/sec - {:.0} items/sec",
+                (sender_count * ITEM_SIZE) as f64 / (elapsed.as_secs_f64()) / 1e9,
+                (sender_count as f64) / elapsed.as_secs_f64(),
             );
             sender_count = 0;
         }
