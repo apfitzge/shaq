@@ -6,7 +6,6 @@ use std::{
 };
 
 pub const HEADER_SIZE: usize = core::mem::size_of::<SharedQueueHeader>();
-
 const WRAP_MARKER: u32 = 0xFFFF_FFFF;
 
 #[repr(C)]
@@ -44,20 +43,22 @@ impl SharedQueue {
         index % self.buffer_size
     }
 
-    /// Get a buffer of `size` bytes to write into.
-    pub fn reserve(&mut self, size: usize) -> Option<*mut u8> {
+    /// Reserve a buffer using a passed value of `head` and `tail`.
+    /// If the reservation is successful, return the pointer to the buffer,
+    /// and the next tail value.
+    fn reserve_with_head_and_tail(
+        &mut self,
+        size: usize,
+        head: usize,
+        mut tail: usize,
+    ) -> Option<(*mut u8, usize)> {
         let contiguous_size = size.wrapping_add(core::mem::size_of::<u32>());
-        let head = self.header().head.load(Ordering::Acquire);
-        let mut tail = self.header().tail.load(Ordering::Relaxed);
-
         let remaining = self.buffer_size.wrapping_sub(tail.wrapping_sub(head));
 
         // This does NOT consider if we must wrap around.
         if remaining < contiguous_size {
             return None;
         }
-
-        let buf = self.buffer_ptr();
 
         // We must now consider if we need to wrap around.
         let mut starting_pos = self.mask(tail);
@@ -83,6 +84,7 @@ impl SharedQueue {
             }
         };
 
+        let buf = self.buffer_ptr();
         if must_wrap {
             // If we must wrap. Before we do so we must make sure we have enough room
             // AFTER we wrap around.
@@ -98,11 +100,8 @@ impl SharedQueue {
                     .cast::<u32>()
                     .write_unaligned(WRAP_MARKER);
             }
-            std::sync::atomic::fence(Ordering::Release);
             tail = tail.wrapping_add(remaining_before_wrap);
             starting_pos = 0;
-            // Immediately commit the tail so we do not need to cache this info for `commit`.
-            self.header().tail.store(tail, Ordering::Release);
         }
 
         // If wrapped around, local variables have been updated.
@@ -114,25 +113,31 @@ impl SharedQueue {
                 .cast::<u32>()
                 .write_unaligned(size as u32);
         }
-        // Return a reference to the data.
-        Some(unsafe { buf.add(starting_pos + core::mem::size_of::<u32>()) })
+
+        // Return a pointer to the data.
+        let reserved_buffer = unsafe { buf.add(starting_pos + core::mem::size_of::<u32>()) };
+        tail = tail.wrapping_add(contiguous_size);
+        Some((reserved_buffer, tail))
     }
 
-    pub fn commit_size(&mut self, size: usize) {
+    fn commit_tail(&mut self, tail: usize) {
         std::sync::atomic::fence(Ordering::Release);
-        let tail = self.header().tail.load(Ordering::Relaxed);
-        let new_tail = tail.wrapping_add(size + core::mem::size_of::<u32>());
-        self.header().tail.store(new_tail, Ordering::Release);
+        self.header().tail.store(tail, Ordering::Release);
     }
 
     pub fn try_enqueue(&mut self, data: &[u8]) -> bool {
-        let Some(reserved_buffer) = self.reserve(data.len()) else {
+        let head = self.header().head.load(Ordering::Acquire);
+        let tail = self.header().tail.load(Ordering::Relaxed);
+
+        let Some((reserved_buffer, tail)) = self.reserve_with_head_and_tail(data.len(), head, tail)
+        else {
             return false;
         };
+
         unsafe {
             reserved_buffer.copy_from_nonoverlapping(data.as_ptr(), data.len());
         }
-        self.commit_size(data.len());
+        self.commit_tail(tail);
         true
     }
 

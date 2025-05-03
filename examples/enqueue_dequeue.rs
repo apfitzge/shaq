@@ -35,14 +35,7 @@ fn run_sender(mut sender: shaq::SharedQueue) {
     let mut sender_count = 0;
     let mut last_time = std::time::Instant::now();
     loop {
-        let Some(reserved_bytes) = sender.reserve(ITEM_SIZE) else {
-            continue;
-        };
-
-        let item = unsafe { &mut *(reserved_bytes as *mut [u8; ITEM_SIZE]) };
-        *item = [5; ITEM_SIZE];
-        sender.commit_size(ITEM_SIZE);
-
+        sender.try_enqueue(&[5; ITEM_SIZE]);
         sender_count += 1;
         if sender_count == 10_000_000 {
             let now = std::time::Instant::now();
