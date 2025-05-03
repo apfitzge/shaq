@@ -8,6 +8,89 @@ use std::{
 pub const HEADER_SIZE: usize = core::mem::size_of::<SharedQueueHeader>();
 const WRAP_MARKER: u32 = 0xFFFF_FFFF;
 
+pub struct Producer {
+    queue: SharedQueue,
+    head: usize,
+    tail: usize,
+}
+
+impl Producer {
+    pub fn new(mmap: MmapMut) -> Self {
+        let queue = SharedQueue::new(mmap);
+        let head = queue.header().head.load(Ordering::Acquire);
+        let tail = queue.header().tail.load(Ordering::Relaxed);
+        Self { queue, head, tail }
+    }
+
+    /// Write data to the queue - the [`Consumer`] cannot see it until
+    /// [`Self::commit`] is called.
+    pub fn try_enqueue(&mut self, data: &[u8]) -> bool {
+        let Some(reserved_buffer) = self.reserve(data.len()) else {
+            return false;
+        };
+
+        unsafe {
+            reserved_buffer.copy_from_nonoverlapping(data.as_ptr(), data.len());
+        }
+        true
+    }
+
+    /// Reserve a buffer for writing data. The [`Consumer`] cannot see it until
+    /// [`Self::commit`] is called.
+    pub fn reserve(&mut self, size: usize) -> Option<*mut u8> {
+        let (reserved_buffer, tail) = self
+            .queue
+            .reserve_with_head_and_tail(size, self.head, self.tail)?;
+        self.tail = tail;
+        Some(reserved_buffer)
+    }
+
+    /// Commit the data to the queue. The [`Consumer`] can now see it.
+    /// This is a release operation, so it must be called after all writes to
+    /// the reserved buffer are done.
+    pub fn commit(&mut self) {
+        std::sync::atomic::fence(Ordering::Release);
+        self.head = self.queue.header().head.load(Ordering::Acquire);
+        self.queue.header().tail.store(self.tail, Ordering::Release);
+        std::sync::atomic::fence(Ordering::Release);
+    }
+}
+
+pub struct Consumer {
+    queue: SharedQueue,
+    head: usize,
+    tail: usize,
+}
+
+impl Consumer {
+    pub fn new(mmap: MmapMut) -> Self {
+        let queue = SharedQueue::new(mmap);
+        let head = queue.header().head.load(Ordering::Acquire);
+        let tail = queue.header().tail.load(Ordering::Relaxed);
+        Self { queue, head, tail }
+    }
+
+    /// Try to dequeue a message from the queue. Returns `None` if there is no
+    /// message available.
+    /// This does not update the head of the shared queue so the space is not
+    /// freed for the [`Producer`] to use until [`Self::sync`] is called.
+    pub fn try_dequeue(&mut self) -> Option<&[u8]> {
+        let (data_ptr, len, head) = self
+            .queue
+            .try_pop_with_head_and_tail(self.head, self.tail)?;
+        self.head = head;
+        Some(unsafe { core::slice::from_raw_parts(data_ptr, len) })
+    }
+
+    /// Sync the queue with the current head and tail.
+    pub fn sync(&mut self) {
+        std::sync::atomic::fence(Ordering::Release);
+        self.tail = self.queue.header().tail.load(Ordering::Acquire);
+        self.queue.header().head.store(self.head, Ordering::Release);
+        std::sync::atomic::fence(Ordering::Release);
+    }
+}
+
 #[repr(C)]
 struct SharedQueueHeader {
     head: CacheAlignedAtomicSize,
@@ -357,6 +440,70 @@ mod tests {
         assert_eq!(
             recver.header().tail.load(Ordering::Acquire),
             message1.len() + message2.len() + 4 + 4,
+        );
+    }
+
+    #[test]
+    fn test_producer_consumer_simple_messagee() {
+        let path = "/tmp/test_producer_consumer_simple_messagee";
+        let _ = std::fs::remove_file(path);
+        let mut producer = {
+            let mmap = create_mmap(path, 1024);
+            Producer::new(mmap)
+        };
+        let mut consumer = {
+            let mmap = join_mmap(path);
+            Consumer::new(mmap)
+        };
+
+        let original_data = b"hello world";
+        let original_data_len = original_data.len();
+        assert!(producer.try_enqueue(original_data));
+
+        assert_eq!(producer.queue.header().tail.load(Ordering::Acquire), 0);
+        assert_eq!(producer.tail, original_data_len + 4);
+        assert_eq!(producer.head, 0);
+
+        // The producer has not committed the data yet, so the consumer cannot see it.
+        assert!(consumer.try_dequeue().is_none());
+        assert_eq!(consumer.tail, 0);
+        assert_eq!(consumer.head, 0);
+        assert_eq!(consumer.queue.header().head.load(Ordering::Acquire), 0);
+        assert_eq!(consumer.queue.header().tail.load(Ordering::Acquire), 0);
+
+        // Commit the data to the queue.
+        producer.commit();
+        assert_eq!(
+            producer.queue.header().tail.load(Ordering::Acquire),
+            original_data_len + 4
+        );
+        assert_eq!(producer.tail, original_data_len + 4);
+        assert_eq!(producer.head, 0);
+        assert_eq!(producer.queue.header().head.load(Ordering::Acquire), 0);
+
+        // The consumer can still not see the data since it has not synced the tail.
+        assert!(consumer.try_dequeue().is_none());
+        assert_eq!(consumer.tail, 0);
+        assert_eq!(consumer.head, 0);
+
+        // Sync the queue with the current head and tail.
+        consumer.sync();
+
+        // Dequeue the data.
+        let dequeued_data = consumer.try_dequeue().unwrap();
+        assert_eq!(dequeued_data, original_data);
+        assert_eq!(consumer.tail, original_data_len + 4);
+        assert_eq!(consumer.head, original_data_len + 4);
+        assert_eq!(consumer.queue.header().head.load(Ordering::Acquire), 0);
+        assert_eq!(
+            consumer.queue.header().tail.load(Ordering::Acquire),
+            original_data_len + 4
+        );
+
+        consumer.sync();
+        assert_eq!(
+            consumer.head,
+            consumer.queue.header().head.load(Ordering::Acquire)
         );
     }
 }
