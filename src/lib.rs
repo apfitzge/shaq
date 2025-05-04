@@ -5,8 +5,6 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-pub const HEADER_SIZE: usize = core::mem::size_of::<SharedQueueHeader>();
-
 pub struct Producer {
     queue: SharedQueue,
     head: usize,
@@ -14,8 +12,8 @@ pub struct Producer {
 }
 
 impl Producer {
-    pub fn new(ptr_and_file_size: (*mut u8, usize)) -> Self {
-        let queue = SharedQueue::new(ptr_and_file_size);
+    pub fn new(header_ptr: *mut u8, buffer_ptr_and_file_size: (*mut u8, usize)) -> Self {
+        let queue = SharedQueue::new(header_ptr, buffer_ptr_and_file_size);
         let head = queue.header().head.load(Ordering::Acquire);
         let tail = queue.header().tail.load(Ordering::Relaxed);
         Self { queue, head, tail }
@@ -62,8 +60,8 @@ pub struct Consumer {
 }
 
 impl Consumer {
-    pub fn new(ptr_and_file_size: (*mut u8, usize)) -> Self {
-        let queue = SharedQueue::new(ptr_and_file_size);
+    pub fn new(header_ptr: *mut u8, buffer_ptr_and_file_size: (*mut u8, usize)) -> Self {
+        let queue = SharedQueue::new(header_ptr, buffer_ptr_and_file_size);
         let head = queue.header().head.load(Ordering::Acquire);
         let tail = queue.header().tail.load(Ordering::Relaxed);
         Self { queue, head, tail }
@@ -97,21 +95,17 @@ struct SharedQueueHeader {
 }
 
 pub struct SharedQueue {
-    ptr: *mut u8,
-    buffer_start: usize,
+    header_ptr: *mut u8,
+    buffer_ptr: *mut u8,
     buffer_size: usize,
 }
 
 impl SharedQueue {
-    pub fn new(ptr_and_file_size: (*mut u8, usize)) -> Self {
-        let ptr = ptr_and_file_size.0;
-        let file_size = ptr_and_file_size.1;
-
-        let buffer_size = file_size - core::mem::size_of::<SharedQueueHeader>();
+    pub fn new(header_ptr: *mut u8, buffer_ptr_and_file_size: (*mut u8, usize)) -> Self {
         Self {
-            ptr,
-            buffer_start: core::mem::size_of::<SharedQueueHeader>(),
-            buffer_size,
+            header_ptr,
+            buffer_ptr: buffer_ptr_and_file_size.0,
+            buffer_size: buffer_ptr_and_file_size.1,
         }
     }
 
@@ -121,11 +115,11 @@ impl SharedQueue {
     }
 
     fn header(&self) -> &SharedQueueHeader {
-        unsafe { &*(self.ptr as *const SharedQueueHeader) }
+        unsafe { &*(self.header_ptr as *const SharedQueueHeader) }
     }
 
     fn buffer_ptr(&mut self) -> *mut u8 {
-        unsafe { self.ptr.add(self.buffer_start) }
+        self.buffer_ptr
     }
 
     fn mask(&self, index: usize) -> usize {
@@ -231,14 +225,13 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
     }
 }
 
-pub fn create_mmap(path: impl AsRef<Path>, buffer_size: usize) -> (*mut u8, usize) {
+fn create_file(path: impl AsRef<Path>, size: usize) -> (File, usize) {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(&path)
+        .open(path.as_ref())
         .unwrap();
-
     let use_hugepages = use_hugepages(path.as_ref());
     let page_size = if use_hugepages {
         1 << 21
@@ -248,20 +241,39 @@ pub fn create_mmap(path: impl AsRef<Path>, buffer_size: usize) -> (*mut u8, usiz
             .unwrap() as usize
     };
 
-    let file_size = core::mem::size_of::<SharedQueueHeader>() + buffer_size;
+    let file_size = core::mem::size_of::<SharedQueueHeader>() + size;
     let file_size = (file_size + page_size - 1) & !(page_size - 1);
-
     file.set_len((file_size) as u64).unwrap();
 
-    (mirror_map(&file, file_size, use_hugepages), file_size)
+    (file, file_size)
 }
 
-pub fn join_mmap(path: impl AsRef<Path>) -> (*mut u8, usize) {
-    let file = OpenOptions::new()
+fn join_file(path: impl AsRef<Path>) -> File {
+    OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&path)
-        .unwrap();
+        .open(path)
+        .unwrap()
+}
+
+pub fn create_header_mmap(path: impl AsRef<Path>) -> *mut u8 {
+    let (file, file_size) = create_file(path.as_ref(), core::mem::size_of::<SharedQueueHeader>());
+    map(&file, file_size)
+}
+
+pub fn join_header_mmap(path: impl AsRef<Path>) -> *mut u8 {
+    let file = join_file(path.as_ref());
+    let file_size = file.metadata().unwrap().len() as usize;
+    map(&file, file_size)
+}
+
+pub fn create_buffer_mmap(path: impl AsRef<Path>, buffer_size: usize) -> (*mut u8, usize) {
+    let (file, file_size) = create_file(path.as_ref(), buffer_size);
+    (mirror_map(&file, file_size, use_hugepages(path)), file_size)
+}
+
+pub fn join_buffer_mmap(path: impl AsRef<Path>) -> (*mut u8, usize) {
+    let file = join_file(path.as_ref());
     let file_size = file.metadata().unwrap().len() as usize;
     (
         mirror_map(&file, file_size, use_hugepages(path.as_ref())),
@@ -271,6 +283,25 @@ pub fn join_mmap(path: impl AsRef<Path>) -> (*mut u8, usize) {
 
 fn use_hugepages(path: impl AsRef<Path>) -> bool {
     path.as_ref().starts_with("/mnt/hugepages")
+}
+
+fn map(file: &File, file_size: usize) -> *mut u8 {
+    let addr = unsafe {
+        nix::libc::mmap(
+            core::ptr::null_mut(),
+            file_size,
+            nix::libc::PROT_READ | nix::libc::PROT_WRITE,
+            nix::libc::MAP_SHARED, // TODO: support hugepages?
+            file.as_raw_fd(),
+            0,
+        )
+    };
+
+    if addr == nix::libc::MAP_FAILED {
+        panic!("mmap failed: {}", std::io::Error::last_os_error());
+    }
+
+    addr.cast()
 }
 
 fn mirror_map(file: &File, file_size: usize, use_hugepages: bool) -> *mut u8 {
@@ -343,9 +374,15 @@ mod tests {
 
     #[test]
     fn test_shared_queue_simple_message() {
-        let path = "/tmp/test_shared_queue_simple_message";
-        let _ = std::fs::remove_file(path);
-        let mut queue = SharedQueue::new(create_mmap(path, 1024));
+        let header_path = "/tmp/test_shared_queue_simple_message_header";
+        let buffer_path = "/tmp/test_shared_queue_simple_message_buffer";
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(buffer_path);
+
+        let mut queue = SharedQueue::new(
+            create_header_mmap(header_path),
+            create_buffer_mmap(buffer_path, 1024),
+        );
 
         let original_data = b"hello world";
         let original_data_len = original_data.len();
@@ -368,13 +405,21 @@ mod tests {
             queue.header().tail.load(Ordering::Acquire),
             original_data_len + 4
         );
+
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(buffer_path);
     }
 
     #[test]
     fn test_shared_queue_variable_sized_messages() {
-        let path = "/tmp/test_shared_queue_variable_sized_messages";
-        let _ = std::fs::remove_file(path);
-        let mut queue = SharedQueue::new(create_mmap(path, 1024));
+        let header_path = "/tmp/test_shared_queue_variable_sized_messages_header";
+        let buffer_path = "/tmp/test_shared_queue_variable_sized_messages_buffer";
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(buffer_path);
+        let mut queue = SharedQueue::new(
+            create_header_mmap(header_path),
+            create_buffer_mmap(buffer_path, 1024),
+        );
 
         let message1 = b"hello world";
         let message2 = b"wasup";
@@ -401,13 +446,20 @@ mod tests {
             queue.header().tail.load(Ordering::Acquire),
             message1.len() + message2.len() + 4 + 4,
         );
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(buffer_path);
     }
 
     #[test]
     fn test_shared_queue_wrap_around() {
-        let path = "/tmp/test_shared_queue_wrap_around";
-        let _ = std::fs::remove_file(path);
-        let mut queue = SharedQueue::new(create_mmap(path, 128));
+        let header_path = "/tmp/test_shared_queue_wrap_around_header";
+        let buffer_path = "/tmp/test_shared_queue_wrap_around_buffer";
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(buffer_path);
+        let mut queue = SharedQueue::new(
+            create_header_mmap(header_path),
+            create_buffer_mmap(buffer_path, 1024),
+        );
         let buffer_size = queue.buffer_size();
 
         // Put message in and pop out so that there is room at the beginnning of the buffer.
@@ -440,14 +492,24 @@ mod tests {
             queue.header().tail.load(Ordering::Acquire),
             2 * buffer_size - 60
         );
+
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(buffer_path);
     }
 
     #[test]
     fn test_shared_queue_separate_instances() {
-        let path = "/tmp/test_shared_queue_separate_instances";
-        let _ = std::fs::remove_file(path);
-        let mut sender = SharedQueue::new(create_mmap(path, 1024));
-        let mut recver = SharedQueue::new(join_mmap(path));
+        let header_path = "/tmp/test_shared_queue_separate_instances_header";
+        let buffer_path = "/tmp/test_shared_queue_separate_instances_buffer";
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(buffer_path);
+
+        let mut sender = SharedQueue::new(
+            create_header_mmap(header_path),
+            create_buffer_mmap(buffer_path, 1024),
+        );
+        let mut recver =
+            SharedQueue::new(join_header_mmap(header_path), join_buffer_mmap(buffer_path));
 
         let message1 = b"hello world";
         let message2 = b"wasup";
@@ -487,19 +549,26 @@ mod tests {
             recver.header().tail.load(Ordering::Acquire),
             message1.len() + message2.len() + 4 + 4,
         );
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(buffer_path);
     }
 
     #[test]
-    fn test_producer_consumer_simple_messagee() {
-        let path = "/tmp/test_producer_consumer_simple_messagee";
-        let _ = std::fs::remove_file(path);
+    fn test_producer_consumer_simple_message() {
+        let header_path = "/tmp/test_producer_consumer_simple_message_header";
+        let buffer_path = "/tmp/test_producer_consumer_simple_message_buffer";
+        let _ = std::fs::remove_file(header_path);
+        let _ = std::fs::remove_file(buffer_path);
+
         let mut producer = {
-            let mmap = create_mmap(path, 1024);
-            Producer::new(mmap)
+            let header_mmap = create_header_mmap(header_path);
+            let buffer_mmap = create_buffer_mmap(buffer_path, 1024);
+            Producer::new(header_mmap, buffer_mmap)
         };
         let mut consumer = {
-            let mmap = join_mmap(path);
-            Consumer::new(mmap)
+            let header_mmap = join_header_mmap(header_path);
+            let buffer_mmap = join_buffer_mmap(buffer_path);
+            Consumer::new(header_mmap, buffer_mmap)
         };
 
         let original_data = b"hello world";

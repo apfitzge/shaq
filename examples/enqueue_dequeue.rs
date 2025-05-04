@@ -11,11 +11,15 @@ fn main() {
     })
     .unwrap();
 
-    let map_path = "/mnt/hugepages/shaq_enqueue_dequeue";
-    let _ = std::fs::remove_file(map_path);
+    let header_path = "/mnt/hugepages/shaq_enqueue_dequeue_header";
+    let buffer_path = "/mnt/hugepages/shaq_enqueue_dequeue_buffer";
+    let _ = std::fs::remove_file(header_path);
+    let _ = std::fs::remove_file(buffer_path);
 
-    let (ptr, file_size) = shaq::create_mmap(map_path, 1024 * 1024 * 1024 - shaq::HEADER_SIZE);
-    let ptr = ptr as usize;
+    let header_ptr = shaq::create_header_mmap(header_path);
+    let (buffer_ptr, file_size) = shaq::create_buffer_mmap(buffer_path, 1024 * 1024 * 1024);
+    let header_ptr = header_ptr as usize;
+    let buffer_ptr = buffer_ptr as usize;
 
     let recver_hdl = std::thread::Builder::new()
         .name("shaqRecver".to_string())
@@ -23,8 +27,9 @@ fn main() {
             let exit = exit.clone();
             move || {
                 let recver = {
-                    let mmap = shaq::join_mmap(map_path);
-                    shaq::Consumer::new(mmap)
+                    let header_mmap = shaq::join_header_mmap(header_path);
+                    let buffer_mmap = shaq::join_buffer_mmap(buffer_path);
+                    shaq::Consumer::new(header_mmap, buffer_mmap)
                 };
                 run_recver(recver, exit)
             }
@@ -34,8 +39,9 @@ fn main() {
     let sender_hdl = std::thread::Builder::new()
         .name("shaqSender".to_string())
         .spawn(move || {
-            let ptr = ptr as *mut u8;
-            let sender = { shaq::Producer::new((ptr, file_size)) };
+            let header_ptr = header_ptr as *mut u8;
+            let buffer_ptr = buffer_ptr as *mut u8;
+            let sender = { shaq::Producer::new(header_ptr, (buffer_ptr, file_size)) };
             run_sender(sender, exit);
         })
         .unwrap();
@@ -43,7 +49,7 @@ fn main() {
     recver_hdl.join().unwrap();
     sender_hdl.join().unwrap();
 
-    let _ = std::fs::remove_file(map_path);
+    let _ = std::fs::remove_file(buffer_path);
 }
 
 #[inline(never)]
