@@ -6,7 +6,6 @@ use std::{
 };
 
 pub const HEADER_SIZE: usize = core::mem::size_of::<SharedQueueHeader>();
-const WRAP_MARKER: u32 = 0xFFFF_FFFF;
 
 pub struct Producer {
     queue: SharedQueue,
@@ -146,59 +145,12 @@ impl SharedQueue {
         let contiguous_size = size.wrapping_add(core::mem::size_of::<u32>());
         let remaining = self.buffer_size.wrapping_sub(tail.wrapping_sub(head));
 
-        // This does NOT consider if we must wrap around.
         if remaining < contiguous_size {
             return None;
         }
 
-        // We must now consider if we need to wrap around.
-        let mut starting_pos = self.mask(tail);
-        let remaining_before_wrap = self.buffer_size.wrapping_sub(starting_pos);
-
-        // If we have exactly enough space to write the (len, message) then
-        // we do not need to leave room for a wrap marker.
-        let must_wrap = match remaining_before_wrap.cmp(&contiguous_size) {
-            std::cmp::Ordering::Less => {
-                // We must wrap around - write a wrap marker.
-                true
-            }
-            std::cmp::Ordering::Equal => {
-                // We have exactly enough space to write the (len, message).
-                // We do NOT need to write a wrap marker.
-                false
-            }
-            std::cmp::Ordering::Greater => {
-                // We have enough space to write the (len, message) but we
-                // must make sure we have enough space for a wrap marker
-                // after.
-                remaining_before_wrap.wrapping_sub(contiguous_size) < core::mem::size_of::<u32>()
-            }
-        };
-
+        let starting_pos = self.mask(tail);
         let buf = self.buffer_ptr();
-        if must_wrap {
-            // If we must wrap. Before we do so we must make sure we have enough room
-            // AFTER we wrap around.
-            let remaining_after_wrap = remaining.wrapping_sub(remaining_before_wrap);
-            if remaining_after_wrap < contiguous_size {
-                return None;
-            }
-
-            // Write the wrap-around marker.
-            assert!(starting_pos + core::mem::size_of::<u32>() <= self.buffer_size);
-            unsafe {
-                buf.add(starting_pos)
-                    .cast::<u32>()
-                    .write_unaligned(WRAP_MARKER);
-            }
-            tail = tail.wrapping_add(remaining_before_wrap);
-            starting_pos = 0;
-        }
-
-        // If wrapped around, local variables have been updated.
-        // Otherwise, we are still at the same position.
-        // Write the size.
-        assert!(starting_pos + core::mem::size_of::<u32>() <= self.buffer_size);
         unsafe {
             buf.add(starting_pos)
                 .cast::<u32>()
@@ -252,28 +204,12 @@ impl SharedQueue {
             return None;
         }
 
-        let mut pos = self.mask(head);
+        let pos = self.mask(head);
         let buf = self.buffer_ptr();
 
-        let marker = unsafe { buf.add(pos).cast::<u32>().read_unaligned() };
-        let len = if marker == WRAP_MARKER {
-            // wrap-around marker moves head to next increment of buffer-size.
-            head = head.wrapping_add(self.buffer_size - self.mask(head));
-            pos = self.mask(head);
-            (unsafe { buf.add(pos).cast::<u32>().read_unaligned() } as usize)
-        } else {
-            marker as usize
-        };
+        let len = unsafe { buf.add(pos).cast::<u32>().read_unaligned() } as usize;
 
         let payload_pos = pos + core::mem::size_of::<u32>();
-        assert!(
-            payload_pos + len <= self.buffer_size,
-            "message would wrap buffer. {} {} {}",
-            payload_pos,
-            len,
-            self.buffer_size
-        );
-
         let data_ptr = unsafe { buf.add(payload_pos) };
         head = head.wrapping_add(len + core::mem::size_of::<u32>());
         Some((data_ptr, len, head))
@@ -476,11 +412,34 @@ mod tests {
 
         // Put message in and pop out so that there is room at the beginnning of the buffer.
         assert!(queue.try_enqueue(&vec![5; buffer_size - 64]));
+        assert_eq!(queue.header().head.load(Ordering::Acquire), 0);
+        assert_eq!(
+            queue.header().tail.load(Ordering::Acquire),
+            buffer_size - 60
+        );
         assert!(queue.try_dequeue().is_some());
+        assert_eq!(
+            queue.header().head.load(Ordering::Acquire),
+            buffer_size - 60
+        );
+        assert_eq!(
+            queue.header().tail.load(Ordering::Acquire),
+            buffer_size - 60
+        );
 
-        assert!(!queue.try_enqueue(&vec![5; buffer_size - 28])); // Not enough space to write contiguously.
-        assert!(!queue.try_enqueue(&vec![5; buffer_size - 60])); // Not enough space to write contiguously with the size.
-        assert!(queue.try_enqueue(&vec![5; buffer_size - 64])); // This should work - we do not need to wrap around.
+        // Not enough space to write contiguously - but mirrored mmap allos wrap around anyway.
+        let data = (0..buffer_size - 4).map(|i| i as u8).collect::<Vec<u8>>();
+        assert!(queue.try_enqueue(&data));
+
+        // The queue should be full now.
+        assert_eq!(
+            queue.header().head.load(Ordering::Acquire),
+            buffer_size - 60
+        );
+        assert_eq!(
+            queue.header().tail.load(Ordering::Acquire),
+            2 * buffer_size - 60
+        );
     }
 
     #[test]
