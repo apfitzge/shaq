@@ -8,7 +8,7 @@ fn bench_queue_with_size<const N: usize>(c: &mut Criterion) {
     let map_path = format!("/mnt/hugepages/shaq_bench_queue_{pid}");
     let _ = std::fs::remove_file(&map_path);
 
-    let mmap = shaq::create_mmap(&map_path, 1024 * 1024 * 10 - shaq::HEADER_SIZE);
+    let mmap = shaq::create_mmap(&map_path, MAP_SIZE);
     let mut queue = SharedQueue::new(mmap);
 
     const NUM_ITEMS_PER_ITERATION: usize = 1024;

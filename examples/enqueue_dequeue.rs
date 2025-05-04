@@ -14,7 +14,7 @@ fn main() {
     let map_path = "/mnt/hugepages/shaq_enqueue_dequeue";
     let _ = std::fs::remove_file(map_path);
 
-    let (ptr, file_size) = shaq::create_mmap(map_path, 1024 * 1024 * 10 - shaq::HEADER_SIZE);
+    let (ptr, file_size) = shaq::create_mmap(map_path, 1024 * 1024 * 1024 - shaq::HEADER_SIZE);
     let ptr = ptr as usize;
 
     let recver_hdl = std::thread::Builder::new()
