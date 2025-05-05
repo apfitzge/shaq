@@ -56,8 +56,10 @@ fn main() {
 fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>) {
     const ITEM_SIZE: usize = 512;
 
-    let mut sender_count = 0;
+    let mut message_count = 0;
+    let mut batch_count = 0;
     let mut last_time = std::time::Instant::now();
+    let mut value = 0;
     while !exit.load(Ordering::Relaxed) {
         // Push in batches.
         const BYTES_PER_BATCH: usize = 100_000;
@@ -68,36 +70,45 @@ fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>) {
                 break;
             };
             unsafe {
-                ptr.write_bytes(5, ITEM_SIZE);
+                ptr.write_bytes(value, ITEM_SIZE);
             }
-
-            sender_count += 1;
+            value += 1;
+            message_count += 1;
         }
         sender.commit();
 
-        if sender_count >= 10_000_000 {
+        batch_count += 1;
+        if batch_count >= 100_000 {
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(last_time);
             last_time = now;
             println!(
                 "{:.02} GB/sec - {:.0} items/sec",
-                (sender_count * ITEM_SIZE) as f64 / (elapsed.as_secs_f64()) / 1e9,
-                (sender_count as f64) / elapsed.as_secs_f64(),
+                (message_count * ITEM_SIZE) as f64 / (elapsed.as_secs_f64()) / 1e9,
+                (message_count as f64) / elapsed.as_secs_f64(),
             );
-            sender_count = 0;
+            message_count = 0;
+            batch_count = 0;
         }
     }
 }
 
 #[inline(never)]
 fn run_recver(mut recver: shaq::Consumer, exit: Arc<AtomicBool>) {
+    let mut value = 0u8;
     while !exit.load(Ordering::Relaxed) {
         recver.sync();
         loop {
-            let x = recver.try_dequeue();
-            if x.is_none() {
+            let Some(buffer) = recver.try_dequeue() else {
                 break;
+            };
+
+            if buffer[0] != value {
+                exit.store(true, Ordering::Relaxed);
+                println!("Error: expected {}, got {}", value, buffer[0]);
+                return;
             }
+            value += 1;
         }
     }
 }
