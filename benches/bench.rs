@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use shaq::{create_buffer_mmap, join_buffer_mmap, Consumer, Producer, SharedQueue};
 
-const MAP_SIZE: usize = 1024 * 1024 * 1024;
+const MAP_SIZE: usize = 10 * 1024 * 1024;
 
 fn bench_queue_with_size<const N: usize>(c: &mut Criterion) {
     let header_path = format!("/tmp/shaq_bench_queue_header");
