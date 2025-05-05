@@ -63,9 +63,14 @@ fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>) {
         const BYTES_PER_BATCH: usize = 100_000;
         const MESSAGES_PER_BATCH: usize = BYTES_PER_BATCH / ITEM_SIZE;
         for _ in 0..MESSAGES_PER_BATCH {
-            if !sender.try_enqueue(&[5; ITEM_SIZE]) {
+            let Some(ptr) = sender.reserve(ITEM_SIZE) else {
+                println!("sender is full!");
                 break;
+            };
+            unsafe {
+                ptr.write_bytes(5, ITEM_SIZE);
             }
+
             sender_count += 1;
         }
         sender.commit();
