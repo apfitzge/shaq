@@ -49,6 +49,7 @@ fn main() {
     recver_hdl.join().unwrap();
     sender_hdl.join().unwrap();
 
+    let _ = std::fs::remove_file(header_path);
     let _ = std::fs::remove_file(buffer_path);
 }
 
