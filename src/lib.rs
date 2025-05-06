@@ -125,8 +125,6 @@ impl SharedQueue {
     }
 
     fn mask(&self, index: usize) -> usize {
-        // TODO: Make sure buffer_size is a power of 2 so we can just do shift.
-        // index % self.buffer_size
         index & self.buffer_mask
     }
 
@@ -137,13 +135,19 @@ impl SharedQueue {
         &mut self,
         size: usize,
         head: usize,
-        mut tail: usize,
+        tail: usize,
     ) -> Option<(*mut u8, usize)> {
-        // Round contiguous size to the next 64 byte boundary.
-        let contiguous_size = size.wrapping_add(core::mem::size_of::<u32>());
-        // Round contiguous size to the next rounding boundary.
-        let contiguous_size = Self::round_message_size(contiguous_size);
+        // Size written at the current `tail`.
+        const _: () = assert!(core::mem::size_of::<u32>() < CACHELINE_SIZE);
+        let cache_aligned_payload_tail = tail.wrapping_add(CACHELINE_SIZE);
 
+        // The end of the payload would naturally fall at:
+        // `cache_aligned_payload_tail + size`.
+        // However, we round to the next cacheline boundary.
+        let next_tail = round_to_next_cacheline(cache_aligned_payload_tail.wrapping_add(size));
+
+        // Round contiguous size to the next 64 byte boundary.
+        let contiguous_size = next_tail.wrapping_sub(tail);
         let remaining = self.buffer_size.wrapping_sub(tail.wrapping_sub(head));
         if remaining < contiguous_size {
             return None;
@@ -156,15 +160,14 @@ impl SharedQueue {
         }
 
         // Return a pointer to the data.
-        let reserved_buffer = unsafe { buf.add(starting_pos + core::mem::size_of::<u32>()) };
-        tail = tail.wrapping_add(contiguous_size);
-
-        Some((reserved_buffer, tail))
+        let reserved_buffer = unsafe { buf.add(starting_pos).add(CACHELINE_SIZE) };
+        Some((reserved_buffer, next_tail))
     }
 
     fn commit_tail(&mut self, tail: usize) {
         std::sync::atomic::fence(Ordering::Release);
         self.header().tail.store(tail, Ordering::Release);
+        std::sync::atomic::fence(Ordering::Release);
     }
 
     pub fn try_enqueue(&mut self, data: &[u8]) -> bool {
@@ -196,35 +199,32 @@ impl SharedQueue {
     /// Try to pop a message from the queue, returning the message, length, and new head.
     fn try_pop_with_head_and_tail(
         &mut self,
-        mut head: usize,
+        head: usize,
         tail: usize,
     ) -> Option<(*const u8, usize, usize)> {
         if head == tail {
             return None;
         }
-
-        let pos = self.mask(head);
         let buf = self.buffer_ptr();
 
+        // Get the current position and read the length.
+        let pos = self.mask(head);
         let len = unsafe { buf.add(pos).cast::<u32>().read() } as usize;
-        let contiguous_size = len.wrapping_add(core::mem::size_of::<u32>());
-        // Round contiguous size to the next rounding boundary.
-        let contiguous_size = Self::round_message_size(contiguous_size);
 
-        let payload_pos = pos + core::mem::size_of::<u32>();
-        let data_ptr = unsafe { buf.add(payload_pos) };
-        head = head.wrapping_add(contiguous_size);
-        Some((data_ptr, len, head))
-    }
+        // Cache-aligned payload will live at the next cacheline boundary.
+        let cache_aligned_payload_head = head.wrapping_add(CACHELINE_SIZE);
+        let next_head = round_to_next_cacheline(cache_aligned_payload_head.wrapping_add(len));
 
-    fn round_message_size(size: usize) -> usize {
-        // Align to some multiple of 4 bytes to avoid unaligned read/write
-        // for the message sizes.
-        const ROUNDING_SIZE: usize = 4;
-        const ROUNDING_SIZE_MINUS_ONE: usize = ROUNDING_SIZE - 1;
-        const ROUNDING_MASK: usize = !(ROUNDING_SIZE - 1);
-        (size + ROUNDING_SIZE_MINUS_ONE) & ROUNDING_MASK
+        // Payload lives at next cacheline boundary.
+        let data_ptr = unsafe { buf.add(pos).add(CACHELINE_SIZE) };
+
+        Some((data_ptr, len, next_head))
     }
+}
+
+const CACHELINE_SIZE: usize = 64;
+const fn round_to_next_cacheline(size: usize) -> usize {
+    (size + CACHELINE_SIZE - 1) & !(CACHELINE_SIZE - 1)
 }
 
 /// `AtomicUsize` with 128-byte alignment for better performance.
@@ -277,7 +277,13 @@ fn join_file(path: impl AsRef<Path>) -> File {
 
 pub fn create_header_mmap(path: impl AsRef<Path>) -> *mut u8 {
     let (file, file_size) = create_file(path.as_ref(), core::mem::size_of::<SharedQueueHeader>());
-    map(&file, file_size)
+    let mmap = map(&file, file_size);
+
+    unsafe {
+        mmap.write_bytes(0, file_size);
+    }
+
+    mmap
 }
 
 pub fn join_header_mmap(path: impl AsRef<Path>) -> *mut u8 {
@@ -288,7 +294,12 @@ pub fn join_header_mmap(path: impl AsRef<Path>) -> *mut u8 {
 
 pub fn create_buffer_mmap(path: impl AsRef<Path>, buffer_size: usize) -> (*mut u8, usize) {
     let (file, file_size) = create_file(path.as_ref(), buffer_size);
-    (mirror_map(&file, file_size, use_hugepages(path)), file_size)
+
+    let mmap = mirror_map(&file, file_size, use_hugepages(path));
+    unsafe {
+        mmap.write_bytes(0, file_size);
+    }
+    (mmap, file_size)
 }
 
 pub fn join_buffer_mmap(path: impl AsRef<Path>) -> (*mut u8, usize) {
@@ -349,9 +360,12 @@ fn mirror_map(file: &File, file_size: usize, use_hugepages: bool) -> *mut u8 {
     let addr2 = (addr as usize + file_size) as *mut nix::libc::c_void;
 
     let flags = if use_hugepages {
-        nix::libc::MAP_SHARED | nix::libc::MAP_FIXED | nix::libc::MAP_HUGETLB
+        nix::libc::MAP_SHARED
+            | nix::libc::MAP_FIXED
+            | nix::libc::MAP_HUGETLB
+            | nix::libc::MAP_POPULATE
     } else {
-        nix::libc::MAP_SHARED | nix::libc::MAP_FIXED
+        nix::libc::MAP_SHARED | nix::libc::MAP_FIXED | nix::libc::MAP_POPULATE
     };
 
     let first = unsafe {
@@ -406,9 +420,10 @@ mod tests {
         let original_data = b"hello world";
         assert!(queue.try_enqueue(original_data));
 
+        let expected_position = CACHELINE_SIZE + round_to_next_cacheline(original_data.len());
         assert_eq!(
             queue.header().tail.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + original_data.len())
+            expected_position
         );
         assert_eq!(queue.header().head.load(Ordering::Acquire), 0);
 
@@ -417,11 +432,11 @@ mod tests {
         assert_eq!(dequeued_data, original_data);
         assert_eq!(
             queue.header().head.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + original_data.len())
+            expected_position
         );
         assert_eq!(
             queue.header().tail.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + original_data.len())
+            expected_position
         );
 
         let _ = std::fs::remove_file(header_path);
@@ -445,8 +460,8 @@ mod tests {
         assert!(queue.try_enqueue(message1));
         assert!(queue.try_enqueue(message2));
 
-        let message1_len = SharedQueue::round_message_size(4 + message1.len());
-        let message2_len = SharedQueue::round_message_size(4 + message2.len());
+        let message1_len = CACHELINE_SIZE + round_to_next_cacheline(message1.len());
+        let message2_len = CACHELINE_SIZE + round_to_next_cacheline(message2.len());
 
         assert_eq!(
             queue.header().tail.load(Ordering::Acquire),
@@ -487,33 +502,47 @@ mod tests {
         let message_size = buffer_size - 64;
         assert!(queue.try_enqueue(&vec![5; message_size]));
         assert_eq!(queue.header().head.load(Ordering::Acquire), 0);
+        let expected_position = CACHELINE_SIZE + round_to_next_cacheline(message_size);
         assert_eq!(
             queue.header().tail.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + message_size)
+            expected_position
         );
         assert!(queue.try_dequeue().is_some());
         assert_eq!(
             queue.header().head.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + message_size)
+            expected_position
         );
         assert_eq!(
             queue.header().tail.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + message_size)
+            expected_position
         );
 
         // Not enough space to write contiguously - but mirrored mmap allos wrap around anyway.
-        let data = (0..buffer_size - 4).map(|i| i as u8).collect::<Vec<u8>>();
+        let data = (0..buffer_size - 120).map(|i| i as u8).collect::<Vec<u8>>();
         assert!(queue.try_enqueue(&data));
 
         // The queue should be full now.
         assert_eq!(
             queue.header().head.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + message_size)
+            expected_position
         );
         assert_eq!(
             queue.header().tail.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + message_size + buffer_size)
+            expected_position + CACHELINE_SIZE + round_to_next_cacheline(buffer_size - 120)
         );
+
+        // Dequeue the data.
+        let dequeued_data = queue.try_dequeue().unwrap();
+        assert_eq!(dequeued_data, &data[..]);
+        assert_eq!(
+            queue.header().head.load(Ordering::Acquire),
+            expected_position + CACHELINE_SIZE + round_to_next_cacheline(buffer_size - 120)
+        );
+        assert_eq!(
+            queue.header().tail.load(Ordering::Acquire),
+            expected_position + CACHELINE_SIZE + round_to_next_cacheline(buffer_size - 120)
+        );
+        assert!(queue.try_dequeue().is_none());
 
         let _ = std::fs::remove_file(header_path);
         let _ = std::fs::remove_file(buffer_path);
@@ -539,17 +568,17 @@ mod tests {
         assert!(sender.try_enqueue(message1));
         assert!(sender.try_enqueue(message2));
 
-        let message1_rounded_len = SharedQueue::round_message_size(4 + message1.len());
-        let message2_rounded_len = SharedQueue::round_message_size(4 + message2.len());
+        let message1_len = CACHELINE_SIZE + round_to_next_cacheline(message1.len());
+        let message2_len = CACHELINE_SIZE + round_to_next_cacheline(message2.len());
 
         assert_eq!(
             sender.header().tail.load(Ordering::Acquire),
-            message1_rounded_len + message2_rounded_len,
+            message1_len + message2_len,
         );
         assert_eq!(sender.header().head.load(Ordering::Acquire), 0);
         assert_eq!(
             recver.header().tail.load(Ordering::Acquire),
-            message1_rounded_len + message2_rounded_len,
+            message1_len + message2_len,
         );
         assert_eq!(recver.header().head.load(Ordering::Acquire), 0);
 
@@ -560,19 +589,19 @@ mod tests {
 
         assert_eq!(
             sender.header().head.load(Ordering::Acquire),
-            message1_rounded_len + message2_rounded_len,
+            message1_len + message2_len,
         );
         assert_eq!(
             sender.header().tail.load(Ordering::Acquire),
-            message1_rounded_len + message2_rounded_len,
+            message1_len + message2_len,
         );
         assert_eq!(
             recver.header().head.load(Ordering::Acquire),
-            message1_rounded_len + message2_rounded_len,
+            message1_len + message2_len,
         );
         assert_eq!(
             recver.header().tail.load(Ordering::Acquire),
-            message1_rounded_len + message2_rounded_len,
+            message1_len + message2_len,
         );
         let _ = std::fs::remove_file(header_path);
         let _ = std::fs::remove_file(buffer_path);
@@ -597,13 +626,11 @@ mod tests {
         };
 
         let original_data = b"hello world";
+        let expected_position = CACHELINE_SIZE + round_to_next_cacheline(original_data.len());
         assert!(producer.try_enqueue(original_data));
 
         assert_eq!(producer.queue.header().tail.load(Ordering::Acquire), 0);
-        assert_eq!(
-            producer.tail,
-            SharedQueue::round_message_size(4 + original_data.len())
-        );
+        assert_eq!(producer.tail, expected_position);
         assert_eq!(producer.head, 0);
 
         // The producer has not committed the data yet, so the consumer cannot see it.
@@ -617,12 +644,9 @@ mod tests {
         producer.commit();
         assert_eq!(
             producer.queue.header().tail.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + original_data.len())
+            expected_position
         );
-        assert_eq!(
-            producer.tail,
-            SharedQueue::round_message_size(4 + original_data.len())
-        );
+        assert_eq!(producer.tail, expected_position);
         assert_eq!(producer.head, 0);
         assert_eq!(producer.queue.header().head.load(Ordering::Acquire), 0);
 
@@ -637,18 +661,12 @@ mod tests {
         // Dequeue the data.
         let dequeued_data = consumer.try_dequeue().unwrap();
         assert_eq!(dequeued_data, original_data);
-        assert_eq!(
-            consumer.tail,
-            SharedQueue::round_message_size(4 + original_data.len())
-        );
-        assert_eq!(
-            consumer.head,
-            SharedQueue::round_message_size(4 + original_data.len())
-        );
+        assert_eq!(consumer.tail, expected_position);
+        assert_eq!(consumer.head, expected_position);
         assert_eq!(consumer.queue.header().head.load(Ordering::Acquire), 0);
         assert_eq!(
             consumer.queue.header().tail.load(Ordering::Acquire),
-            SharedQueue::round_message_size(4 + original_data.len())
+            expected_position
         );
 
         consumer.sync();
