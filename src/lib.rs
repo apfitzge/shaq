@@ -98,6 +98,7 @@ pub struct SharedQueue {
     header_ptr: *mut u8,
     buffer_ptr: *mut u8,
     buffer_size: usize,
+    buffer_mask: usize,
 }
 
 impl SharedQueue {
@@ -106,6 +107,7 @@ impl SharedQueue {
             header_ptr,
             buffer_ptr: buffer_ptr_and_file_size.0,
             buffer_size: buffer_ptr_and_file_size.1,
+            buffer_mask: buffer_ptr_and_file_size.1 - 1,
         }
     }
 
@@ -124,7 +126,8 @@ impl SharedQueue {
 
     fn mask(&self, index: usize) -> usize {
         // TODO: Make sure buffer_size is a power of 2 so we can just do shift.
-        index % self.buffer_size
+        // index % self.buffer_size
+        index & self.buffer_mask
     }
 
     /// Reserve a buffer using a passed value of `head` and `tail`.
@@ -218,7 +221,9 @@ impl SharedQueue {
         // Align to some multiple of 4 bytes to avoid unaligned read/write
         // for the message sizes.
         const ROUNDING_SIZE: usize = 4;
-        (size + ROUNDING_SIZE - 1) & !(ROUNDING_SIZE - 1)
+        const ROUNDING_SIZE_MINUS_ONE: usize = ROUNDING_SIZE - 1;
+        const ROUNDING_MASK: usize = !(ROUNDING_SIZE - 1);
+        (size + ROUNDING_SIZE_MINUS_ONE) & ROUNDING_MASK
     }
 }
 
@@ -253,8 +258,10 @@ fn create_file(path: impl AsRef<Path>, size: usize) -> (File, usize) {
             .unwrap() as usize
     };
 
-    let file_size = core::mem::size_of::<SharedQueueHeader>() + size;
-    let file_size = (file_size + page_size - 1) & !(page_size - 1);
+    let file_size = (size + page_size - 1) & !(page_size - 1);
+    let file_size = file_size.next_power_of_two();
+    assert!(file_size % page_size == 0);
+
     file.set_len((file_size) as u64).unwrap();
 
     (file, file_size)
