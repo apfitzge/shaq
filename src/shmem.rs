@@ -131,6 +131,7 @@ fn mirror_map(file: &File, size: usize, hugepages: bool) -> Result<*mut u8, Erro
     Ok(first.cast())
 }
 
+pub const CACHELINE_SIZE: usize = 64;
 pub const STANDARD_PAGE_SIZE: usize = 4096;
 pub const HUGE_PAGE_SIZE: usize = 1 << 21;
 
@@ -156,6 +157,11 @@ pub fn get_rounded_file_size(path: impl AsRef<Path>, size: usize) -> usize {
         // Safety: `STANDARD_PAGE_SIZE` is a power of 2.
         unsafe { pow2_round_size::<STANDARD_PAGE_SIZE>(size) }
     }
+}
+
+pub const fn round_to_next_cacheline(size: usize) -> usize {
+    // SAFETY: `STANDARD_CACHELINE_SIZE` is a power of 2.
+    unsafe { pow2_round_size::<CACHELINE_SIZE>(size) }
 }
 
 #[cfg(test)]

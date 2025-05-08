@@ -1,5 +1,8 @@
 use error::Error;
-use shmem::{create_and_map_file, get_rounded_file_size, open_and_map_file, use_hugepages};
+use shmem::{
+    create_and_map_file, get_rounded_file_size, open_and_map_file, round_to_next_cacheline,
+    use_hugepages, CACHELINE_SIZE,
+};
 use std::{
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
@@ -223,11 +226,6 @@ impl SharedQueue {
 
         Some((data_ptr, len, next_head))
     }
-}
-
-const CACHELINE_SIZE: usize = 64;
-const fn round_to_next_cacheline(size: usize) -> usize {
-    (size + CACHELINE_SIZE - 1) & !(CACHELINE_SIZE - 1)
 }
 
 /// `AtomicUsize` with 128-byte alignment for better performance.
