@@ -16,8 +16,9 @@ fn main() {
     let _ = std::fs::remove_file(header_path);
     let _ = std::fs::remove_file(buffer_path);
 
-    let header_ptr = shaq::create_header_mmap(header_path);
-    let (buffer_ptr, file_size) = shaq::create_buffer_mmap(buffer_path, 1024 * 1024 * 1024);
+    let header_ptr = shaq::create_header_mmap(header_path).unwrap();
+    let (buffer_ptr, file_size) =
+        shaq::create_buffer_mmap(buffer_path, 1024 * 1024 * 1024).unwrap();
     let header_ptr = header_ptr as usize;
     let buffer_ptr = buffer_ptr as usize;
 
@@ -27,8 +28,8 @@ fn main() {
             let exit = exit.clone();
             move || {
                 let recver = {
-                    let header_mmap = shaq::join_header_mmap(header_path);
-                    let buffer_mmap = shaq::join_buffer_mmap(buffer_path);
+                    let header_mmap = shaq::join_header_mmap(header_path).unwrap();
+                    let buffer_mmap = shaq::join_buffer_mmap(buffer_path).unwrap();
                     shaq::Consumer::new(header_mmap, buffer_mmap)
                 };
                 run_recver(recver, exit)

@@ -9,8 +9,8 @@ fn bench_queue_with_size<const N: usize>(c: &mut Criterion) {
     let _ = std::fs::remove_file(&header_path);
     let _ = std::fs::remove_file(&buffer_path);
 
-    let header_mmap = shaq::create_header_mmap(&header_path);
-    let buffer_mmap = shaq::create_buffer_mmap(&buffer_path, MAP_SIZE);
+    let header_mmap = shaq::create_header_mmap(&header_path).unwrap();
+    let buffer_mmap = shaq::create_buffer_mmap(&buffer_path, MAP_SIZE).unwrap();
     let mut queue = SharedQueue::new(header_mmap, buffer_mmap);
 
     const NUM_ITEMS_PER_ITERATION: usize = 1024;
@@ -35,13 +35,13 @@ fn bench_producer_consumer_with_size<const N: usize>(c: &mut Criterion) {
     let _ = std::fs::remove_file(header_path);
     let _ = std::fs::remove_file(buffer_path);
     let mut producer = {
-        let header_mmap = shaq::create_header_mmap(&header_path);
-        let buffer_mmap = create_buffer_mmap(buffer_path, MAP_SIZE);
+        let header_mmap = shaq::create_header_mmap(&header_path).unwrap();
+        let buffer_mmap = create_buffer_mmap(buffer_path, MAP_SIZE).unwrap();
         Producer::new(header_mmap, buffer_mmap)
     };
     let mut consumer = {
-        let header_mmap = shaq::join_header_mmap(&header_path);
-        let buffer_mmap = join_buffer_mmap(buffer_path);
+        let header_mmap = shaq::join_header_mmap(&header_path).unwrap();
+        let buffer_mmap = join_buffer_mmap(buffer_path).unwrap();
         Consumer::new(header_mmap, buffer_mmap)
     };
 

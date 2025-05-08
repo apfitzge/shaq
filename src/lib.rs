@@ -1,9 +1,12 @@
+use error::Error;
+use shmem::{create_and_map_file, get_rounded_file_size, open_and_map_file, use_hugepages};
 use std::{
-    fs::{File, OpenOptions},
-    os::fd::AsRawFd,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
 };
+
+pub mod error;
+mod shmem;
 
 pub struct Producer {
     queue: SharedQueue,
@@ -242,163 +245,42 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
     }
 }
 
-fn create_file(path: impl AsRef<Path>, size: usize) -> (File, usize) {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path.as_ref())
-        .unwrap();
-    let use_hugepages = use_hugepages(path.as_ref());
-    let page_size = if use_hugepages {
-        1 << 21
+pub fn create_header_mmap(path: impl AsRef<Path>) -> Result<*mut u8, Error> {
+    let hugepages = use_hugepages(path.as_ref());
+    let file_size = get_rounded_file_size(path.as_ref(), core::mem::size_of::<SharedQueueHeader>());
+
+    create_and_map_file(path.as_ref(), file_size, hugepages, false)
+}
+
+pub fn join_header_mmap(path: impl AsRef<Path>) -> Result<*mut u8, Error> {
+    let hugepages = use_hugepages(path.as_ref());
+    let expected_file_size =
+        get_rounded_file_size(path.as_ref(), core::mem::size_of::<SharedQueueHeader>());
+
+    let (mmap, file_size) = open_and_map_file(path, hugepages, false)?;
+    if file_size != expected_file_size {
+        Err(Error::FileSizeMismatch {
+            expected: expected_file_size,
+            actual: file_size,
+        })
     } else {
-        nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
-            .unwrap()
-            .unwrap() as usize
-    };
-
-    let file_size = (size + page_size - 1) & !(page_size - 1);
-    let file_size = file_size.next_power_of_two();
-    assert!(file_size % page_size == 0);
-
-    file.set_len((file_size) as u64).unwrap();
-
-    (file, file_size)
-}
-
-fn join_file(path: impl AsRef<Path>) -> File {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .unwrap()
-}
-
-pub fn create_header_mmap(path: impl AsRef<Path>) -> *mut u8 {
-    let (file, file_size) = create_file(path.as_ref(), core::mem::size_of::<SharedQueueHeader>());
-    let mmap = map(&file, file_size);
-
-    unsafe {
-        mmap.write_bytes(0, file_size);
+        Ok(mmap)
     }
-
-    mmap
 }
 
-pub fn join_header_mmap(path: impl AsRef<Path>) -> *mut u8 {
-    let file = join_file(path.as_ref());
-    let file_size = file.metadata().unwrap().len() as usize;
-    map(&file, file_size)
+pub fn create_buffer_mmap(
+    path: impl AsRef<Path>,
+    buffer_size: usize,
+) -> Result<(*mut u8, usize), Error> {
+    let hugepages = use_hugepages(path.as_ref());
+    let file_size = get_rounded_file_size(path.as_ref(), buffer_size);
+    let mmap = create_and_map_file(path.as_ref(), file_size, hugepages, true)?;
+    Ok((mmap, file_size))
 }
 
-pub fn create_buffer_mmap(path: impl AsRef<Path>, buffer_size: usize) -> (*mut u8, usize) {
-    let (file, file_size) = create_file(path.as_ref(), buffer_size);
-
-    let mmap = mirror_map(&file, file_size, use_hugepages(path));
-    unsafe {
-        mmap.write_bytes(0, file_size);
-    }
-    (mmap, file_size)
-}
-
-pub fn join_buffer_mmap(path: impl AsRef<Path>) -> (*mut u8, usize) {
-    let file = join_file(path.as_ref());
-    let file_size = file.metadata().unwrap().len() as usize;
-    (
-        mirror_map(&file, file_size, use_hugepages(path.as_ref())),
-        file_size,
-    )
-}
-
-fn use_hugepages(path: impl AsRef<Path>) -> bool {
-    path.as_ref().starts_with("/mnt/hugepages")
-}
-
-fn map(file: &File, file_size: usize) -> *mut u8 {
-    let addr = unsafe {
-        nix::libc::mmap(
-            core::ptr::null_mut(),
-            file_size,
-            nix::libc::PROT_READ | nix::libc::PROT_WRITE,
-            nix::libc::MAP_SHARED, // TODO: support hugepages?
-            file.as_raw_fd(),
-            0,
-        )
-    };
-
-    if addr == nix::libc::MAP_FAILED {
-        panic!("mmap failed: {}", std::io::Error::last_os_error());
-    }
-
-    addr.cast()
-}
-
-fn mirror_map(file: &File, file_size: usize, use_hugepages: bool) -> *mut u8 {
-    let anon_flags = if use_hugepages {
-        nix::libc::MAP_PRIVATE | nix::libc::MAP_ANONYMOUS | nix::libc::MAP_HUGETLB
-    } else {
-        nix::libc::MAP_PRIVATE | nix::libc::MAP_ANONYMOUS
-    };
-
-    let addr = unsafe {
-        nix::libc::mmap(
-            core::ptr::null_mut(),
-            file_size * 2,
-            nix::libc::PROT_NONE,
-            anon_flags,
-            -1,
-            0,
-        )
-    };
-
-    if addr == nix::libc::MAP_FAILED {
-        panic!("reserve failed: {}", std::io::Error::last_os_error());
-    }
-
-    let addr1 = addr;
-    let addr2 = (addr as usize + file_size) as *mut nix::libc::c_void;
-
-    let flags = if use_hugepages {
-        nix::libc::MAP_SHARED
-            | nix::libc::MAP_FIXED
-            | nix::libc::MAP_HUGETLB
-            | nix::libc::MAP_POPULATE
-    } else {
-        nix::libc::MAP_SHARED | nix::libc::MAP_FIXED | nix::libc::MAP_POPULATE
-    };
-
-    let first = unsafe {
-        nix::libc::mmap(
-            addr1,
-            file_size,
-            nix::libc::PROT_READ | nix::libc::PROT_WRITE,
-            flags,
-            file.as_raw_fd(),
-            0,
-        )
-    };
-
-    if first == nix::libc::MAP_FAILED {
-        panic!("first map failed: {}", std::io::Error::last_os_error());
-    }
-
-    let second = unsafe {
-        nix::libc::mmap(
-            addr2,
-            file_size,
-            nix::libc::PROT_READ | nix::libc::PROT_WRITE,
-            flags,
-            file.as_raw_fd(),
-            0,
-        )
-    };
-
-    if second == nix::libc::MAP_FAILED {
-        panic!("second map failed: {}", std::io::Error::last_os_error());
-    }
-
-    first.cast()
+pub fn join_buffer_mmap(path: impl AsRef<Path>) -> Result<(*mut u8, usize), Error> {
+    let hugepages = use_hugepages(path.as_ref());
+    open_and_map_file(path, hugepages, true)
 }
 
 #[cfg(test)]
@@ -413,8 +295,8 @@ mod tests {
         let _ = std::fs::remove_file(buffer_path);
 
         let mut queue = SharedQueue::new(
-            create_header_mmap(header_path),
-            create_buffer_mmap(buffer_path, 1024),
+            create_header_mmap(header_path).unwrap(),
+            create_buffer_mmap(buffer_path, 1024).unwrap(),
         );
 
         let original_data = b"hello world";
@@ -450,8 +332,8 @@ mod tests {
         let _ = std::fs::remove_file(header_path);
         let _ = std::fs::remove_file(buffer_path);
         let mut queue = SharedQueue::new(
-            create_header_mmap(header_path),
-            create_buffer_mmap(buffer_path, 1024),
+            create_header_mmap(header_path).unwrap(),
+            create_buffer_mmap(buffer_path, 1024).unwrap(),
         );
 
         let message1 = b"hello world";
@@ -493,8 +375,8 @@ mod tests {
         let _ = std::fs::remove_file(header_path);
         let _ = std::fs::remove_file(buffer_path);
         let mut queue = SharedQueue::new(
-            create_header_mmap(header_path),
-            create_buffer_mmap(buffer_path, 1024),
+            create_header_mmap(header_path).unwrap(),
+            create_buffer_mmap(buffer_path, 1024).unwrap(),
         );
         let buffer_size = queue.buffer_size();
 
@@ -556,11 +438,13 @@ mod tests {
         let _ = std::fs::remove_file(buffer_path);
 
         let mut sender = SharedQueue::new(
-            create_header_mmap(header_path),
-            create_buffer_mmap(buffer_path, 1024),
+            create_header_mmap(header_path).unwrap(),
+            create_buffer_mmap(buffer_path, 1024).unwrap(),
         );
-        let mut recver =
-            SharedQueue::new(join_header_mmap(header_path), join_buffer_mmap(buffer_path));
+        let mut recver = SharedQueue::new(
+            join_header_mmap(header_path).unwrap(),
+            join_buffer_mmap(buffer_path).unwrap(),
+        );
 
         let message1 = b"hello world";
         let message2 = b"wasup";
@@ -615,13 +499,13 @@ mod tests {
         let _ = std::fs::remove_file(buffer_path);
 
         let mut producer = {
-            let header_mmap = create_header_mmap(header_path);
-            let buffer_mmap = create_buffer_mmap(buffer_path, 1024);
+            let header_mmap = create_header_mmap(header_path).unwrap();
+            let buffer_mmap = create_buffer_mmap(buffer_path, 1024).unwrap();
             Producer::new(header_mmap, buffer_mmap)
         };
         let mut consumer = {
-            let header_mmap = join_header_mmap(header_path);
-            let buffer_mmap = join_buffer_mmap(buffer_path);
+            let header_mmap = join_header_mmap(header_path).unwrap();
+            let buffer_mmap = join_buffer_mmap(buffer_path).unwrap();
             Consumer::new(header_mmap, buffer_mmap)
         };
 
