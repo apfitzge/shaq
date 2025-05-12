@@ -11,14 +11,13 @@ fn main() {
     })
     .unwrap();
 
-    let header_path = "/mnt/hugepages/shaq_enqueue_dequeue_header";
+    let header_path = "/tmp/shaq_enqueue_dequeue_header";
     let buffer_path = "/mnt/hugepages/shaq_enqueue_dequeue_buffer";
     let _ = std::fs::remove_file(header_path);
     let _ = std::fs::remove_file(buffer_path);
 
     let header_ptr = shaq::create_header_mmap(header_path).unwrap();
-    let (buffer_ptr, file_size) =
-        shaq::create_buffer_mmap(buffer_path, 1024 * 1024 * 1024).unwrap();
+    let (buffer_ptr, file_size) = shaq::create_buffer_mmap(buffer_path, 16 * 1024 * 1024).unwrap();
     let header_ptr = header_ptr as usize;
     let buffer_ptr = buffer_ptr as usize;
 
