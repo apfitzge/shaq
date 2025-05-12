@@ -103,7 +103,7 @@ fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>) {
             let elapsed = now.duration_since(last_time);
             last_time = now;
             println!(
-                "{:.02} GB/sec - {:.0} items/sec. ({} items, {} failed reserveds)",
+                "{:.02} GB/sec - {:.0} items/sec. ({} items, {} failed reserves)",
                 (message_count * ITEM_SIZE) as f64 / (elapsed.as_secs_f64()) / 1e9,
                 (message_count as f64) / elapsed.as_secs_f64(),
                 message_count,
