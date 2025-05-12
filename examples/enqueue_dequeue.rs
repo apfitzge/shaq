@@ -4,6 +4,13 @@ use std::sync::{
 };
 
 fn main() {
+    let (recver_core_id, sender_core_id) = core_affinity::get_core_ids()
+        .map(|c| {
+            // Get the last 2 cores - assuming these are sorted.
+            (Some(c[c.len() - 2]), Some(c[c.len() - 1]))
+        })
+        .unwrap_or_default();
+
     let exit = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let exit = exit.clone();
@@ -26,6 +33,10 @@ fn main() {
         .spawn({
             let exit = exit.clone();
             move || {
+                if let Some(id) = recver_core_id {
+                    core_affinity::set_for_current(id);
+                }
+
                 let recver = {
                     let header_mmap = shaq::join_header_mmap(header_path).unwrap();
                     let buffer_mmap = shaq::join_buffer_mmap(buffer_path).unwrap();
@@ -39,6 +50,10 @@ fn main() {
     let sender_hdl = std::thread::Builder::new()
         .name("shaqSender".to_string())
         .spawn(move || {
+            if let Some(id) = sender_core_id {
+                core_affinity::set_for_current(id);
+            }
+
             let header_ptr = header_ptr as *mut u8;
             let buffer_ptr = buffer_ptr as *mut u8;
             let sender = { shaq::Producer::new(header_ptr, (buffer_ptr, file_size)) };
