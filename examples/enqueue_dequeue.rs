@@ -4,12 +4,26 @@ use std::sync::{
 };
 
 fn main() {
+    let item_size = std::env::args()
+        .skip(1)
+        .next()
+        .map(|s| s.parse::<usize>().expect("invalid item size"))
+        .unwrap_or(512);
+
     let (recver_core_id, sender_core_id) = core_affinity::get_core_ids()
         .map(|c| {
             // Get the last 2 cores - assuming these are sorted.
             (Some(c[c.len() - 2]), Some(c[c.len() - 1]))
         })
         .unwrap_or_default();
+
+    println!("Using item size: {} bytes", item_size);
+    if let Some(recver_core_id) = recver_core_id.as_ref() {
+        println!("Receiver core id: {}", recver_core_id.id);
+    }
+    if let Some(sender_core_id) = sender_core_id.as_ref() {
+        println!("Sender core id: {}", sender_core_id.id);
+    }
 
     let exit = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
@@ -20,9 +34,14 @@ fn main() {
 
     let header_path = "/tmp/shaq_enqueue_dequeue_header";
     let buffer_path = "/mnt/hugepages/shaq_enqueue_dequeue_buffer";
+    println!(
+        "Cleaning header file and buffer file: {} {}",
+        header_path, buffer_path
+    );
     let _ = std::fs::remove_file(header_path);
     let _ = std::fs::remove_file(buffer_path);
 
+    println!("Initializing files");
     let header_ptr = shaq::create_header_mmap(header_path).unwrap();
     let (buffer_ptr, file_size) = shaq::create_buffer_mmap(buffer_path, 16 * 1024 * 1024).unwrap();
     let header_ptr = header_ptr as usize;
@@ -42,7 +61,8 @@ fn main() {
                     let buffer_mmap = shaq::join_buffer_mmap(buffer_path).unwrap();
                     shaq::Consumer::new(header_mmap, buffer_mmap)
                 };
-                run_recver(recver, exit)
+                println!("Receiver initialized");
+                run_recver(recver, exit, item_size)
             }
         })
         .unwrap();
@@ -57,23 +77,25 @@ fn main() {
             let header_ptr = header_ptr as *mut u8;
             let buffer_ptr = buffer_ptr as *mut u8;
             let sender = { shaq::Producer::new(header_ptr, (buffer_ptr, file_size)) };
-            run_sender(sender, exit);
+            println!("Sender initialized");
+            run_sender(sender, exit, item_size);
         })
         .unwrap();
 
     recver_hdl.join().unwrap();
     sender_hdl.join().unwrap();
 
+    println!("Cleaning up files");
     let _ = std::fs::remove_file(header_path);
     let _ = std::fs::remove_file(buffer_path);
 }
 
-const ITEM_SIZE: usize = 512;
 const BYTES_PER_BATCH: usize = 100_000;
-const MESSAGES_PER_BATCH: usize = BYTES_PER_BATCH / ITEM_SIZE;
 
 #[inline(never)]
-fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>) {
+fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>, item_size: usize) {
+    let messages_per_batch = BYTES_PER_BATCH / item_size;
+
     let mut message_count = 0;
     let mut failed_reserves = 0;
     let mut batch_count = 0;
@@ -81,15 +103,15 @@ fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>) {
     let mut value = 0;
     while !exit.load(Ordering::Relaxed) {
         // Push in batches.
-        for _ in 0..MESSAGES_PER_BATCH {
+        for _ in 0..messages_per_batch {
             // Loop until we write the message.
             loop {
-                let Some(ptr) = sender.reserve(ITEM_SIZE) else {
+                let Some(ptr) = sender.reserve(item_size) else {
                     failed_reserves += 1;
                     continue;
                 };
 
-                write_item(ptr, value);
+                write_item(ptr, value, item_size);
                 value += 1;
                 message_count += 1;
                 break;
@@ -104,7 +126,7 @@ fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>) {
             last_time = now;
             println!(
                 "{:.02} GB/sec - {:.0} items/sec. ({} items, {} failed reserves)",
-                (message_count * ITEM_SIZE) as f64 / (elapsed.as_secs_f64()) / 1e9,
+                (message_count * item_size) as f64 / (elapsed.as_secs_f64()) / 1e9,
                 (message_count as f64) / elapsed.as_secs_f64(),
                 message_count,
                 failed_reserves
@@ -116,18 +138,17 @@ fn run_sender(mut sender: shaq::Producer, exit: Arc<AtomicBool>) {
     }
 }
 
-#[repr(C, align(64))]
-struct AlignedBuffer([u8; ITEM_SIZE]);
-
 #[inline(never)]
-fn write_item(ptr: *mut u8, value: u8) {
+fn write_item(ptr: *mut u8, value: u8, item_size: usize) {
     unsafe {
-        *ptr.cast() = AlignedBuffer([value; ITEM_SIZE]);
+        core::ptr::write_bytes(ptr, value, item_size);
     }
 }
 
 #[inline(never)]
-fn run_recver(mut recver: shaq::Consumer, exit: Arc<AtomicBool>) {
+fn run_recver(mut recver: shaq::Consumer, exit: Arc<AtomicBool>, item_size: usize) {
+    let messages_per_batch = BYTES_PER_BATCH / item_size;
+
     let mut value = 0u8;
     while !exit.load(Ordering::Relaxed) {
         recver.sync();
@@ -146,7 +167,7 @@ fn run_recver(mut recver: shaq::Consumer, exit: Arc<AtomicBool>) {
             value += 1;
 
             num_messages += 1;
-            if num_messages == MESSAGES_PER_BATCH {
+            if num_messages == messages_per_batch {
                 recver.sync();
             }
         }
