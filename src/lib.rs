@@ -1,237 +1,288 @@
-use error::Error;
-use shmem::{
-    create_and_map_file, get_rounded_file_size, open_and_map_file, round_to_next_cacheline,
-    use_hugepages, CACHELINE_SIZE,
-};
-use std::{
-    path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+use core::{ptr::NonNull, sync::atomic::AtomicUsize};
+use std::{path::Path, sync::atomic::Ordering};
+
+use crate::{
+    error::Error,
+    shmem::{create_and_map_file, open_and_map_file},
 };
 
 pub mod error;
 mod shmem;
 
-pub struct Producer {
-    queue: SharedQueue,
-    head: usize,
-    tail: usize,
+/// Calculates the minimum file size required for a queue with given capacity.
+/// Note that file size MAY need to be increased beyond this to account for
+/// page-size requirements.
+pub const fn minimum_file_size<T: Sized>(capacity: usize) -> usize {
+    let buffer_offset = SharedQueueHeader::buffer_offset::<T>();
+    buffer_offset + capacity * core::mem::size_of::<T>()
 }
 
-impl Producer {
-    pub fn new(header_ptr: *mut u8, buffer_ptr_and_file_size: (*mut u8, usize)) -> Self {
-        let queue = SharedQueue::new(header_ptr, buffer_ptr_and_file_size);
-        let head = queue.header().head.load(Ordering::Acquire);
-        let tail = queue.header().tail.load(Ordering::Relaxed);
-        Self { queue, head, tail }
+/// Producer side of the SPSC shared queue.
+pub struct Producer<T: Sized> {
+    queue: SharedQueue<T>,
+}
+
+unsafe impl<T> Send for Producer<T> {}
+unsafe impl<T> Sync for Producer<T> {}
+
+impl<T: Sized> Producer<T> {
+    /// Creates a new producer for the shared queue at the specified path with the given size.
+    pub fn create(path: impl AsRef<Path>, size: usize) -> Result<Self, Error> {
+        let header = SharedQueueHeader::create::<T>(path, size)?;
+        Self::from_header(header)
     }
 
-    /// Write data to the queue - the [`Consumer`] cannot see it until
-    /// [`Self::commit`] is called.
-    pub fn try_enqueue(&mut self, data: &[u8]) -> bool {
-        let Some(reserved_buffer) = self.reserve(data.len()) else {
-            return false;
+    /// Joins an existing producer for the shared queue at the specified path.
+    pub fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let header = SharedQueueHeader::join::<T>(path)?;
+        Self::from_header(header)
+    }
+
+    fn from_header(header: NonNull<SharedQueueHeader>) -> Result<Self, Error> {
+        Ok(Self {
+            queue: SharedQueue::from_header(header)?,
+        })
+    }
+
+    /// Return the capacity of the queue in items.
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
+    /// Reserves a position, and increments the cached write position.
+    /// Returns `None` if the queue is full.
+    /// Returns a pointer to the reserved position.
+    ///
+    /// All reserved positions should be written and pointers discarded before
+    /// calling `commit`.
+    pub fn reserve(&mut self) -> Option<NonNull<T>> {
+        // If write is >= read + buffer_size, the queue is written one iteration
+        // ahead of the consumer, and we cannot reserve more space.
+        if self.queue.cached_write.wrapping_sub(self.queue.cached_read)
+            >= self.queue.header().buffer_size
+        {
+            return None;
+        }
+
+        let reserved_index = self.queue.mask(self.queue.cached_write);
+        // SAFETY: The reserved index is guaranteed to be within bounds given the mask.
+        let reserved_ptr = unsafe { self.queue.buffer.add(reserved_index) };
+        self.queue.cached_write = self.queue.cached_write.wrapping_add(1);
+
+        Some(reserved_ptr)
+    }
+
+    /// Commits the reserved position, making it visible to the consumer.
+    pub fn commit(&self) {
+        self.queue
+            .header()
+            .write
+            .store(self.queue.cached_write, Ordering::Release);
+    }
+
+    /// Synchronize the producer's cached read position with the queue's read position.
+    pub fn sync(&mut self) {
+        self.queue.load_read();
+    }
+}
+
+/// Consumer side of the SPSC shared queue.
+pub struct Consumer<T: Sized> {
+    queue: SharedQueue<T>,
+}
+
+unsafe impl<T> Send for Consumer<T> {}
+unsafe impl<T> Sync for Consumer<T> {}
+
+impl<T: Sized> Consumer<T> {
+    /// Creates a new consumer for the shared queue at the specified path with the given size.
+    pub fn create(path: impl AsRef<Path>, size: usize) -> Result<Self, Error> {
+        let header = SharedQueueHeader::create::<T>(path, size)?;
+        Self::from_header(header)
+    }
+
+    /// Joins an existing consumer for the shared queue at the specified path.
+    pub fn join(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let header = SharedQueueHeader::join::<T>(path)?;
+        Self::from_header(header)
+    }
+
+    fn from_header(header: NonNull<SharedQueueHeader>) -> Result<Self, Error> {
+        Ok(Self {
+            queue: SharedQueue::from_header(header)?,
+        })
+    }
+
+    /// Return the capacity of the queue in items.
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
+    /// Attempts to read a value from the queue.
+    /// Returns `None` if there are no values available.
+    /// Returns a pointer to the value if available.
+    ///
+    /// All read items should be processed and pointers discarded before
+    /// calling `finalize`.
+    pub fn try_read(&mut self) -> Option<NonNull<T>> {
+        if self.queue.cached_read == self.queue.cached_write {
+            return None; // Queue is empty
+        }
+
+        let read_index = self.queue.mask(self.queue.cached_read);
+        let read_ptr = unsafe { self.queue.buffer.add(read_index) };
+        self.queue.cached_read = self.queue.cached_read.wrapping_add(1);
+
+        Some(read_ptr)
+    }
+
+    /// Publishes the read position, making it visible to the producer.
+    /// All previously read items MUST be processed before this is called.
+    pub fn finalize(&self) {
+        self.queue
+            .header()
+            .read
+            .store(self.queue.cached_read, Ordering::Release);
+    }
+
+    /// Synchronizes the consumer's cached write position with the queue's write position.
+    pub fn sync(&mut self) {
+        self.queue.load_write();
+    }
+}
+
+struct SharedQueue<T: Sized> {
+    header: NonNull<SharedQueueHeader>,
+    buffer: NonNull<T>,
+
+    buffer_mask: usize,
+    cached_write: usize,
+    cached_read: usize,
+}
+
+impl<T: Sized> SharedQueue<T> {
+    fn from_header(header: NonNull<SharedQueueHeader>) -> Result<Self, Error> {
+        let size = unsafe { header.as_ref().buffer_size };
+        debug_assert!(size.is_power_of_two() && size > 0, "Invalid buffer size");
+
+        let buffer = Self::buffer_from_header(header);
+
+        let mut queue = Self {
+            header,
+            buffer,
+            buffer_mask: size - 1,
+            cached_write: 0,
+            cached_read: 0,
         };
 
-        unsafe {
-            reserved_buffer.copy_from_nonoverlapping(data.as_ptr(), data.len());
-        }
-        true
+        queue.load_write();
+        queue.load_read();
+
+        Ok(queue)
     }
 
-    /// Reserve a buffer for writing data. The [`Consumer`] cannot see it until
-    /// [`Self::commit`] is called.
-    pub fn reserve(&mut self, size: usize) -> Option<*mut u8> {
-        let (reserved_buffer, tail) = self
-            .queue
-            .reserve_with_head_and_tail(size, self.head, self.tail)?;
-        self.tail = tail;
-        Some(reserved_buffer)
+    fn buffer_from_header(header: NonNull<SharedQueueHeader>) -> NonNull<T> {
+        let after_header = unsafe { header.add(1) };
+        let byte_ptr = after_header.cast::<u8>();
+        let offset_to_align = byte_ptr.align_offset(core::mem::align_of::<T>());
+        let aligned_ptr = unsafe { byte_ptr.byte_add(offset_to_align) };
+        aligned_ptr.cast()
     }
 
-    /// Commit the data to the queue. The [`Consumer`] can now see it.
-    /// This is a release operation, so it must be called after all writes to
-    /// the reserved buffer are done.
-    pub fn commit(&mut self) {
-        std::sync::atomic::fence(Ordering::Release);
-        self.head = self.queue.header().head.load(Ordering::Acquire);
-        self.queue.header().tail.store(self.tail, Ordering::Release);
-        std::sync::atomic::fence(Ordering::Release);
-    }
-}
-
-pub struct Consumer {
-    queue: SharedQueue,
-    head: usize,
-    tail: usize,
-}
-
-impl Consumer {
-    pub fn new(header_ptr: *mut u8, buffer_ptr_and_file_size: (*mut u8, usize)) -> Self {
-        let queue = SharedQueue::new(header_ptr, buffer_ptr_and_file_size);
-        let head = queue.header().head.load(Ordering::Acquire);
-        let tail = queue.header().tail.load(Ordering::Relaxed);
-        Self { queue, head, tail }
-    }
-
-    /// Try to dequeue a message from the queue. Returns `None` if there is no
-    /// message available.
-    /// This does not update the head of the shared queue so the space is not
-    /// freed for the [`Producer`] to use until [`Self::sync`] is called.
-    pub fn try_dequeue(&mut self) -> Option<&[u8]> {
-        let (data_ptr, len, head) = self
-            .queue
-            .try_pop_with_head_and_tail(self.head, self.tail)?;
-        self.head = head;
-        Some(unsafe { core::slice::from_raw_parts(data_ptr, len) })
-    }
-
-    /// Sync the queue with the current head and tail.
-    pub fn sync(&mut self) {
-        std::sync::atomic::fence(Ordering::Release);
-        self.tail = self.queue.header().tail.load(Ordering::Acquire);
-        self.queue.header().head.store(self.head, Ordering::Release);
-        std::sync::atomic::fence(Ordering::Release);
-    }
-}
-
-#[repr(C)]
-struct SharedQueueHeader {
-    head: CacheAlignedAtomicSize,
-    tail: CacheAlignedAtomicSize,
-}
-
-pub struct SharedQueue {
-    header_ptr: *mut u8,
-    buffer_ptr: *mut u8,
-    buffer_size: usize,
-    buffer_mask: usize,
-}
-
-impl SharedQueue {
-    pub fn new(header_ptr: *mut u8, buffer_ptr_and_file_size: (*mut u8, usize)) -> Self {
-        Self {
-            header_ptr,
-            buffer_ptr: buffer_ptr_and_file_size.0,
-            buffer_size: buffer_ptr_and_file_size.1,
-            buffer_mask: buffer_ptr_and_file_size.1 - 1,
-        }
-    }
-
-    /// Get the size of the buffer - this may have been rounded during creation.
-    pub fn buffer_size(&self) -> usize {
-        self.buffer_size
-    }
-
-    fn header(&self) -> &SharedQueueHeader {
-        unsafe { &*(self.header_ptr as *const SharedQueueHeader) }
-    }
-
-    fn buffer_ptr(&mut self) -> *mut u8 {
-        self.buffer_ptr
+    fn capacity(&self) -> usize {
+        self.buffer_mask + 1
     }
 
     fn mask(&self, index: usize) -> usize {
         index & self.buffer_mask
     }
 
-    /// Reserve a buffer using a passed value of `head` and `tail`.
-    /// If the reservation is successful, return the pointer to the buffer,
-    /// and the next tail value.
-    fn reserve_with_head_and_tail(
-        &mut self,
-        size: usize,
-        head: usize,
-        tail: usize,
-    ) -> Option<(*mut u8, usize)> {
-        // Size written at the current `tail`.
-        const _: () = assert!(core::mem::size_of::<u32>() < CACHELINE_SIZE);
-        let cache_aligned_payload_tail = tail.wrapping_add(CACHELINE_SIZE);
-
-        // The end of the payload would naturally fall at:
-        // `cache_aligned_payload_tail + size`.
-        // However, we round to the next cacheline boundary.
-        let next_tail = round_to_next_cacheline(cache_aligned_payload_tail.wrapping_add(size));
-
-        // Round contiguous size to the next 64 byte boundary.
-        let contiguous_size = next_tail.wrapping_sub(tail);
-        let remaining = self.buffer_size.wrapping_sub(tail.wrapping_sub(head));
-        if remaining < contiguous_size {
-            return None;
-        }
-
-        let starting_pos = self.mask(tail);
-        let buf = self.buffer_ptr();
-        unsafe {
-            buf.add(starting_pos).cast::<u32>().write(size as u32);
-        }
-
-        // Return a pointer to the data.
-        let reserved_buffer = unsafe { buf.add(starting_pos).add(CACHELINE_SIZE) };
-        Some((reserved_buffer, next_tail))
+    #[inline]
+    fn header(&self) -> &SharedQueueHeader {
+        unsafe { self.header.as_ref() }
     }
 
-    fn commit_tail(&mut self, tail: usize) {
-        std::sync::atomic::fence(Ordering::Release);
-        self.header().tail.store(tail, Ordering::Release);
-        std::sync::atomic::fence(Ordering::Release);
+    #[inline]
+    fn load_write(&mut self) {
+        self.cached_write = self.header().write.load(Ordering::Acquire);
     }
 
-    pub fn try_enqueue(&mut self, data: &[u8]) -> bool {
-        let head = self.header().head.load(Ordering::Acquire);
-        let tail = self.header().tail.load(Ordering::Relaxed);
-
-        let Some((reserved_buffer, tail)) = self.reserve_with_head_and_tail(data.len(), head, tail)
-        else {
-            return false;
-        };
-
-        unsafe {
-            reserved_buffer.copy_from_nonoverlapping(data.as_ptr(), data.len());
-        }
-        self.commit_tail(tail);
-        true
-    }
-
-    pub fn try_dequeue<'a>(&'a mut self) -> Option<&'a [u8]> {
-        let tail = self.header().tail.load(Ordering::Acquire);
-        let head = self.header().head.load(Ordering::Relaxed);
-
-        let (data, len, head) = self.try_pop_with_head_and_tail(head, tail)?;
-        std::sync::atomic::fence(Ordering::Release);
-        self.header().head.store(head, Ordering::Release);
-        Some(unsafe { core::slice::from_raw_parts(data, len) })
-    }
-
-    /// Try to pop a message from the queue, returning the message, length, and new head.
-    fn try_pop_with_head_and_tail(
-        &mut self,
-        head: usize,
-        tail: usize,
-    ) -> Option<(*const u8, usize, usize)> {
-        if head == tail {
-            return None;
-        }
-        let buf = self.buffer_ptr();
-
-        // Get the current position and read the length.
-        let pos = self.mask(head);
-        let len = unsafe { buf.add(pos).cast::<u32>().read() } as usize;
-
-        // Cache-aligned payload will live at the next cacheline boundary.
-        let cache_aligned_payload_head = head.wrapping_add(CACHELINE_SIZE);
-        let next_head = round_to_next_cacheline(cache_aligned_payload_head.wrapping_add(len));
-
-        // Payload lives at next cacheline boundary.
-        let data_ptr = unsafe { buf.add(pos).add(CACHELINE_SIZE) };
-
-        Some((data_ptr, len, next_head))
+    #[inline]
+    fn load_read(&mut self) {
+        self.cached_read = self.header().read.load(Ordering::Acquire);
     }
 }
 
-/// `AtomicUsize` with 128-byte alignment for better performance.
+/// Header in shared memory for the queue.
+#[repr(C)]
+struct SharedQueueHeader {
+    write: CacheAlignedAtomicSize,
+    read: CacheAlignedAtomicSize,
+    buffer_size: usize,
+}
+
+impl SharedQueueHeader {
+    fn create<T: Sized>(path: impl AsRef<Path>, size: usize) -> Result<NonNull<Self>, Error> {
+        let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(size)?;
+        let header = create_and_map_file(path, size)?.cast::<Self>();
+        Self::initialize(header, buffer_size_in_items);
+        Ok(header)
+    }
+
+    const fn buffer_offset<T: Sized>() -> usize {
+        (core::mem::size_of::<Self>() + core::mem::align_of::<T>() - 1)
+            & !(core::mem::align_of::<T>() - 1)
+    }
+
+    const fn calculate_buffer_size_in_items<T: Sized>(file_size: usize) -> Result<usize, Error> {
+        let buffer_offset = Self::buffer_offset::<T>();
+        if file_size < buffer_offset {
+            return Err(Error::InvalidBufferSize);
+        }
+
+        // The buffer size (in units of T) must be a power of two.
+        let buffer_size_in_bytes = file_size - buffer_offset;
+        let mut buffer_size_in_items = buffer_size_in_bytes / core::mem::size_of::<T>();
+        if !buffer_size_in_items.is_power_of_two() {
+            // If not a power of two, round down to the previous power of two.
+            buffer_size_in_items = buffer_size_in_items.next_power_of_two() >> 1;
+            if buffer_size_in_items == 0 {
+                return Err(Error::InvalidBufferSize);
+            }
+        }
+
+        Ok(buffer_size_in_items)
+    }
+
+    fn initialize(mut header: NonNull<Self>, buffer_size_in_items: usize) {
+        let header = unsafe { header.as_mut() };
+        header.write.store(0, Ordering::Release);
+        header.read.store(0, Ordering::Release);
+        header.buffer_size = buffer_size_in_items;
+    }
+
+    fn join<T: Sized>(path: impl AsRef<Path>) -> Result<NonNull<Self>, Error> {
+        let (header, file_size) = open_and_map_file(path)?;
+        let header = header.cast::<Self>();
+        {
+            let header = unsafe { header.as_ref() };
+            if header.buffer_size == 0
+                || !header.buffer_size.is_power_of_two()
+                || header.buffer_size * core::mem::size_of::<T>() + core::mem::size_of::<Self>()
+                    > file_size
+            {
+                return Err(Error::InvalidBufferSize);
+            }
+        }
+
+        Ok(header)
+    }
+}
+
+/// `AtomicUsize` with 64-byte alignment for better performance.
 #[derive(Default)]
-#[repr(C, align(128))]
-pub struct CacheAlignedAtomicSize {
+#[repr(C, align(64))]
+struct CacheAlignedAtomicSize {
     inner: AtomicUsize,
 }
 
@@ -243,318 +294,81 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
     }
 }
 
-pub fn create_header_mmap(path: impl AsRef<Path>) -> Result<*mut u8, Error> {
-    let hugepages = use_hugepages(path.as_ref());
-    let file_size = get_rounded_file_size(path.as_ref(), core::mem::size_of::<SharedQueueHeader>());
-
-    create_and_map_file(path.as_ref(), file_size, hugepages, false)
-}
-
-pub fn join_header_mmap(path: impl AsRef<Path>) -> Result<*mut u8, Error> {
-    let hugepages = use_hugepages(path.as_ref());
-    let expected_file_size =
-        get_rounded_file_size(path.as_ref(), core::mem::size_of::<SharedQueueHeader>());
-
-    let (mmap, file_size) = open_and_map_file(path, hugepages, false)?;
-    if file_size != expected_file_size {
-        Err(Error::FileSizeMismatch {
-            expected: expected_file_size,
-            actual: file_size,
-        })
-    } else {
-        Ok(mmap)
-    }
-}
-
-pub fn create_buffer_mmap(
-    path: impl AsRef<Path>,
-    buffer_size: usize,
-) -> Result<(*mut u8, usize), Error> {
-    let hugepages = use_hugepages(path.as_ref());
-    let file_size = get_rounded_file_size(path.as_ref(), buffer_size);
-    let mmap = create_and_map_file(path.as_ref(), file_size, hugepages, true)?;
-    Ok((mmap, file_size))
-}
-
-pub fn join_buffer_mmap(path: impl AsRef<Path>) -> Result<(*mut u8, usize), Error> {
-    let hugepages = use_hugepages(path.as_ref());
-    open_and_map_file(path, hugepages, true)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use super::*;
 
-    #[test]
-    fn test_shared_queue_simple_message() {
-        let header_path = "/tmp/test_shared_queue_simple_message_header";
-        let buffer_path = "/tmp/test_shared_queue_simple_message_buffer";
-        let _ = std::fs::remove_file(header_path);
-        let _ = std::fs::remove_file(buffer_path);
+    fn create_test_queue<T: Sized>(buffer: &mut [u8]) -> (Producer<T>, Consumer<T>) {
+        let file_size = buffer.len();
+        let buffer_size_in_items =
+            SharedQueueHeader::calculate_buffer_size_in_items::<T>(file_size)
+                .expect("Invalid buffer size");
+        let header = NonNull::new(buffer.as_mut_ptr().cast()).expect("Failed to create header");
+        SharedQueueHeader::initialize(header, buffer_size_in_items);
 
-        let mut queue = SharedQueue::new(
-            create_header_mmap(header_path).unwrap(),
-            create_buffer_mmap(buffer_path, 1024).unwrap(),
-        );
-
-        let original_data = b"hello world";
-        assert!(queue.try_enqueue(original_data));
-
-        let expected_position = CACHELINE_SIZE + round_to_next_cacheline(original_data.len());
-        assert_eq!(
-            queue.header().tail.load(Ordering::Acquire),
-            expected_position
-        );
-        assert_eq!(queue.header().head.load(Ordering::Acquire), 0);
-
-        // Dequeue the data.
-        let dequeued_data = queue.try_dequeue().unwrap();
-        assert_eq!(dequeued_data, original_data);
-        assert_eq!(
-            queue.header().head.load(Ordering::Acquire),
-            expected_position
-        );
-        assert_eq!(
-            queue.header().tail.load(Ordering::Acquire),
-            expected_position
-        );
-
-        let _ = std::fs::remove_file(header_path);
-        let _ = std::fs::remove_file(buffer_path);
+        (
+            Producer::from_header(header).expect("Failed to create producer"),
+            Consumer::from_header(header).expect("Failed to create consumer"),
+        )
     }
 
     #[test]
-    fn test_shared_queue_variable_sized_messages() {
-        let header_path = "/tmp/test_shared_queue_variable_sized_messages_header";
-        let buffer_path = "/tmp/test_shared_queue_variable_sized_messages_buffer";
-        let _ = std::fs::remove_file(header_path);
-        let _ = std::fs::remove_file(buffer_path);
-        let mut queue = SharedQueue::new(
-            create_header_mmap(header_path).unwrap(),
-            create_buffer_mmap(buffer_path, 1024).unwrap(),
-        );
+    fn test_producer_consumer() {
+        type Item = AtomicU64;
+        const BUFFER_CAPACITY: usize = 1024;
+        const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
+        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let (mut producer, mut consumer) = create_test_queue::<Item>(&mut buffer);
 
-        let message1 = b"hello world";
-        let message2 = b"wasup";
+        assert_eq!(producer.capacity(), BUFFER_CAPACITY);
+        assert_eq!(consumer.capacity(), BUFFER_CAPACITY);
 
-        assert!(queue.try_enqueue(message1));
-        assert!(queue.try_enqueue(message2));
+        unsafe {
+            producer
+                .reserve()
+                .expect("Failed to reserve")
+                .as_ref()
+                .store(42, Ordering::Release);
+            assert!(consumer.try_read().is_none()); // not committed yet
+            producer.commit();
+            assert!(consumer.try_read().is_none()); // consumer has not synced yet
+            consumer.sync();
+            let item = consumer.try_read().expect("Failed to read item");
+            assert_eq!(item.as_ref().load(Ordering::Acquire), 42);
+            assert!(consumer.try_read().is_none()); // no more items to read
+            consumer.finalize();
+            producer.sync();
 
-        let message1_len = CACHELINE_SIZE + round_to_next_cacheline(message1.len());
-        let message2_len = CACHELINE_SIZE + round_to_next_cacheline(message2.len());
+            // Ensure we can push up to the capacity.
+            for _ in 0..BUFFER_CAPACITY {
+                let spot = producer.reserve().expect("Failed to reserve");
+                spot.as_ref().store(1, Ordering::Release);
+            }
+            assert!(producer.reserve().is_none()); // buffer is full, we cannot reserve more
+            producer.commit();
+            consumer.sync();
+            for _ in 0..BUFFER_CAPACITY {
+                let item = consumer.try_read().expect("Failed to read item");
+                assert_eq!(item.as_ref().load(Ordering::Acquire), 1);
+            }
+            assert!(consumer.try_read().is_none()); // no more items to read
+            consumer.finalize();
+            producer.sync();
 
-        assert_eq!(
-            queue.header().tail.load(Ordering::Acquire),
-            message1_len + message2_len,
-        );
-        assert_eq!(queue.header().head.load(Ordering::Acquire), 0);
-
-        // Dequeue the data.
-        assert_eq!(queue.try_dequeue().unwrap(), message1);
-        assert_eq!(queue.try_dequeue().unwrap(), message2);
-        assert!(queue.try_dequeue().is_none());
-
-        assert_eq!(
-            queue.header().head.load(Ordering::Acquire),
-            message1_len + message2_len,
-        );
-        assert_eq!(
-            queue.header().tail.load(Ordering::Acquire),
-            message1_len + message2_len,
-        );
-        let _ = std::fs::remove_file(header_path);
-        let _ = std::fs::remove_file(buffer_path);
-    }
-
-    #[test]
-    fn test_shared_queue_wrap_around() {
-        let header_path = "/tmp/test_shared_queue_wrap_around_header";
-        let buffer_path = "/tmp/test_shared_queue_wrap_around_buffer";
-        let _ = std::fs::remove_file(header_path);
-        let _ = std::fs::remove_file(buffer_path);
-        let mut queue = SharedQueue::new(
-            create_header_mmap(header_path).unwrap(),
-            create_buffer_mmap(buffer_path, 1024).unwrap(),
-        );
-        let buffer_size = queue.buffer_size();
-
-        // Put message in and pop out so that there is room at the beginnning of the buffer.
-        let message_size = buffer_size - 64;
-        assert!(queue.try_enqueue(&vec![5; message_size]));
-        assert_eq!(queue.header().head.load(Ordering::Acquire), 0);
-        let expected_position = CACHELINE_SIZE + round_to_next_cacheline(message_size);
-        assert_eq!(
-            queue.header().tail.load(Ordering::Acquire),
-            expected_position
-        );
-        assert!(queue.try_dequeue().is_some());
-        assert_eq!(
-            queue.header().head.load(Ordering::Acquire),
-            expected_position
-        );
-        assert_eq!(
-            queue.header().tail.load(Ordering::Acquire),
-            expected_position
-        );
-
-        // Not enough space to write contiguously - but mirrored mmap allos wrap around anyway.
-        let data = (0..buffer_size - 120).map(|i| i as u8).collect::<Vec<u8>>();
-        assert!(queue.try_enqueue(&data));
-
-        // The queue should be full now.
-        assert_eq!(
-            queue.header().head.load(Ordering::Acquire),
-            expected_position
-        );
-        assert_eq!(
-            queue.header().tail.load(Ordering::Acquire),
-            expected_position + CACHELINE_SIZE + round_to_next_cacheline(buffer_size - 120)
-        );
-
-        // Dequeue the data.
-        let dequeued_data = queue.try_dequeue().unwrap();
-        assert_eq!(dequeued_data, &data[..]);
-        assert_eq!(
-            queue.header().head.load(Ordering::Acquire),
-            expected_position + CACHELINE_SIZE + round_to_next_cacheline(buffer_size - 120)
-        );
-        assert_eq!(
-            queue.header().tail.load(Ordering::Acquire),
-            expected_position + CACHELINE_SIZE + round_to_next_cacheline(buffer_size - 120)
-        );
-        assert!(queue.try_dequeue().is_none());
-
-        let _ = std::fs::remove_file(header_path);
-        let _ = std::fs::remove_file(buffer_path);
-    }
-
-    #[test]
-    fn test_shared_queue_separate_instances() {
-        let header_path = "/tmp/test_shared_queue_separate_instances_header";
-        let buffer_path = "/tmp/test_shared_queue_separate_instances_buffer";
-        let _ = std::fs::remove_file(header_path);
-        let _ = std::fs::remove_file(buffer_path);
-
-        let mut sender = SharedQueue::new(
-            create_header_mmap(header_path).unwrap(),
-            create_buffer_mmap(buffer_path, 1024).unwrap(),
-        );
-        let mut recver = SharedQueue::new(
-            join_header_mmap(header_path).unwrap(),
-            join_buffer_mmap(buffer_path).unwrap(),
-        );
-
-        let message1 = b"hello world";
-        let message2 = b"wasup";
-
-        assert!(sender.try_enqueue(message1));
-        assert!(sender.try_enqueue(message2));
-
-        let message1_len = CACHELINE_SIZE + round_to_next_cacheline(message1.len());
-        let message2_len = CACHELINE_SIZE + round_to_next_cacheline(message2.len());
-
-        assert_eq!(
-            sender.header().tail.load(Ordering::Acquire),
-            message1_len + message2_len,
-        );
-        assert_eq!(sender.header().head.load(Ordering::Acquire), 0);
-        assert_eq!(
-            recver.header().tail.load(Ordering::Acquire),
-            message1_len + message2_len,
-        );
-        assert_eq!(recver.header().head.load(Ordering::Acquire), 0);
-
-        // Dequeue the data.
-        assert_eq!(recver.try_dequeue().unwrap(), message1);
-        assert_eq!(recver.try_dequeue().unwrap(), message2);
-        assert!(recver.try_dequeue().is_none());
-
-        assert_eq!(
-            sender.header().head.load(Ordering::Acquire),
-            message1_len + message2_len,
-        );
-        assert_eq!(
-            sender.header().tail.load(Ordering::Acquire),
-            message1_len + message2_len,
-        );
-        assert_eq!(
-            recver.header().head.load(Ordering::Acquire),
-            message1_len + message2_len,
-        );
-        assert_eq!(
-            recver.header().tail.load(Ordering::Acquire),
-            message1_len + message2_len,
-        );
-        let _ = std::fs::remove_file(header_path);
-        let _ = std::fs::remove_file(buffer_path);
-    }
-
-    #[test]
-    fn test_producer_consumer_simple_message() {
-        let header_path = "/tmp/test_producer_consumer_simple_message_header";
-        let buffer_path = "/tmp/test_producer_consumer_simple_message_buffer";
-        let _ = std::fs::remove_file(header_path);
-        let _ = std::fs::remove_file(buffer_path);
-
-        let mut producer = {
-            let header_mmap = create_header_mmap(header_path).unwrap();
-            let buffer_mmap = create_buffer_mmap(buffer_path, 1024).unwrap();
-            Producer::new(header_mmap, buffer_mmap)
-        };
-        let mut consumer = {
-            let header_mmap = join_header_mmap(header_path).unwrap();
-            let buffer_mmap = join_buffer_mmap(buffer_path).unwrap();
-            Consumer::new(header_mmap, buffer_mmap)
-        };
-
-        let original_data = b"hello world";
-        let expected_position = CACHELINE_SIZE + round_to_next_cacheline(original_data.len());
-        assert!(producer.try_enqueue(original_data));
-
-        assert_eq!(producer.queue.header().tail.load(Ordering::Acquire), 0);
-        assert_eq!(producer.tail, expected_position);
-        assert_eq!(producer.head, 0);
-
-        // The producer has not committed the data yet, so the consumer cannot see it.
-        assert!(consumer.try_dequeue().is_none());
-        assert_eq!(consumer.tail, 0);
-        assert_eq!(consumer.head, 0);
-        assert_eq!(consumer.queue.header().head.load(Ordering::Acquire), 0);
-        assert_eq!(consumer.queue.header().tail.load(Ordering::Acquire), 0);
-
-        // Commit the data to the queue.
-        producer.commit();
-        assert_eq!(
-            producer.queue.header().tail.load(Ordering::Acquire),
-            expected_position
-        );
-        assert_eq!(producer.tail, expected_position);
-        assert_eq!(producer.head, 0);
-        assert_eq!(producer.queue.header().head.load(Ordering::Acquire), 0);
-
-        // The consumer can still not see the data since it has not synced the tail.
-        assert!(consumer.try_dequeue().is_none());
-        assert_eq!(consumer.tail, 0);
-        assert_eq!(consumer.head, 0);
-
-        // Sync the queue with the current head and tail.
-        consumer.sync();
-
-        // Dequeue the data.
-        let dequeued_data = consumer.try_dequeue().unwrap();
-        assert_eq!(dequeued_data, original_data);
-        assert_eq!(consumer.tail, expected_position);
-        assert_eq!(consumer.head, expected_position);
-        assert_eq!(consumer.queue.header().head.load(Ordering::Acquire), 0);
-        assert_eq!(
-            consumer.queue.header().tail.load(Ordering::Acquire),
-            expected_position
-        );
-
-        consumer.sync();
-        assert_eq!(
-            consumer.head,
-            consumer.queue.header().head.load(Ordering::Acquire)
-        );
+            // Ensure we can reserve again after finalizing/sync.
+            let spot = producer
+                .reserve()
+                .expect("Failed to reserve after finalize");
+            spot.as_ref().store(2, Ordering::Release);
+            producer.commit();
+            consumer.sync();
+            let item = consumer
+                .try_read()
+                .expect("Failed to read item after finalize");
+            assert_eq!(item.as_ref().load(Ordering::Acquire), 2);
+            consumer.finalize();
+        }
     }
 }
