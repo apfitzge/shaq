@@ -71,13 +71,28 @@ impl<T: Sized> Producer<T> {
         self.queue.is_empty()
     }
 
+    /// Writes item into the queue or returns it if there is not enough space.
+    pub fn try_write(&mut self, item: T) -> Result<(), T> {
+        // SAFETY: pointer is written below if successfully reserved.
+        match unsafe { self.reserve() } {
+            Some(p) => {
+                // SAFETY: `reserve` returns a properly aligned ptr with enough
+                //         space to write T.
+                unsafe { p.write(item) };
+                Ok(())
+            }
+            None => Err(item),
+        }
+    }
+
     /// Reserves a position, and increments the cached write position.
     /// Returns `None` if the queue is full.
     /// Returns a pointer to the reserved position.
     ///
-    /// All reserved positions should be written and pointers discarded before
-    /// calling `commit`.
-    pub fn reserve(&mut self) -> Option<NonNull<T>> {
+    /// # Safety
+    /// All reserved positions must be fully initialized before calling `commit`.
+    /// Pointers should be dropped before calling `commit`.
+    pub unsafe fn reserve(&mut self) -> Option<NonNull<T>> {
         // If write is >= read + buffer_size, the queue is written one iteration
         // ahead of the consumer, and we cannot reserve more space.
         if self.queue.cached_write.wrapping_sub(self.queue.cached_read)
@@ -169,11 +184,22 @@ impl<T: Sized> Consumer<T> {
 
     /// Attempts to read a value from the queue.
     /// Returns `None` if there are no values available.
+    /// Returns a reference to the value if available.
+    pub fn try_read(&mut self) -> Option<&T> {
+        // SAFETY: `try_read_ptr` returns a pointer to properly aligned
+        //         location for `T`.
+        //         IF producer properly wrote items, or T is POD, it is
+        //         safe to convert to reference here.
+        self.try_read_ptr().map(|p| unsafe { p.as_ref() })
+    }
+
+    /// Attempts to read a value from the queue.
+    /// Returns `None` if there are no values available.
     /// Returns a pointer to the value if available.
     ///
     /// All read items should be processed and pointers discarded before
     /// calling `finalize`.
-    pub fn try_read(&mut self) -> Option<NonNull<T>> {
+    pub fn try_read_ptr(&mut self) -> Option<NonNull<T>> {
         if self.queue.cached_read == self.queue.cached_write {
             return None; // Queue is empty
         }
@@ -188,7 +214,7 @@ impl<T: Sized> Consumer<T> {
 
     /// Publishes the read position, making it visible to the producer.
     /// All previously read items MUST be processed before this is called.
-    pub fn finalize(&self) {
+    pub fn finalize(&mut self) {
         self.queue
             .header()
             .read
@@ -458,7 +484,7 @@ mod tests {
             assert!(consumer.try_read().is_none()); // consumer has not synced yet
             consumer.sync();
             let item = consumer.try_read().expect("Failed to read item");
-            assert_eq!(item.as_ref().load(Ordering::Acquire), 42);
+            assert_eq!(item.load(Ordering::Acquire), 42);
             assert!(consumer.try_read().is_none()); // no more items to read
             consumer.finalize();
             producer.sync();
@@ -473,7 +499,7 @@ mod tests {
             consumer.sync();
             for _ in 0..BUFFER_CAPACITY {
                 let item = consumer.try_read().expect("Failed to read item");
-                assert_eq!(item.as_ref().load(Ordering::Acquire), 1);
+                assert_eq!(item.load(Ordering::Acquire), 1);
             }
             assert!(consumer.try_read().is_none()); // no more items to read
             consumer.finalize();
@@ -489,7 +515,7 @@ mod tests {
             let item = consumer
                 .try_read()
                 .expect("Failed to read item after finalize");
-            assert_eq!(item.as_ref().load(Ordering::Acquire), 2);
+            assert_eq!(item.load(Ordering::Acquire), 2);
             consumer.finalize();
         }
     }
