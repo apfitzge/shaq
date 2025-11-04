@@ -24,7 +24,10 @@ pub struct Producer<T: Sized> {
 impl<T: Sized> Producer<T> {
     /// Creates a new producer for the shared queue in the provided file with
     /// the given size.
-    pub fn create(file: &File, file_size: usize) -> Result<Self, Error> {
+    ///
+    /// # Safety
+    /// - The provided file must be uniquely created as a Producer.
+    pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -33,8 +36,9 @@ impl<T: Sized> Producer<T> {
 
     /// Joins an existing producer for the shared queue in the provided file.
     ///
-    /// # SAFETY: The provided file must be uniquely accessed as a Producer.
-    pub fn join(file: &File) -> Result<Self, Error> {
+    /// # Safety
+    /// - The provided file must be uniquely joined as a Producer.
+    pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -134,7 +138,10 @@ pub struct Consumer<T: Sized> {
 impl<T: Sized> Consumer<T> {
     /// Creates a new consumer for the shared queue in the provided file with
     /// the given size.
-    pub fn create(file: &File, file_size: usize) -> Result<Self, Error> {
+    ///
+    /// # Safety
+    /// - The provided file must be uniquely created as a Consumer.
+    pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -144,7 +151,7 @@ impl<T: Sized> Consumer<T> {
     /// Joins an existing consumer for the shared queue in the provided file.
     ///
     /// # Safety
-    /// - The provided file must be uniquely accessed as a Consumer.
+    /// - The provided file must be uniquely joined as a Consumer.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
