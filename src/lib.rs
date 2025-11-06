@@ -8,6 +8,7 @@ use std::{
 };
 
 pub mod error;
+pub mod mpmc;
 mod shmem;
 
 const VERSION: u8 = 1;
