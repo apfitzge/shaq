@@ -118,6 +118,8 @@ impl<T: Sized> Consumer<T> {
     }
 }
 
+unsafe impl<T: Sized> Send for Consumer<T> {}
+
 pub struct ConsumerSession<T: Sized> {
     producer_header: NonNull<SharedProducerHeader>,
     buffer: NonNull<T>,
@@ -358,6 +360,8 @@ impl<T: Sized> Producer<T> {
         index & self.buffer_mask
     }
 }
+
+unsafe impl<T: Sized> Send for Producer<T> {}
 
 #[repr(C)]
 struct SharedQueueHeader {
