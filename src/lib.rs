@@ -459,10 +459,17 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
 }
 
 #[cfg(test)]
+pub(crate) mod aligned_buffer {
+    #[repr(C, align(64))]
+    pub struct AlignedBuffer<const N: usize>(pub [u8; N]);
+}
+
+#[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU64;
+    use crate::aligned_buffer::AlignedBuffer;
 
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     fn create_test_queue<T: Sized>(buffer: &mut [u8]) -> (Producer<T>, Consumer<T>) {
         let file_size = buffer.len();
@@ -483,8 +490,10 @@ mod tests {
         type Item = AtomicU64;
         const BUFFER_CAPACITY: usize = 1024;
         const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
-        let mut buffer = vec![0u8; BUFFER_SIZE];
-        let (mut producer, mut consumer) = create_test_queue::<Item>(&mut buffer);
+
+        let mut buffer = Box::new(AlignedBuffer([0; BUFFER_SIZE]));
+        let slice = buffer.0.as_mut_slice();
+        let (mut producer, mut consumer) = create_test_queue::<Item>(slice);
 
         assert_eq!(producer.capacity(), BUFFER_CAPACITY);
         assert_eq!(consumer.capacity(), BUFFER_CAPACITY);
