@@ -18,6 +18,9 @@ impl<T> Producer<T> {
     ///
     /// # Safety
     /// - The provided file must be uniquely created as a Producer.
+    /// - The queue does not validate `T` across processes.
+    /// - If a process may read, dereference, mutate, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
@@ -26,7 +29,14 @@ impl<T> Producer<T> {
     }
 
     /// Joins an existing producer for the shared queue in the provided file.
-    pub fn join(file: &File) -> Result<Self, Error> {
+    ///
+    /// # Safety
+    /// - The queue does not validate `T` across processes.
+    /// - If a process may read, dereference, mutate, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
+    /// - The same `T` must be used by the [`Consumer`]s that are joined with
+    ///   the same file.
+    pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
@@ -115,6 +125,9 @@ impl<T> Consumer<T> {
     ///
     /// # Safety
     /// - The provided file must be uniquely created as a Consumer.
+    /// - The queue does not validate `T` across processes.
+    /// - If a process may read, dereference, mutate, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         let header = SharedQueueHeader::create::<T>(file, file_size)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
@@ -123,7 +136,14 @@ impl<T> Consumer<T> {
     }
 
     /// Joins an existing consumer for the shared queue in the provided file.
-    pub fn join(file: &File) -> Result<Self, Error> {
+    ///
+    /// # Safety
+    /// - The queue does not validate `T` across processes.
+    /// - If a process may read, dereference, mutate, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
+    /// - The same `T` must be used by the [`Producer`]s that are joined with
+    ///   the same file.
+    pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (header, file_size) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
