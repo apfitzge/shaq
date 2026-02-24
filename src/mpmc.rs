@@ -560,12 +560,6 @@ pub struct ReadGuard<'a, T> {
 }
 
 impl<'a, T> ReadGuard<'a, T> {
-    /// Returns a shared reference to the reserved slot.
-    pub fn as_ref(&self) -> &T {
-        // SAFETY: The cell was reserved for reading and is initialized.
-        unsafe { self.cell.as_ref() }
-    }
-
     pub fn as_ptr(&self) -> *const T {
         // SAFETY: The cell was reserved for reading.
         self.cell.as_ptr()
@@ -574,6 +568,14 @@ impl<'a, T> ReadGuard<'a, T> {
     pub fn read(self) -> T {
         // SAFETY: The cell was reserved for reading and holds an initialized value.
         unsafe { self.cell.as_ptr().read() }
+    }
+}
+
+impl<'a, T> AsRef<T> for ReadGuard<'a, T> {
+    /// Returns a shared reference to the reserved slot.
+    fn as_ref(&self) -> &T {
+        // SAFETY: The cell was reserved for reading and is initialized.
+        unsafe { self.cell.as_ref() }
     }
 }
 
