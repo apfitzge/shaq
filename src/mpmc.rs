@@ -531,8 +531,16 @@ pub struct WriteGuard<'a, T> {
 }
 
 impl<'a, T> WriteGuard<'a, T> {
-    pub fn as_mut_ptr(&mut self) -> *mut T {
+    /// Returns a mutable reference to the slot.
+    ///
+    /// # Safety
+    /// - T must be be valid for any bytes.
+    pub unsafe fn as_mut_ref(&mut self) -> &mut T {
         // SAFETY: The cell was reserved for writing.
+        unsafe { self.cell.as_mut() }
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut T {
         self.cell.as_ptr()
     }
 
@@ -610,19 +618,34 @@ impl<'a, T> WriteBatch<'a, T> {
     /// Returns a mutable reference to the reserved slot.
     ///
     /// # Safety
-    /// The slot is uninitialized; caller must fully initialize `T`.
+    /// - The slot is uninitialized; caller must fully initialize `T`.
+    /// - `index < count`
+    /// - `T` must be valid for any bytes.
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut T {
-        debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing.
         unsafe { self.buffer.add(position & self.buffer_mask).as_mut() }
     }
 
-    pub fn as_mut_ptr(&mut self, index: usize) -> *mut T {
-        debug_assert!(index < self.count);
+    /// Returns a mutable pointer to the reserved slot.
+    ///
+    /// # Safety
+    /// - The slot is uninitialized; caller must fully initialize `T`.
+    /// - `index < count`
+    pub unsafe fn as_mut_ptr(&mut self, index: usize) -> *mut T {
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
+    }
+
+    /// Writes a value into the slot at index.
+    ///
+    /// # Safety
+    /// - `index < count`
+    pub unsafe fn write(&mut self, index: usize, value: T) {
+        let position = self.start.wrapping_add(index);
+        // SAFETY: The position was reserved for writing
+        unsafe { self.buffer.add(position & self.buffer_mask).write(value) }
     }
 }
 
@@ -654,19 +677,34 @@ impl<'a, T> ReadBatch<'a, T> {
         self.count == 0
     }
 
-    /// Returns a shared reference to the reserved slot.
-    pub fn as_ref(&self, index: usize) -> &T {
-        debug_assert!(index < self.count);
+    /// Returns a reference to the reserved slot.
+    ///
+    /// # Safety
+    /// - `index` must be less than `self.len()`
+    pub unsafe fn as_ref(&self, index: usize) -> &T {
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading and is initialized.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ref() }
     }
 
-    pub fn as_ptr(&self, index: usize) -> *const T {
-        debug_assert!(index < self.count);
+    /// Returns a pointer to the reserved slot.
+    ///
+    /// # Safety
+    /// - `index` must be less than `self.len()`
+    pub unsafe fn as_ptr(&self, index: usize) -> *const T {
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
+    }
+
+    /// Read the value at index
+    ///
+    /// # Safety
+    /// - `index` must be less than `self.len()`
+    pub unsafe fn read(&self, index: usize) -> T {
+        let position = self.start.wrapping_add(index);
+        // SAFETY: The position was reserved for reading.
+        unsafe { self.buffer.add(position & self.buffer_mask).read() }
     }
 }
 
@@ -748,7 +786,7 @@ mod tests {
             unsafe {
                 assert_eq!(*batch.as_ptr(index), index as u64);
             }
-            assert_eq!(*batch.as_ref(index), index as u64);
+            assert_eq!(unsafe { batch.read(index) }, index as u64);
         }
     }
 
