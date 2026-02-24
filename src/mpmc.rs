@@ -560,6 +560,12 @@ pub struct ReadGuard<'a, T> {
 }
 
 impl<'a, T> ReadGuard<'a, T> {
+    /// Returns a shared reference to the reserved slot.
+    pub fn as_ref(&self) -> &T {
+        // SAFETY: The cell was reserved for reading and is initialized.
+        unsafe { self.cell.as_ref() }
+    }
+
     pub fn as_ptr(&self) -> *const T {
         // SAFETY: The cell was reserved for reading.
         self.cell.as_ptr()
@@ -646,6 +652,14 @@ impl<'a, T> ReadBatch<'a, T> {
         self.count == 0
     }
 
+    /// Returns a shared reference to the reserved slot.
+    pub fn as_ref(&self, index: usize) -> &T {
+        debug_assert!(index < self.count);
+        let position = self.start.wrapping_add(index);
+        // SAFETY: The position was reserved for reading and is initialized.
+        unsafe { self.buffer.add(position & self.buffer_mask).as_ref() }
+    }
+
     pub fn as_ptr(&self, index: usize) -> *const T {
         debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
@@ -712,6 +726,7 @@ mod tests {
         unsafe {
             assert_eq!(*guard.as_ptr(), 42);
         }
+        assert_eq!(*guard.as_ref(), 42);
     }
 
     #[test]
@@ -731,6 +746,7 @@ mod tests {
             unsafe {
                 assert_eq!(*batch.as_ptr(index), index as u64);
             }
+            assert_eq!(*batch.as_ref(index), index as u64);
         }
     }
 
