@@ -113,10 +113,15 @@ impl<T> Producer<T> {
             None => return Err(items),
         };
 
+        let mut written = 0;
         for (index, item) in items.enumerate() {
+            debug_assert!(index < guard.count);
             // SAFETY: index is not out of bounds
             unsafe { guard.write(index, item) };
+            written = index + 1;
         }
+        debug_assert_eq!(written, guard.count);
+
         Ok(())
     }
 
