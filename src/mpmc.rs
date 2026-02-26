@@ -653,6 +653,7 @@ impl<'a, T> WriteBatch<'a, T> {
     /// - `index < count`
     /// - `T` must be valid for any bytes.
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut T {
+        debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing.
         unsafe { self.buffer.add(position & self.buffer_mask).as_mut() }
@@ -664,6 +665,7 @@ impl<'a, T> WriteBatch<'a, T> {
     /// - The slot is uninitialized; caller must fully initialize `T`.
     /// - `index < count`
     pub unsafe fn as_mut_ptr(&mut self, index: usize) -> *mut T {
+        debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
@@ -674,6 +676,7 @@ impl<'a, T> WriteBatch<'a, T> {
     /// # Safety
     /// - `index < count`
     pub unsafe fn write(&mut self, index: usize, value: T) {
+        debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing
         unsafe { self.buffer.add(position & self.buffer_mask).write(value) }
@@ -713,6 +716,7 @@ impl<'a, T> ReadBatch<'a, T> {
     /// # Safety
     /// - `index` must be less than `self.len()`
     pub unsafe fn as_ref(&self, index: usize) -> &T {
+        debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading and is initialized.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ref() }
@@ -723,6 +727,7 @@ impl<'a, T> ReadBatch<'a, T> {
     /// # Safety
     /// - `index` must be less than `self.len()`
     pub unsafe fn as_ptr(&self, index: usize) -> *const T {
+        debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
@@ -733,6 +738,7 @@ impl<'a, T> ReadBatch<'a, T> {
     /// # Safety
     /// - `index` must be less than `self.len()`
     pub unsafe fn read(&self, index: usize) -> T {
+        debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading.
         unsafe { self.buffer.add(position & self.buffer_mask).read() }
