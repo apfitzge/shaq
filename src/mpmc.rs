@@ -75,26 +75,26 @@ impl<T> Producer<T> {
 
     /// Writes items from a slice into the queue.
     ///
-    /// Returns `Err(items)` if there is not enough space.
-    pub fn try_write_slice<'a>(&self, items: &'a [T]) -> Result<(), &'a [T]>
+    /// Returns `Err()` if there is not enough space.
+    pub fn try_write_slice(&self, items: &[T]) -> bool
     where
         T: Copy,
     {
         if items.is_empty() {
-            return Ok(());
+            return true;
         }
 
         // SAFETY: if successful we write all items below.
         let mut guard = match unsafe { self.reserve_write_batch(items.len()) } {
             Some(guard) => guard,
-            None => return Err(items),
+            None => return false,
         };
 
         for (index, item) in items.iter().copied().enumerate() {
             // SAFETY: index is not out of bounds.
             unsafe { guard.write(index, item) };
         }
-        Ok(())
+        true
     }
 
     /// Writes items into the queue or returns the iterator if there is not enough space.
@@ -886,10 +886,10 @@ mod tests {
     fn test_try_write_slice() {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
-        assert_eq!(producer.try_write_slice(&[]), Ok(()));
+        assert!(producer.try_write_slice(&[]));
 
         let values = [10, 11, 12, 13];
-        assert_eq!(producer.try_write_slice(&values), Ok(()));
+        assert!(producer.try_write_slice(&values));
         for value in values {
             assert_eq!(consumer.try_read(), Some(value));
         }
