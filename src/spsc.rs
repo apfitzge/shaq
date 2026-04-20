@@ -175,7 +175,7 @@ impl<T> Producer<T> {
     }
 }
 
-unsafe impl<T> Send for Producer<T> {}
+unsafe impl<T: Send> Send for Producer<T> {}
 
 /// Consumer side of the SPSC shared queue.
 pub struct Consumer<T> {
@@ -307,7 +307,7 @@ impl<T> Consumer<T> {
     }
 }
 
-unsafe impl<T> Send for Consumer<T> {}
+unsafe impl<T: Send> Send for Consumer<T> {}
 
 struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
