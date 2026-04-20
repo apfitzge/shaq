@@ -183,8 +183,8 @@ impl<T> Clone for Producer<T> {
     }
 }
 
-unsafe impl<T> Send for Producer<T> {}
-unsafe impl<T> Sync for Producer<T> {}
+unsafe impl<T: Send> Send for Producer<T> {}
+unsafe impl<T: Sync> Sync for Producer<T> {}
 
 pub struct Consumer<T> {
     queue: SharedQueue<T>,
@@ -348,8 +348,8 @@ impl<T> Clone for Consumer<T> {
     }
 }
 
-unsafe impl<T> Send for Consumer<T> {}
-unsafe impl<T> Sync for Consumer<T> {}
+unsafe impl<T: Send> Send for Consumer<T> {}
+unsafe impl<T: Sync> Sync for Consumer<T> {}
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
