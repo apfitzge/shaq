@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy)]
 pub struct Item {
     pub data: [u8; 512],
 }
