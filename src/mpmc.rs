@@ -1,15 +1,22 @@
 //! DPDK-style bounded MPMC ring queue
 
-use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomicSize, VERSION};
+use crate::{
+    error::{Error, WaitError},
+    normalized_capacity,
+    shmem::Region,
+    CacheAlignedAtomicSize, CacheAlignedAtomicU32, VERSION,
+};
 use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
 use std::{
     fs::File,
     num::NonZeroUsize,
     sync::{atomic::AtomicU64, Arc},
+    time::Duration,
 };
 
 /// Unique identifier for MPMC queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqmpmc");
+const CONSUMER_WAIT_SPIN_ATTEMPTS: usize = 2048;
 
 pub struct Producer<T> {
     queue: SharedQueue<T>,
@@ -255,6 +262,12 @@ impl<T> Consumer<T> {
         self.reserve_read().map(ReadGuard::read)
     }
 
+    /// Attempts to read a value from the queue, waiting up to `timeout` for
+    /// a producer to publish data.
+    pub fn read_timeout(&self, timeout: Duration) -> Result<T, WaitError> {
+        self.reserve_read_timeout(timeout).map(ReadGuard::read)
+    }
+
     /// Attempts to reserve a value from the queue, returning a guard.
     /// The slot is released back to producers when the guard is dropped.
     ///
@@ -269,6 +282,12 @@ impl<T> Consumer<T> {
             start: position,
             _marker: PhantomData,
         })
+    }
+
+    /// Attempts to reserve a value from the queue, waiting up to `timeout` for
+    /// a producer to publish data.
+    pub fn reserve_read_timeout(&self, timeout: Duration) -> Result<ReadGuard<'_, T>, WaitError> {
+        self.reserve_with_timeout(timeout, || self.reserve_read())
     }
 
     /// Attempts to reserve up to `max` values from the queue.
@@ -289,6 +308,52 @@ impl<T> Consumer<T> {
             buffer_mask: self.queue.buffer_mask,
             _marker: PhantomData,
         })
+    }
+
+    /// Attempts to reserve up to `max` values from the queue, waiting up to
+    /// `timeout` for a producer to publish data.
+    ///
+    /// Returns `Ok(None)` immediately when `max == 0`.
+    pub fn reserve_read_batch_timeout(
+        &self,
+        max: usize,
+        timeout: Duration,
+    ) -> Result<Option<ReadBatch<'_, T>>, WaitError> {
+        if max == 0 {
+            return Ok(None);
+        }
+
+        self.reserve_with_timeout(timeout, || self.reserve_read_batch(max))
+            .map(Some)
+    }
+
+    #[inline]
+    fn reserve_with_timeout<R>(
+        &self,
+        timeout: Duration,
+        mut reserve: impl FnMut() -> Option<R>,
+    ) -> Result<R, WaitError> {
+        let deadline = crate::futex::WaitDeadline::timeout(timeout);
+        loop {
+            if let Some(reserved) = reserve() {
+                return Ok(reserved);
+            }
+
+            deadline.remaining()?;
+            for _ in 0..CONSUMER_WAIT_SPIN_ATTEMPTS {
+                core::hint::spin_loop();
+                if let Some(reserved) = reserve() {
+                    return Ok(reserved);
+                }
+            }
+
+            let waiter = self.queue.register_consumer_waiter();
+            if let Some(reserved) = reserve() {
+                return Ok(reserved);
+            }
+
+            waiter.wait(deadline.remaining()?)?;
+        }
     }
 
     /// Makes reserved-but-not-released reads left behind by a previous
@@ -496,6 +561,12 @@ impl<T> SharedQueue<T> {
         }
     }
 
+    fn register_consumer_waiter(&self) -> ConsumerWaiter<'_> {
+        // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
+        let header = unsafe { self.header.as_ref() };
+        ConsumerWaiter::new(&header.futex, &header.futex_waiters)
+    }
+
     /// Creates a new shared queue from a header pointer and region.
     ///
     /// # Safety
@@ -574,6 +645,19 @@ struct SharedQueueHeader {
     /// Consumers advance this in-order after dropping/reading claimed slots.
     /// Producers use it to determine how much free space is available.
     consumer_release: CacheAlignedAtomicSize,
+    /// Futex word used for consumer wait/wake coordination.
+    ///
+    /// Consumers register in [`SharedQueueHeader::futex_waiters`], record this
+    /// sequence value, recheck readability, then enter [`libc::FUTEX_WAIT`].
+    /// Producers increment this sequence before [`libc::FUTEX_WAKE`] so a
+    /// publish racing with the wait call cannot be missed.
+    futex: CacheAlignedAtomicU32,
+    /// Number of consumers registered as possible futex sleepers.
+    ///
+    /// Producers read this before touching [`SharedQueueHeader::futex`] so the
+    /// producer fast path skips futex wake syscalls when no consumer is
+    /// waiting.
+    futex_waiters: CacheAlignedAtomicU32,
 }
 
 impl SharedQueueHeader {
@@ -668,6 +752,8 @@ impl SharedQueueHeader {
         header.producer_publication.store(0, Ordering::Release);
         header.consumer_reservation.store(0, Ordering::Release);
         header.consumer_release.store(0, Ordering::Release);
+        header.futex.store(0, Ordering::Release);
+        header.futex_waiters.store(0, Ordering::Release);
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.magic.store(MAGIC, Ordering::Release);
@@ -717,6 +803,7 @@ impl SharedQueueHeader {
         header
             .producer_publication
             .store(start.wrapping_add(count), Ordering::Release);
+        header.wake_consumers_if_waiting(count);
     }
 
     /// # Safety
@@ -730,6 +817,50 @@ impl SharedQueueHeader {
         header
             .consumer_release
             .store(start.wrapping_add(count), Ordering::Release);
+    }
+
+    /// Wakes registered consumers after new producer publication.
+    ///
+    /// This skips the futex wake syscall when no consumer has registered as a
+    /// sleeper. If consumers are registered, the futex sequence is advanced
+    /// before waking so consumers racing into [`libc::FUTEX_WAIT`] observe the
+    /// state change instead of sleeping through the publication.
+    fn wake_consumers_if_waiting(&self, published: usize) {
+        let waiters = self.futex_waiters.load(Ordering::Acquire);
+        if waiters == 0 {
+            return;
+        }
+
+        self.futex.fetch_add(1, Ordering::Release);
+        let wake_count = waiters.min(published.min(libc::c_int::MAX as usize) as u32);
+        crate::futex::wake(&self.futex, wake_count);
+    }
+}
+
+struct ConsumerWaiter<'a> {
+    futex: &'a CacheAlignedAtomicU32,
+    futex_waiters: &'a CacheAlignedAtomicU32,
+    expected: u32,
+}
+
+impl<'a> ConsumerWaiter<'a> {
+    fn new(futex: &'a CacheAlignedAtomicU32, futex_waiters: &'a CacheAlignedAtomicU32) -> Self {
+        futex_waiters.fetch_add(1, Ordering::AcqRel);
+        Self {
+            futex,
+            futex_waiters,
+            expected: futex.load(Ordering::Acquire),
+        }
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<(), WaitError> {
+        crate::futex::wait(self.futex, self.expected, timeout)
+    }
+}
+
+impl Drop for ConsumerWaiter<'_> {
+    fn drop(&mut self) {
+        self.futex_waiters.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -938,6 +1069,10 @@ impl<'a, T> Drop for ReadBatch<'a, T> {
 mod tests {
     use super::*;
     use crate::shmem::create_temp_shmem_file;
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
 
     type Item = u64;
     const BUFFER_CAPACITY: usize = 512;
@@ -950,6 +1085,27 @@ mod tests {
         let consumer = unsafe { Consumer::join(&file) }.expect("Failed to join consumer");
 
         (file, producer, consumer)
+    }
+
+    fn wait_for_waiters<T>(producer: &Producer<T>, waiters: u32) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { producer.queue.header.as_ref() }
+            .futex_waiters
+            .load(Ordering::Acquire)
+            < waiters
+        {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for registered futex waiters"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn futex_waiters<T>(consumer: &Consumer<T>) -> u32 {
+        unsafe { consumer.queue.header.as_ref() }
+            .futex_waiters
+            .load(Ordering::Acquire)
     }
 
     #[test]
@@ -1091,6 +1247,155 @@ mod tests {
         for (i, value) in values.iter().enumerate() {
             assert_eq!(*value, i as Item);
         }
+    }
+
+    #[test]
+    fn test_read_timeout_waits_until_publication() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let value = consumer
+                .read_timeout(Duration::from_secs(1))
+                .expect("timeout read failed");
+            tx.send(value).unwrap();
+        });
+
+        wait_for_waiters(&producer, 1);
+        let mut guard = unsafe { producer.reserve_write() }.expect("reserve write");
+        unsafe {
+            guard.as_mut_ptr().write(42);
+        }
+
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+
+        drop(guard);
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 42);
+        handle.join().unwrap();
+        assert_eq!(
+            unsafe { producer.queue.header.as_ref() }
+                .futex_waiters
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn test_read_timeout_cleans_waiter() {
+        let (_file, _producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        assert!(matches!(
+            consumer.reserve_read_timeout(Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+        assert_eq!(futex_waiters(&consumer), 0);
+
+        assert!(matches!(
+            consumer.reserve_read_batch_timeout(4, Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+        assert_eq!(futex_waiters(&consumer), 0);
+
+        assert!(consumer
+            .reserve_read_batch_timeout(0, Duration::from_secs(1))
+            .unwrap()
+            .is_none());
+        assert_eq!(futex_waiters(&consumer), 0);
+    }
+
+    #[test]
+    fn test_publish_without_waiters_leaves_futex_unchanged() {
+        let (_file, producer, _consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let header = unsafe { producer.queue.header.as_ref() };
+        let initial_futex = header.futex.load(Ordering::Acquire);
+        assert_eq!(header.futex_waiters.load(Ordering::Acquire), 0);
+
+        producer.try_write(9).unwrap();
+
+        let header = unsafe { producer.queue.header.as_ref() };
+        assert_eq!(header.futex_waiters.load(Ordering::Acquire), 0);
+        assert_eq!(header.futex.load(Ordering::Acquire), initial_futex);
+    }
+
+    #[test]
+    fn test_multiple_read_timeout_consumers_wake() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let consumer2 = consumer.clone();
+        let (tx, rx) = mpsc::channel();
+
+        let handle1 = std::thread::spawn({
+            let tx = tx.clone();
+            move || {
+                tx.send(
+                    consumer
+                        .read_timeout(Duration::from_secs(1))
+                        .expect("consumer 1 read failed"),
+                )
+                .unwrap();
+            }
+        });
+        let handle2 = std::thread::spawn(move || {
+            tx.send(
+                consumer2
+                    .read_timeout(Duration::from_secs(1))
+                    .expect("consumer 2 read failed"),
+            )
+            .unwrap();
+        });
+
+        wait_for_waiters(&producer, 2);
+        producer.try_write(10).unwrap();
+        producer.try_write(20).unwrap();
+
+        let mut values = vec![
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        ];
+        values.sort_unstable();
+        assert_eq!(values, vec![10, 20]);
+
+        handle1.join().unwrap();
+        handle2.join().unwrap();
+        assert_eq!(
+            unsafe { producer.queue.header.as_ref() }
+                .futex_waiters
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn test_reserve_read_batch_timeout_waits_until_publication() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let batch = consumer
+                .reserve_read_batch_timeout(4, Duration::from_secs(1))
+                .expect("batch timeout failed")
+                .expect("batch should be returned");
+            let mut values = Vec::with_capacity(batch.len());
+            for index in 0..batch.len() {
+                values.push(unsafe { batch.read(index) });
+            }
+            tx.send(values).unwrap();
+        });
+
+        wait_for_waiters(&producer, 1);
+        assert!(producer.try_write_slice(&[1, 2, 3]));
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            vec![1, 2, 3]
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            unsafe { producer.queue.header.as_ref() }
+                .futex_waiters
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]

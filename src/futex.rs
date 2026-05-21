@@ -2,6 +2,32 @@ use crate::error::WaitError;
 use core::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
+/// Absolute deadline helper for timeout-based futex waits.
+#[derive(Clone, Copy)]
+pub(crate) struct WaitDeadline {
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl WaitDeadline {
+    pub(crate) fn timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            deadline: Instant::now().checked_add(timeout),
+        }
+    }
+
+    pub(crate) fn remaining(self) -> Result<Duration, WaitError> {
+        match self.deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(WaitError::Timeout),
+            None => Ok(self.timeout),
+        }
+    }
+}
+
 /// Waits until `futex` no longer equals `expected`, a wake is received, or
 /// `timeout` elapses.
 ///

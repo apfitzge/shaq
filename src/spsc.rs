@@ -2,7 +2,7 @@ use crate::{
     error::{Error, WaitError},
     normalized_capacity,
     shmem::Region,
-    CacheAlignedAtomicSize, CacheAlignedAtomicU32,
+    CacheAlignedAtomicSize, CacheAlignedAtomicU32, VERSION,
 };
 use core::ptr::NonNull;
 use std::{
@@ -12,12 +12,11 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Unique identifier for SPSC queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqspsc");
-const VERSION: u32 = (crate::VERSION_MAJOR as u32) << 16 | 1;
 const FUTEX_IDLE: u32 = 0;
 const FUTEX_WAITING: u32 = 1;
 const CONSUMER_WAIT_SPIN_ATTEMPTS: usize = 2048;
@@ -319,7 +318,7 @@ impl<T> Consumer<T> {
 
     /// Blocks until at least one committed item is readable or `timeout` elapses.
     pub fn wait_readable_timeout(&mut self, timeout: Duration) -> Result<(), WaitError> {
-        self.wait_readable_until(WaitDeadline::timeout(timeout))
+        self.wait_readable_until(crate::futex::WaitDeadline::timeout(timeout))
     }
 
     /// Blocks until a committed item can be reserved for reading or `timeout`
@@ -328,7 +327,7 @@ impl<T> Consumer<T> {
     /// The caller must still process all returned pointers and call
     /// [`Self::finalize`] to release consumed capacity back to the producer.
     pub fn read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError> {
-        let deadline = WaitDeadline::timeout(timeout);
+        let deadline = crate::futex::WaitDeadline::timeout(timeout);
         loop {
             if let Some(ptr) = self.try_read_ptr() {
                 return Ok(ptr);
@@ -337,7 +336,10 @@ impl<T> Consumer<T> {
         }
     }
 
-    fn wait_readable_until(&mut self, deadline: WaitDeadline) -> Result<(), WaitError> {
+    fn wait_readable_until(
+        &mut self,
+        deadline: crate::futex::WaitDeadline,
+    ) -> Result<(), WaitError> {
         loop {
             self.queue.load_write();
             if !self.queue.is_empty() {
@@ -639,31 +641,6 @@ impl SharedQueueHeader {
     fn wake_consumer_if_waiting(&self) {
         if self.futex.swap(FUTEX_IDLE, Ordering::Release) == FUTEX_WAITING {
             crate::futex::wake(&self.futex, 1);
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct WaitDeadline {
-    timeout: Duration,
-    deadline: Option<Instant>,
-}
-
-impl WaitDeadline {
-    fn timeout(timeout: Duration) -> Self {
-        Self {
-            timeout,
-            deadline: Instant::now().checked_add(timeout),
-        }
-    }
-
-    fn remaining(self) -> Result<Duration, WaitError> {
-        match self.deadline {
-            Some(deadline) => deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or(WaitError::Timeout),
-            None => Ok(self.timeout),
         }
     }
 }
