@@ -3,12 +3,13 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("shaq currently supports Linux only");
 
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicU32, AtomicUsize};
 
 // NB: To simplify casting we only support 64bit or wider systems.
 const _: () = assert!(size_of::<usize>() >= size_of::<u64>());
 
 pub mod error;
+mod futex;
 pub mod mpmc;
 mod shmem;
 pub mod spsc;
@@ -34,6 +35,21 @@ struct CacheAlignedAtomicSize {
 
 impl core::ops::Deref for CacheAlignedAtomicSize {
     type Target = AtomicUsize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// `AtomicU32` with 64-byte alignment for futex state.
+#[derive(Default)]
+#[repr(C, align(64))]
+struct CacheAlignedAtomicU32 {
+    inner: AtomicU32,
+}
+
+impl core::ops::Deref for CacheAlignedAtomicU32 {
+    type Target = AtomicU32;
 
     fn deref(&self) -> &Self::Target {
         &self.inner

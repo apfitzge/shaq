@@ -11,6 +11,11 @@ pub enum Error {
     Mmap(std::io::Error),
 }
 
+#[derive(Debug)]
+pub enum WaitError {
+    Timeout,
+}
+
 impl std::error::Error for Error {}
 
 impl Display for Error {

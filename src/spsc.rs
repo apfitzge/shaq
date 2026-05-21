@@ -1,4 +1,9 @@
-use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomicSize, VERSION};
+use crate::{
+    error::{Error, WaitError},
+    normalized_capacity,
+    shmem::Region,
+    CacheAlignedAtomicSize, CacheAlignedAtomicU32,
+};
 use core::ptr::NonNull;
 use std::{
     fs::File,
@@ -7,10 +12,15 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 /// Unique identifier for SPSC queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqspsc");
+const VERSION: u32 = (crate::VERSION_MAJOR as u32) << 16 | 1;
+const FUTEX_IDLE: u32 = 0;
+const FUTEX_WAITING: u32 = 1;
+const CONSUMER_WAIT_SPIN_ATTEMPTS: usize = 2048;
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
@@ -162,10 +172,11 @@ impl<T> Producer<T> {
 
     /// Commits the reserved position, making it visible to the consumer.
     pub fn commit(&self) {
-        self.queue
-            .header()
+        let header = self.queue.header();
+        header
             .write
             .store(self.queue.cached_write, Ordering::Release);
+        header.wake_consumer_if_waiting();
     }
 
     /// Synchronize the producer's cached read position with the queue's read
@@ -305,6 +316,65 @@ impl<T> Consumer<T> {
     pub fn sync(&mut self) {
         self.queue.load_write();
     }
+
+    /// Blocks until at least one committed item is readable or `timeout` elapses.
+    pub fn wait_readable_timeout(&mut self, timeout: Duration) -> Result<(), WaitError> {
+        self.wait_readable_until(WaitDeadline::timeout(timeout))
+    }
+
+    /// Blocks until a committed item can be reserved for reading or `timeout`
+    /// elapses.
+    ///
+    /// The caller must still process all returned pointers and call
+    /// [`Self::finalize`] to release consumed capacity back to the producer.
+    pub fn read_ptr_timeout(&mut self, timeout: Duration) -> Result<NonNull<T>, WaitError> {
+        let deadline = WaitDeadline::timeout(timeout);
+        loop {
+            if let Some(ptr) = self.try_read_ptr() {
+                return Ok(ptr);
+            }
+            self.wait_readable_until(deadline)?;
+        }
+    }
+
+    fn wait_readable_until(&mut self, deadline: WaitDeadline) -> Result<(), WaitError> {
+        loop {
+            self.queue.load_write();
+            if !self.queue.is_empty() {
+                return Ok(());
+            }
+
+            deadline.remaining()?;
+            if self.spin_until_readable() {
+                return Ok(());
+            }
+
+            let header = self.queue.header;
+            // SAFETY: `header` points to this consumer's live shared queue header.
+            let header_ref = unsafe { header.as_ref() };
+            let _waiter = NotEmptyWaiter::new(&header_ref.futex);
+
+            self.queue.load_write();
+            if !self.queue.is_empty() {
+                return Ok(());
+            }
+
+            // SAFETY: `header` points to this consumer's live shared queue header.
+            let header_ref = unsafe { header.as_ref() };
+            crate::futex::wait(&header_ref.futex, FUTEX_WAITING, deadline.remaining()?)?;
+        }
+    }
+
+    fn spin_until_readable(&mut self) -> bool {
+        for _ in 0..CONSUMER_WAIT_SPIN_ATTEMPTS {
+            core::hint::spin_loop();
+            self.queue.load_write();
+            if !self.queue.is_empty() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 unsafe impl<T: Send> Send for Consumer<T> {}
@@ -420,6 +490,15 @@ struct SharedQueueHeader {
     // Hot cache lines.
     write: CacheAlignedAtomicSize,
     read: CacheAlignedAtomicSize,
+    /// Futex word used only for consumer wait/wake coordination.
+    ///
+    /// [`FUTEX_IDLE`] means the consumer is not sleeping. The consumer stores
+    /// [`FUTEX_WAITING`] immediately before rechecking whether data is
+    /// available and entering [`libc::FUTEX_WAIT`]; the producer swaps it back
+    /// to [`FUTEX_IDLE`] before calling [`libc::FUTEX_WAKE`]. The consumer also
+    /// restores [`FUTEX_IDLE`] when it stops waiting because of a race or
+    /// timeout.
+    futex: CacheAlignedAtomicU32,
 }
 
 impl SharedQueueHeader {
@@ -513,6 +592,7 @@ impl SharedQueueHeader {
         let header = unsafe { header.as_mut() };
         header.write.store(0, Ordering::Release);
         header.read.store(0, Ordering::Release);
+        header.futex.store(0, Ordering::Release);
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.magic.store(MAGIC, Ordering::Release);
@@ -551,13 +631,68 @@ impl SharedQueueHeader {
 
         Ok(header)
     }
+
+    /// Wakes the single consumer if it registered itself as waiting.
+    ///
+    /// This avoids a futex wake syscall on the producer fast path when the
+    /// consumer is active or not waiting for data.
+    fn wake_consumer_if_waiting(&self) {
+        if self.futex.swap(FUTEX_IDLE, Ordering::Release) == FUTEX_WAITING {
+            crate::futex::wake(&self.futex, 1);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WaitDeadline {
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl WaitDeadline {
+    fn timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            deadline: Instant::now().checked_add(timeout),
+        }
+    }
+
+    fn remaining(self) -> Result<Duration, WaitError> {
+        match self.deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(WaitError::Timeout),
+            None => Ok(self.timeout),
+        }
+    }
+}
+
+struct NotEmptyWaiter<'a> {
+    state: &'a CacheAlignedAtomicU32,
+}
+
+impl<'a> NotEmptyWaiter<'a> {
+    fn new(state: &'a CacheAlignedAtomicU32) -> Self {
+        state.store(FUTEX_WAITING, Ordering::Release);
+        Self { state }
+    }
+}
+
+impl Drop for NotEmptyWaiter<'_> {
+    fn drop(&mut self) {
+        self.state.store(FUTEX_IDLE, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shmem::create_temp_shmem_file;
-    use std::sync::atomic::AtomicU64;
+    use std::{
+        sync::{atomic::AtomicU64, mpsc},
+        time::{Duration, Instant},
+    };
 
     fn create_test_queue<T>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
         let file = create_temp_shmem_file().unwrap();
@@ -566,6 +701,17 @@ mod tests {
         let consumer = unsafe { Consumer::join(&file) }.expect("Failed to join consumer");
 
         (file, producer, consumer)
+    }
+
+    fn wait_for_waiter<T>(producer: &Producer<T>) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while producer.queue.header().futex.load(Ordering::Acquire) != FUTEX_WAITING {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for registered futex waiter"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -723,5 +869,72 @@ mod tests {
         let val = consumer.try_read().expect("read failed");
         assert_eq!(*val, 55);
         consumer.finalize();
+    }
+
+    #[test]
+    fn test_read_ptr_timeout_waits_until_commit() {
+        let (mut producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+        let (tx, rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let ptr = consumer
+                .read_ptr_timeout(Duration::from_secs(1))
+                .expect("timeout read failed");
+            // SAFETY: `ptr` points at a readable `u64`; the value is Copy.
+            let value = unsafe { *ptr.as_ptr() };
+            consumer.finalize();
+            tx.send(value).unwrap();
+        });
+
+        wait_for_waiter(&producer);
+        let spot = unsafe { producer.reserve() }.expect("reserve failed");
+        unsafe { spot.write(42) };
+
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+
+        producer.commit();
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 42);
+        handle.join().unwrap();
+        assert_eq!(
+            producer.queue.header().futex.load(Ordering::Acquire),
+            FUTEX_IDLE
+        );
+    }
+
+    #[test]
+    fn test_wait_readable_timeout_cleans_waiter() {
+        let (_producer, mut consumer) = pair::<u64>(64).expect("pair failed");
+
+        assert!(matches!(
+            consumer.wait_readable_timeout(Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+        assert_eq!(
+            consumer.queue.header().futex.load(Ordering::Acquire),
+            FUTEX_IDLE
+        );
+
+        assert!(matches!(
+            consumer.read_ptr_timeout(Duration::from_millis(1)),
+            Err(WaitError::Timeout)
+        ));
+        assert_eq!(
+            consumer.queue.header().futex.load(Ordering::Acquire),
+            FUTEX_IDLE
+        );
+    }
+
+    #[test]
+    fn test_commit_without_waiter_leaves_futex_idle() {
+        let (mut producer, _consumer) = pair::<u64>(64).expect("pair failed");
+        let initial_state = producer.queue.header().futex.load(Ordering::Acquire);
+        assert_eq!(initial_state, FUTEX_IDLE);
+
+        producer.try_write(9).unwrap();
+        producer.commit();
+
+        let state = producer.queue.header().futex.load(Ordering::Acquire);
+        assert_eq!(state, FUTEX_IDLE);
     }
 }
