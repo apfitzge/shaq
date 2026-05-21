@@ -31,14 +31,10 @@
 //! validates the snapshot already taken; it does not pin the slot, and a
 //! producer may overwrite the slot immediately after validation returns.
 //!
-//! Broadcast payloads are treated as shared-memory bytes. Values overwritten in
-//! the ring are not dropped, and high-level writes copy payload bytes into the
-//! ring and forget the source value. By-value reads/writes and the atomic chunk
-//! helpers therefore require byte-copyable shared-memory data: no `Drop`, no
-//! uninitialized bytes including padding, and no process-local pointers unless
-//! every process that reads them can validly use them. Raw pointer reads that
-//! materialize `T` before validation additionally require every possible
-//! old/new/mixed snapshot to be valid to temporarily inspect as `T`.
+//! Broadcast payloads are treated as shared-memory bytes. The unsafe
+//! constructors require callers to choose a `T` and access pattern for which
+//! bytewise copying, sharing, forgetting, and pre-validation inspection are
+//! valid.
 
 use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomicSize, VERSION};
 use core::{
@@ -67,11 +63,16 @@ impl<T> Producer<T> {
     ///   externally as the sole initializer.
     /// - After initialization, `file` must not be truncated or resized while any
     ///   handle remains joined to the queue.
-    /// - All producers and consumers for the same file must use the same `T` and
-    ///   uphold the module-level payload contract. The queue does not validate
-    ///   `T` across processes.
+    /// - The queue does not validate `T` across processes. All producers and
+    ///   consumers for the same file must use the same `T`.
+    /// - If a process may read, dereference, inspect, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
+    /// - By-value and atomic chunk APIs require initialized bytes, including
+    ///   padding, and bytewise copying or forgetting the payload must be valid
+    ///   for `T`.
     /// - Payload access that may race with an overwrite must use the atomic
-    ///   payload APIs or external synchronization.
+    ///   payload APIs or external synchronization. Pre-validation inspection
+    ///   must be valid for any old, new, or mixed snapshot it may observe.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer, so initializing the queue header for
@@ -87,11 +88,16 @@ impl<T> Producer<T> {
     /// # Safety
     /// - `file` must refer to a live initialized broadcast queue and must not be
     ///   concurrently truncated or resized while joined.
-    /// - All producers and consumers for the same file must use the same `T` and
-    ///   uphold the module-level payload contract. The queue does not validate
-    ///   `T` across processes.
+    /// - The queue does not validate `T` across processes. All producers and
+    ///   consumers for the same file must use the same `T`.
+    /// - If a process may read, dereference, inspect, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
+    /// - By-value and atomic chunk APIs require initialized bytes, including
+    ///   padding, and bytewise copying or forgetting the payload must be valid
+    ///   for `T`.
     /// - Payload access that may race with an overwrite must use the atomic
-    ///   payload APIs or external synchronization.
+    ///   payload APIs or external synchronization. Pre-validation inspection
+    ///   must be valid for any old, new, or mixed snapshot it may observe.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (region, header) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
@@ -134,8 +140,6 @@ impl<T> Producer<T> {
     /// payload stores only; queue publication still uses the queue's internal
     /// release ordering.
     ///
-    /// This relies on the constructor payload contract for by-value writes.
-    ///
     /// # Panics
     /// Panics if `ordering` is not valid for atomic stores.
     pub fn try_write(&self, item: T, ordering: Ordering) -> Result<(), T> {
@@ -157,8 +161,8 @@ impl<T> Producer<T> {
     /// similarly to holding a lock on a critical section.
     ///
     /// # Safety
-    /// - Before the guard is dropped, the slot bytes must be initialized and
-    ///   valid to publish under the constructor payload contract.
+    /// - Before the guard is dropped, the reserved slot must contain bytes that
+    ///   are valid to publish as `T`.
     /// - Payload access that may race with consumers must use atomics or
     ///   external synchronization.
     #[must_use]
@@ -182,8 +186,8 @@ impl<T> Producer<T> {
     /// treated similarly to holding a lock on a critical section.
     ///
     /// # Safety
-    /// - Before the batch is dropped, all reserved slot bytes must be initialized
-    ///   and valid to publish under the constructor payload contract.
+    /// - Before the batch is dropped, each reserved slot must contain bytes
+    ///   that are valid to publish as `T`.
     /// - Payload access that may race with consumers must use atomics or
     ///   external synchronization.
     #[must_use]
@@ -258,11 +262,16 @@ impl<T> Consumer<T> {
     ///   externally as the sole initializer.
     /// - After initialization, `file` must not be truncated or resized while any
     ///   handle remains joined to the queue.
-    /// - All producers and consumers for the same file must use the same `T` and
-    ///   uphold the module-level payload contract. The queue does not validate
-    ///   `T` across processes.
+    /// - The queue does not validate `T` across processes. All producers and
+    ///   consumers for the same file must use the same `T`.
+    /// - If a process may read, dereference, inspect, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
+    /// - By-value and atomic chunk APIs require initialized bytes, including
+    ///   padding, and bytewise copying or forgetting the payload must be valid
+    ///   for `T`.
     /// - Payload access that may race with an overwrite must use the atomic
-    ///   payload APIs or external synchronization.
+    ///   payload APIs or external synchronization. Pre-validation inspection
+    ///   must be valid for any old, new, or mixed snapshot it may observe.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer, so initializing the queue header for
@@ -280,11 +289,16 @@ impl<T> Consumer<T> {
     /// # Safety
     /// - `file` must refer to a live initialized broadcast queue and must not be
     ///   concurrently truncated or resized while joined.
-    /// - All producers and consumers for the same file must use the same `T` and
-    ///   uphold the module-level payload contract. The queue does not validate
-    ///   `T` across processes.
+    /// - The queue does not validate `T` across processes. All producers and
+    ///   consumers for the same file must use the same `T`.
+    /// - If a process may read, dereference, inspect, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
+    /// - By-value and atomic chunk APIs require initialized bytes, including
+    ///   padding, and bytewise copying or forgetting the payload must be valid
+    ///   for `T`.
     /// - Payload access that may race with an overwrite must use the atomic
-    ///   payload APIs or external synchronization.
+    ///   payload APIs or external synchronization. Pre-validation inspection
+    ///   must be valid for any old, new, or mixed snapshot it may observe.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (region, header) = SharedQueueHeader::join::<T>(file)?;
         let queue = unsafe { SharedQueue::from_header(region, header) }?;
@@ -332,8 +346,6 @@ impl<T> Consumer<T> {
     /// `ordering` applies to the payload loads only; queue cursor checks still
     /// use the queue's internal acquire ordering.
     ///
-    /// This relies on the constructor payload contract for by-value reads.
-    ///
     /// # Panics
     /// Panics if `ordering` is not valid for atomic loads.
     pub fn try_read(&mut self, ordering: Ordering) -> Result<Option<T>, usize> {
@@ -358,20 +370,11 @@ impl<T> Consumer<T> {
 
     /// Attempts to read a value from the queue as a raw pointer.
     ///
-    /// The returned guard exposes a pointer into shared memory. Producers may
-    /// overwrite that memory concurrently. Payload access through that pointer
-    /// must use [`read_atomic_chunks`] or another atomic/external
-    /// synchronization scheme if it may race with an overwrite. A racing atomic
-    /// read may observe old data, new data, or a mixed old/new snapshot.
-    ///
-    /// Prefer [`Self::try_read`] for high-level reads. If using the raw pointer
-    /// returned by [`DirectRead::as_ptr`], copy the payload with
-    /// [`read_atomic_chunks`] or another payload-level atomic/external
-    /// synchronization scheme before validation.
+    /// Prefer [`Self::try_read`] for high-level reads.
     ///
     /// # Safety
-    /// - Payload access through the returned guard must follow the constructor
-    ///   payload contract.
+    /// - Payload access through the returned guard that may race with producers
+    ///   must use atomic accesses or external synchronization.
     /// - Copy or inspect the payload before calling [`DirectRead::validate`] or
     ///   [`DirectRead::commit`]. If validation reports a possible overwrite,
     ///   discard that already-taken snapshot.
@@ -403,19 +406,11 @@ impl<T> Consumer<T> {
 
     /// Attempts to read up to `max` values from the queue as raw pointers.
     ///
-    /// The returned guard exposes pointers into shared memory. Producers may
-    /// overwrite that memory concurrently. Payload access through those pointers
-    /// must use [`read_atomic_chunks`] or another atomic/external
-    /// synchronization scheme if it may race with an overwrite. A racing atomic
-    /// read may observe old data, new data, or a mixed old/new snapshot.
-    ///
-    /// If using the raw pointers returned by [`DirectReadBatch::as_ptr`], copy
-    /// each payload with [`read_atomic_chunks`] or another payload-level
-    /// atomic/external synchronization scheme before validation.
+    /// Prefer repeated [`Self::try_read`] calls for high-level reads.
     ///
     /// # Safety
-    /// - Payload access through the returned guard must follow the constructor
-    ///   payload contract.
+    /// - Payload access through the returned guard that may race with producers
+    ///   must use atomic accesses or external synchronization.
     /// - Copy or inspect the payloads before calling
     ///   [`DirectReadBatch::validate`] or [`DirectReadBatch::commit`]. If
     ///   validation reports a possible overwrite, discard those already-taken
@@ -511,8 +506,9 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 /// - If the caller converts `dst` to `T`, it must first validate that the
 ///   copied bytes are not a stale or mixed snapshot, or otherwise prove that
 ///   the copied bytes form a valid `T`.
-/// - `ordering` must be valid for atomic loads. `Release` and `AcqRel` will
-///   panic through the standard atomic APIs.
+///
+/// # Panics
+/// Panics if `ordering` is not valid for atomic loads.
 pub unsafe fn read_atomic_chunks<T>(src: *const T, dst: &mut MaybeUninit<T>, ordering: Ordering) {
     debug_assert_eq!((src as usize) % core::mem::align_of::<T>(), 0);
     debug_assert_eq!((dst.as_ptr() as usize) % core::mem::align_of::<T>(), 0);
@@ -593,12 +589,13 @@ pub unsafe fn read_atomic_chunks<T>(src: *const T, dst: &mut MaybeUninit<T>, ord
 ///   `debug_assert!`.
 /// - The destination memory must be safe to access with atomic `u8` stores and
 ///   aligned atomic `u64` stores.
-/// - If `dst` currently contains an initialized value, bytewise overwrite must
-///   uphold the caller's ownership and validity invariants for that value.
+/// - Overwriting `dst` must uphold any ownership and validity invariants for
+///   the bytes currently stored there.
 /// - Any concurrent reads from the destination bytes must also use compatible
 ///   atomic accesses, or be protected by external synchronization.
-/// - `ordering` must be valid for atomic stores. `Acquire` and `AcqRel` will
-///   panic through the standard atomic APIs.
+///
+/// # Panics
+/// Panics if `ordering` is not valid for atomic stores.
 pub unsafe fn write_atomic_chunks<T>(dst: *mut T, src: *const T, ordering: Ordering) {
     debug_assert_eq!((dst as usize) % core::mem::align_of::<T>(), 0);
     debug_assert_eq!((src as usize) % core::mem::align_of::<T>(), 0);
@@ -1045,8 +1042,9 @@ impl<'a, T> WriteGuard<'a, T> {
     /// initialization.
     ///
     /// # Safety
-    /// Caller must use the pointer in a way that upholds
-    /// [`Producer::reserve_write`]'s safety requirements.
+    /// Before the guard is dropped, the reserved slot must contain bytes that
+    /// are valid to publish as `T`. Payload access that may race with consumers
+    /// must use atomics or external synchronization.
     pub unsafe fn as_mut_ptr(&mut self) -> *mut T {
         self.cell.as_ptr()
     }
@@ -1055,8 +1053,6 @@ impl<'a, T> WriteGuard<'a, T> {
     ///
     /// `ordering` applies to the payload stores only; queue publication still
     /// uses the queue's internal release ordering.
-    ///
-    /// This relies on the constructor payload contract for by-value writes.
     ///
     /// # Panics
     /// Panics if `ordering` is not valid for atomic stores. If this happens,
@@ -1076,10 +1072,11 @@ impl<'a, T> WriteGuard<'a, T> {
 
     /// Writes a value into the reserved slot with relaxed atomic chunk stores.
     ///
+    /// Uses relaxed payload stores; prefer [`Self::write_atomic`] when choosing
+    /// an explicit ordering.
+    ///
     /// # Safety
-    /// No additional requirements beyond the constructor payload contract.
-    /// This method uses relaxed payload stores; prefer [`Self::write_atomic`]
-    /// when choosing an explicit ordering.
+    /// No additional requirements.
     pub unsafe fn write(self, value: T) {
         self.write_atomic(value, Ordering::Relaxed);
     }
@@ -1120,8 +1117,10 @@ impl<'a, T> WriteBatch<'a, T> {
     ///
     /// # Safety
     /// - `index < count`
-    /// - Caller must use the pointer in a way that upholds
-    ///   [`Producer::reserve_write_batch`]'s safety requirements.
+    /// - Before the batch is dropped, the reserved slot must contain bytes that
+    ///   are valid to publish as `T`.
+    /// - Payload access that may race with consumers must use atomics or
+    ///   external synchronization.
     pub unsafe fn as_mut_ptr(&mut self, index: usize) -> *mut T {
         debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
@@ -1134,11 +1133,11 @@ impl<'a, T> WriteBatch<'a, T> {
     /// `ordering` applies to the payload stores only; queue publication still
     /// uses the queue's internal release ordering when the batch is dropped.
     ///
-    /// This relies on the constructor payload contract for by-value writes.
-    ///
     /// # Safety
     /// - `index < count`
-    /// - `ordering` must be valid for atomic stores.
+    ///
+    /// # Panics
+    /// Panics if `ordering` is not valid for atomic stores.
     pub unsafe fn write_atomic(&mut self, index: usize, value: T, ordering: Ordering) {
         debug_assert!(index < self.count);
         let position = self.start.wrapping_add(index);
@@ -1157,10 +1156,11 @@ impl<'a, T> WriteBatch<'a, T> {
 
     /// Writes a value into the slot at index with relaxed atomic chunk stores.
     ///
+    /// Uses relaxed payload stores; prefer [`Self::write_atomic`] when choosing
+    /// an explicit ordering.
+    ///
     /// # Safety
     /// - `index < count`
-    /// - No additional requirements beyond the constructor payload contract.
-    ///   This method uses relaxed payload stores.
     pub unsafe fn write(&mut self, index: usize, value: T) {
         // SAFETY: Caller upholds the index requirement.
         unsafe { self.write_atomic(index, value, Ordering::Relaxed) }
@@ -1186,10 +1186,10 @@ pub struct DirectRead<'a, T> {
 impl<'a, T> DirectRead<'a, T> {
     /// Returns a raw pointer into the broadcast ring.
     ///
-    /// Producers may overwrite this slot concurrently. Copy or inspect the
-    /// payload according to the constructor payload contract, then call
-    /// [`Self::validate`] or [`Self::commit`] before trusting the snapshot.
-    /// Validation is not a pin.
+    /// Producers may overwrite this slot concurrently. Payload access that may
+    /// race with producers must use atomics or external synchronization. Copy
+    /// or inspect the payload before calling [`Self::validate`] or
+    /// [`Self::commit`]. Validation is not a pin.
     pub fn as_ptr(&self) -> *const T {
         self.queue.ptr_at(self.start)
     }
@@ -1270,10 +1270,10 @@ impl<'a, T> DirectReadBatch<'a, T> {
 
     /// Returns a pointer into the broadcast ring.
     ///
-    /// Producers may overwrite this slot concurrently. Copy or inspect the
-    /// payload according to the constructor payload contract, then call
-    /// [`Self::validate`] or [`Self::commit`] before trusting the snapshot.
-    /// Validation is not a pin.
+    /// Producers may overwrite this slot concurrently. Payload access that may
+    /// race with producers must use atomics or external synchronization. Copy
+    /// or inspect the payload before calling [`Self::validate`] or
+    /// [`Self::commit`]. Validation is not a pin.
     ///
     /// # Safety
     /// `index` must be less than [`Self::len`].
