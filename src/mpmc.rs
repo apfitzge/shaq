@@ -6,23 +6,137 @@ use crate::{
     shmem::Region,
     CacheAlignedAtomicSize, CacheAlignedAtomicU32, VERSION,
 };
-use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
-use std::{
-    fs::File,
-    num::NonZeroUsize,
-    sync::{atomic::AtomicU64, Arc},
-    time::Duration,
+use core::{
+    marker::PhantomData,
+    ptr::NonNull,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+use std::{fs::File, num::NonZeroUsize, sync::Arc, time::Duration};
 
 /// Unique identifier for MPMC queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqmpmc");
 const CONSUMER_WAIT_SPIN_ATTEMPTS: usize = 2048;
+const DEFAULT_COOPERATIVE_DESCRIPTOR_CAPACITY: usize = 4096;
+const COOPERATIVE_MAX_CAPACITY: usize = 1usize << 31;
+pub const MODE_CLASSIC: u32 = 0;
+pub const MODE_COOPERATIVE: u32 = 1;
 
-pub struct Producer<T> {
-    queue: SharedQueue<T>,
+/// Producer publication strategy for an MPMC queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PublicationMode {
+    /// Current behavior: each producer publishes its own reservation in FIFO
+    /// order, spinning until earlier producers have published.
+    Classic = MODE_CLASSIC,
+    /// Producers and consumers mark reservations ready and cooperatively
+    /// advance the ready FIFO prefix, so later guard drops do not spin behind
+    /// earlier outstanding guards.
+    Cooperative = MODE_COOPERATIVE,
 }
 
-impl<T> Producer<T> {
+impl PublicationMode {
+    const fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Classic),
+            1 => Some(Self::Cooperative),
+            _ => None,
+        }
+    }
+}
+
+impl Default for PublicationMode {
+    fn default() -> Self {
+        Self::Classic
+    }
+}
+
+const fn publication_mode_for_mode<const MODE: u32>() -> PublicationMode {
+    if MODE == MODE_COOPERATIVE {
+        PublicationMode::Cooperative
+    } else {
+        PublicationMode::Classic
+    }
+}
+
+fn validate_mode<const MODE: u32>() -> Result<PublicationMode, Error> {
+    match MODE {
+        MODE_CLASSIC => Ok(PublicationMode::Classic),
+        MODE_COOPERATIVE => Ok(PublicationMode::Cooperative),
+        _ => Err(Error::InvalidBufferSize),
+    }
+}
+
+/// Creation options for an MPMC queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Options {
+    publication_mode: PublicationMode,
+    cooperative_descriptor_capacity: usize,
+}
+
+impl Options {
+    pub const fn new() -> Self {
+        Self {
+            publication_mode: PublicationMode::Classic,
+            cooperative_descriptor_capacity: 0,
+        }
+    }
+
+    /// Selects a publication mode for mode-agnostic sizing helpers.
+    ///
+    /// Typed producers and consumers override this with their const generic
+    /// mode during creation.
+    pub const fn with_publication_mode(mut self, publication_mode: PublicationMode) -> Self {
+        self.publication_mode = publication_mode;
+        self
+    }
+
+    /// Sets the cooperative descriptor ring capacity.
+    ///
+    /// The value is rounded up to a power of two and capped at the item
+    /// capacity. Passing zero uses the default cooperative descriptor capacity.
+    pub const fn with_cooperative_descriptor_capacity(mut self, capacity: usize) -> Self {
+        self.cooperative_descriptor_capacity = capacity;
+        self
+    }
+
+    pub const fn publication_mode(&self) -> PublicationMode {
+        self.publication_mode
+    }
+
+    pub const fn cooperative_descriptor_capacity(&self) -> usize {
+        self.cooperative_descriptor_capacity
+    }
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Classic MPMC producer, kept as the default `Producer` type.
+pub type Producer<T> = ModeProducer<T, { MODE_CLASSIC }>;
+/// Classic MPMC consumer, kept as the default `Consumer` type.
+pub type Consumer<T> = ModeConsumer<T, { MODE_CLASSIC }>;
+/// Producer using classic in-order publication.
+pub type ClassicProducer<T> = ModeProducer<T, { MODE_CLASSIC }>;
+/// Producer using cooperative descriptor publication.
+pub type CooperativeProducer<T> = ModeProducer<T, { MODE_COOPERATIVE }>;
+/// Consumer joined to a classic MPMC queue.
+pub type ClassicConsumer<T> = ModeConsumer<T, { MODE_CLASSIC }>;
+/// Consumer using cooperative descriptor release.
+pub type CooperativeConsumer<T> = ModeConsumer<T, { MODE_COOPERATIVE }>;
+
+/// MPMC producer parameterized by publication mode.
+pub struct ModeProducer<T, const MODE: u32> {
+    queue: SharedQueue<T, MODE>,
+}
+
+impl<T, const MODE: u32> ModeProducer<T, MODE> {
     /// Creates a new producer for the shared queue in the provided file with
     /// the given size.
     ///
@@ -35,10 +149,31 @@ impl<T> Producer<T> {
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
+        // SAFETY: forwarded from this function's safety contract.
+        unsafe { Self::create_with_options(file, file_size, Options::default()) }
+    }
+
+    /// Creates a new producer for the shared queue using explicit options.
+    ///
+    /// # Safety
+    /// - The file must be created and initialized exactly once.
+    /// - Initialization may be performed by either a [`Producer`] or a
+    ///   [`Consumer`], but that process or thread must be designated
+    ///   externally as the sole initializer.
+    /// - The queue does not validate `T` across processes.
+    /// - If a process may read, dereference, mutate, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
+    pub unsafe fn create_with_options(
+        file: &File,
+        file_size: usize,
+        options: Options,
+    ) -> Result<Self, Error> {
+        let mode = validate_mode::<MODE>()?;
+        let options = options.with_publication_mode(mode);
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer, so initializing the queue header for
         // this mapping happens exactly once.
-        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
+        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size, options) }?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(region, header) }
@@ -60,8 +195,8 @@ impl<T> Producer<T> {
     }
 
     /// Creates a Consumer that shares the same memory mapping.
-    pub fn join_as_consumer(&self) -> Consumer<T> {
-        Consumer {
+    pub fn join_as_consumer(&self) -> ModeConsumer<T, MODE> {
+        ModeConsumer {
             queue: self.queue.clone(),
         }
     }
@@ -119,20 +254,22 @@ impl<T> Producer<T> {
     /// Reserves a slot for writing.
     /// The slot is committed when the guard is dropped.
     ///
-    /// Other [`Producer`]s may write in parallel, but writes must be
-    /// published in order they were reserved. Holding a [`WriteGuard`] should
-    /// be treated similarly to holding a lock on a critical section.
+    /// Other [`Producer`]s may write in parallel, but writes become visible in
+    /// reservation order. In classic mode, holding a [`WriteGuard`] can make
+    /// later producers spin while publishing; cooperative mode avoids that
+    /// spin, though the visibility frontier still waits for earlier guards.
     ///
     /// # Safety
     /// - The caller must initialize the reserved slot before the guard is dropped.
     #[must_use]
-    pub unsafe fn reserve_write(&self) -> Option<WriteGuard<'_, T>> {
+    pub unsafe fn reserve_write(&self) -> Option<WriteGuard<'_, T, MODE>> {
         self.queue
             .reserve_write()
-            .map(|(cell, position)| WriteGuard {
+            .map(|(cell, reservation)| WriteGuard {
                 header: self.queue.header,
                 cell,
-                start: position,
+                start: reservation.start,
+                descriptor: reservation.descriptor,
                 _marker: PhantomData,
             })
     }
@@ -140,19 +277,21 @@ impl<T> Producer<T> {
     /// Reserves exactly `count` slots for writing.
     /// The slots are committed when the batch is dropped.
     ///
-    /// Other [`Producer`]s may write in parallel, but writes must be
-    /// published in the order they were reserved. Holding a [`WriteBatch`]
-    /// should be treated similarly to holding a lock on a critical section.
+    /// Other [`Producer`]s may write in parallel, but writes become visible in
+    /// reservation order. In classic mode, holding a [`WriteBatch`] can make
+    /// later producers spin while publishing; cooperative mode avoids that
+    /// spin, though the visibility frontier still waits for earlier batches.
     ///
     /// # Safety
     /// - The caller must initialize all reserved slots before the batch is dropped.
     #[must_use]
-    pub unsafe fn reserve_write_batch(&self, count: usize) -> Option<WriteBatch<'_, T>> {
-        let start = self.queue.reserve_write_batch(count)?;
+    pub unsafe fn reserve_write_batch(&self, count: usize) -> Option<WriteBatch<'_, T, MODE>> {
+        let reservation = self.queue.reserve_write_batch(count)?;
         Some(WriteBatch {
             header: self.queue.header,
             buffer: self.queue.buffer,
-            start,
+            start: reservation.start,
+            descriptor: reservation.descriptor,
             count,
             buffer_mask: self.queue.buffer_mask,
             _marker: PhantomData,
@@ -176,13 +315,20 @@ impl<T> Producer<T> {
         // SAFETY: `self.queue.header` points to a valid shared queue header.
         let header = unsafe { self.queue.header.as_ref() };
         let publication = header.producer_publication.load(Ordering::Acquire);
-        header
-            .producer_reservation
-            .store(publication, Ordering::Release);
+        if MODE == MODE_CLASSIC {
+            header
+                .producer_reservation
+                .store(publication, Ordering::Release);
+        } else {
+            header
+                .producer_reservation
+                .store(publication, Ordering::Release);
+            self.queue.clear_producer_descriptors();
+        }
     }
 }
 
-impl<T> Clone for Producer<T> {
+impl<T, const MODE: u32> Clone for ModeProducer<T, MODE> {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
@@ -190,14 +336,15 @@ impl<T> Clone for Producer<T> {
     }
 }
 
-unsafe impl<T: Send> Send for Producer<T> {}
-unsafe impl<T: Sync> Sync for Producer<T> {}
+unsafe impl<T: Send, const MODE: u32> Send for ModeProducer<T, MODE> {}
+unsafe impl<T: Sync, const MODE: u32> Sync for ModeProducer<T, MODE> {}
 
-pub struct Consumer<T> {
-    queue: SharedQueue<T>,
+/// MPMC consumer parameterized by publication mode.
+pub struct ModeConsumer<T, const MODE: u32> {
+    queue: SharedQueue<T, MODE>,
 }
 
-impl<T> Consumer<T> {
+impl<T, const MODE: u32> ModeConsumer<T, MODE> {
     /// Creates a new consumer for the shared queue in the provided file with
     /// the given size.
     ///
@@ -210,10 +357,31 @@ impl<T> Consumer<T> {
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
+        // SAFETY: forwarded from this function's safety contract.
+        unsafe { Self::create_with_options(file, file_size, Options::default()) }
+    }
+
+    /// Creates a new consumer for the shared queue using explicit options.
+    ///
+    /// # Safety
+    /// - The file must be created and initialized exactly once.
+    /// - Initialization may be performed by either a [`Producer`] or a
+    ///   [`Consumer`], but that process or thread must be designated
+    ///   externally as the sole initializer.
+    /// - The queue does not validate `T` across processes.
+    /// - If a process may read, dereference, mutate, or drop a queued value,
+    ///   that operation must be valid for that value in that process.
+    pub unsafe fn create_with_options(
+        file: &File,
+        file_size: usize,
+        options: Options,
+    ) -> Result<Self, Error> {
+        let mode = validate_mode::<MODE>()?;
+        let options = options.with_publication_mode(mode);
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer, so initializing the queue header for
         // this mapping happens exactly once.
-        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
+        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size, options) }?;
         // SAFETY: `header` is non-null and aligned properly and allocated with
         //         size of `file_size`.
         unsafe { Self::from_header(region, header) }
@@ -235,8 +403,8 @@ impl<T> Consumer<T> {
     }
 
     /// Creates a Producer that shares the same memory mapping.
-    pub fn join_as_producer(&self) -> Producer<T> {
-        Producer {
+    pub fn join_as_producer(&self) -> ModeProducer<T, MODE> {
+        ModeProducer {
             queue: self.queue.clone(),
         }
     }
@@ -271,22 +439,29 @@ impl<T> Consumer<T> {
     /// Attempts to reserve a value from the queue, returning a guard.
     /// The slot is released back to producers when the guard is dropped.
     ///
-    /// Other [`Consumer`]s may read in parallel, but reads must be
-    /// released in order they were reserved. Holding a [`ReadGuard`] should
-    /// be treated similarly to holding a lock on a critical section.
+    /// Other [`Consumer`]s may read in parallel, but capacity is returned in
+    /// reservation order. In classic mode, holding a [`ReadGuard`] can make
+    /// later consumers spin while releasing; cooperative mode avoids that
+    /// spin, though the release frontier still waits for earlier guards.
     #[must_use]
-    pub fn reserve_read(&self) -> Option<ReadGuard<'_, T>> {
-        self.queue.reserve_read().map(|(cell, position)| ReadGuard {
-            header: self.queue.header,
-            cell,
-            start: position,
-            _marker: PhantomData,
-        })
+    pub fn reserve_read(&self) -> Option<ReadGuard<'_, T, MODE>> {
+        self.queue
+            .reserve_read()
+            .map(|(cell, reservation)| ReadGuard {
+                header: self.queue.header,
+                cell,
+                start: reservation.start,
+                descriptor: reservation.descriptor,
+                _marker: PhantomData,
+            })
     }
 
     /// Attempts to reserve a value from the queue, waiting up to `timeout` for
     /// a producer to publish data.
-    pub fn reserve_read_timeout(&self, timeout: Duration) -> Result<ReadGuard<'_, T>, WaitError> {
+    pub fn reserve_read_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ReadGuard<'_, T, MODE>, WaitError> {
         self.reserve_with_timeout(timeout, || self.reserve_read())
     }
 
@@ -294,17 +469,19 @@ impl<T> Consumer<T> {
     /// The slots are released back to producers when the batch is dropped.
     ///
     ///
-    /// Other [`Consumer`]s may read in parallel, but reads must be
-    /// released in order they were reserved. Holding a [`ReadBatch`] should
-    /// be treated similarly to holding a lock on a critical section.
+    /// Other [`Consumer`]s may read in parallel, but capacity is returned in
+    /// reservation order. In classic mode, holding a [`ReadBatch`] can make
+    /// later consumers spin while releasing; cooperative mode avoids that
+    /// spin, though the release frontier still waits for earlier batches.
     #[must_use]
-    pub fn reserve_read_batch(&self, max: usize) -> Option<ReadBatch<'_, T>> {
-        let (start, count) = self.queue.reserve_read_batch(max)?;
+    pub fn reserve_read_batch(&self, max: usize) -> Option<ReadBatch<'_, T, MODE>> {
+        let reservation = self.queue.reserve_read_batch(max)?;
         Some(ReadBatch {
             header: self.queue.header,
             buffer: self.queue.buffer,
-            start,
-            count,
+            start: reservation.start,
+            descriptor: reservation.descriptor,
+            count: reservation.count,
             buffer_mask: self.queue.buffer_mask,
             _marker: PhantomData,
         })
@@ -318,7 +495,7 @@ impl<T> Consumer<T> {
         &self,
         max: usize,
         timeout: Duration,
-    ) -> Result<Option<ReadBatch<'_, T>>, WaitError> {
+    ) -> Result<Option<ReadBatch<'_, T, MODE>>, WaitError> {
         if max == 0 {
             return Ok(None);
         }
@@ -376,9 +553,16 @@ impl<T> Consumer<T> {
         // SAFETY: `self.queue.header` points to a valid shared queue header.
         let header = unsafe { self.queue.header.as_ref() };
         let release = header.consumer_release.load(Ordering::Acquire);
-        header
-            .consumer_reservation
-            .store(release, Ordering::Release);
+        if MODE == MODE_CLASSIC {
+            header
+                .consumer_reservation
+                .store(release, Ordering::Release);
+        } else {
+            header
+                .consumer_reservation
+                .store(release, Ordering::Release);
+            self.queue.clear_consumer_descriptors();
+        }
     }
 
     /// Drops all reserved-but-not-released reads left behind by a previous
@@ -399,13 +583,20 @@ impl<T> Consumer<T> {
         // SAFETY: `self.queue.header` points to a valid shared queue header.
         let header = unsafe { self.queue.header.as_ref() };
         let reservation = header.consumer_reservation.load(Ordering::Acquire);
-        header
-            .consumer_release
-            .store(reservation, Ordering::Release);
+        if MODE == MODE_CLASSIC {
+            header
+                .consumer_release
+                .store(reservation, Ordering::Release);
+        } else {
+            header
+                .consumer_release
+                .store(reservation, Ordering::Release);
+            self.queue.clear_consumer_descriptors();
+        }
     }
 }
 
-impl<T> Clone for Consumer<T> {
+impl<T, const MODE: u32> Clone for ModeConsumer<T, MODE> {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
@@ -413,15 +604,43 @@ impl<T> Clone for Consumer<T> {
     }
 }
 
-unsafe impl<T: Send> Send for Consumer<T> {}
-unsafe impl<T: Sync> Sync for Consumer<T> {}
+unsafe impl<T: Send, const MODE: u32> Send for ModeConsumer<T, MODE> {}
+unsafe impl<T: Sync, const MODE: u32> Sync for ModeConsumer<T, MODE> {}
 
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
 /// page-size requirements.
 pub const fn minimum_file_size<T>(capacity: usize) -> usize {
-    let buffer_offset = SharedQueueHeader::buffer_offset::<T>();
-    buffer_offset + normalized_capacity(capacity) * core::mem::size_of::<T>()
+    minimum_file_size_with_options::<T>(capacity, Options::new())
+}
+
+/// Calculates the minimum file size required for a queue with given capacity
+/// and options.
+/// Note that file size MAY need to be increased beyond this to account for
+/// page-size requirements.
+pub const fn minimum_file_size_with_options<T>(capacity: usize, options: Options) -> usize {
+    let mut capacity = normalized_capacity(capacity);
+    if matches!(options.publication_mode(), PublicationMode::Cooperative)
+        && capacity > COOPERATIVE_MAX_CAPACITY
+    {
+        capacity = COOPERATIVE_MAX_CAPACITY;
+    }
+    let descriptor_capacity = SharedQueueHeader::descriptor_capacity_for_options(capacity, options);
+    let buffer_offset = SharedQueueHeader::buffer_offset_for_capacities::<T>(
+        descriptor_capacity,
+        options.publication_mode(),
+    );
+    buffer_offset + capacity * core::mem::size_of::<T>()
+}
+
+pub const fn minimum_file_size_for_mode<T, const MODE: u32>(
+    capacity: usize,
+    options: Options,
+) -> usize {
+    minimum_file_size_with_options::<T>(
+        capacity,
+        options.with_publication_mode(publication_mode_for_mode::<MODE>()),
+    )
 }
 
 /// Calculates the minimum region size required for a queue with given capacity.
@@ -429,64 +648,175 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
     minimum_file_size::<T>(capacity)
 }
 
+/// Calculates the minimum region size required for a queue with given capacity
+/// and options.
+pub const fn minimum_region_size_with_options<T>(capacity: usize, options: Options) -> usize {
+    minimum_file_size_with_options::<T>(capacity, options)
+}
+
+pub const fn minimum_region_size_for_mode<T, const MODE: u32>(
+    capacity: usize,
+    options: Options,
+) -> usize {
+    minimum_file_size_for_mode::<T, MODE>(capacity, options)
+}
+
 /// Creates a new in-process MPMC queue pair backed by a heap allocation.
 ///
 /// Values left buffered when the queue is dropped may be leaked instead of
 /// having their destructors run.
 pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Error> {
-    let region_size = minimum_region_size::<T>(capacity);
+    pair_with_options::<T, { MODE_CLASSIC }>(capacity, Options::default())
+}
+
+/// Creates a new in-process MPMC queue pair with explicit options.
+///
+/// Values left buffered when the queue is dropped may be leaked instead of
+/// having their destructors run.
+pub fn pair_with_options<T: Send, const MODE: u32>(
+    capacity: usize,
+    options: Options,
+) -> Result<(ModeProducer<T, MODE>, ModeConsumer<T, MODE>), Error> {
+    let mode = validate_mode::<MODE>()?;
+    let options = options.with_publication_mode(mode);
+    let region_size = minimum_region_size_with_options::<T>(capacity, options);
     let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
-    let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region) }?;
-    let producer = unsafe { Producer::from_header(Arc::clone(&region), header) }?;
-    let consumer = unsafe { Consumer::from_header(region, header) }?;
+    let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region, options) }?;
+    let producer = unsafe { ModeProducer::<T, MODE>::from_header(Arc::clone(&region), header) }?;
+    let consumer = unsafe { ModeConsumer::<T, MODE>::from_header(region, header) }?;
     Ok((producer, consumer))
 }
 
-struct SharedQueue<T> {
+pub fn cooperative_pair<T: Send>(
+    capacity: usize,
+    options: Options,
+) -> Result<(CooperativeProducer<T>, CooperativeConsumer<T>), Error> {
+    pair_with_options::<T, { MODE_COOPERATIVE }>(capacity, options)
+}
+
+const COOPERATIVE_DESCRIPTOR_PENDING: usize = 0;
+const COOPERATIVE_DESCRIPTOR_READY: usize = 1;
+
+#[derive(Clone, Copy)]
+struct ProducerReservation {
+    start: usize,
+    descriptor: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ConsumerReservation {
+    start: usize,
+    count: usize,
+    descriptor: usize,
+}
+
+#[inline]
+fn cooperative_cursor_add(cursor: usize, increment: usize) -> usize {
+    (cursor as u32).wrapping_add(increment as u32) as usize
+}
+
+#[inline]
+fn cooperative_cursor_sub(lhs: usize, rhs: usize) -> usize {
+    (lhs as u32).wrapping_sub(rhs as u32) as usize
+}
+
+#[inline]
+fn cooperative_pack_cursor_pair(item: usize, descriptor: usize) -> usize {
+    ((descriptor as u32 as usize) << 32) | item as u32 as usize
+}
+
+#[inline]
+fn cooperative_packed_item(packed: usize) -> usize {
+    packed as u32 as usize
+}
+
+#[inline]
+fn cooperative_packed_descriptor(packed: usize) -> usize {
+    (packed >> 32) as u32 as usize
+}
+
+#[repr(C)]
+struct CooperativeDescriptor {
+    start: AtomicUsize,
+    count: AtomicUsize,
+    state: AtomicUsize,
+}
+
+impl CooperativeDescriptor {
+    const fn new() -> Self {
+        Self {
+            start: AtomicUsize::new(0),
+            count: AtomicUsize::new(0),
+            state: AtomicUsize::new(COOPERATIVE_DESCRIPTOR_PENDING),
+        }
+    }
+
+    fn initialize_reserved(&self, start: usize, count: usize) {
+        // The reservation cursor gives this caller exclusive ownership of the
+        // descriptor position. The publication/release cursor is the reuse
+        // frontier, so no descriptor-local free state is needed.
+        self.state
+            .store(COOPERATIVE_DESCRIPTOR_PENDING, Ordering::Release);
+        self.start.store(start, Ordering::Relaxed);
+        self.count.store(count, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CooperativeDescriptorRings {
+    producer: NonNull<CooperativeDescriptor>,
+    consumer: NonNull<CooperativeDescriptor>,
+}
+
+struct SharedQueue<T, const MODE: u32> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
+    cooperative_descriptors: Option<CooperativeDescriptorRings>,
     buffer_mask: usize,
+    cooperative_descriptor_mask: usize,
 
     // NB: Region must be declared last so it is dropped last ensuring `header` and
     // `buffer` remain valid for their entire lifetime.
     region: Arc<Region>,
 }
 
-impl<T> Clone for SharedQueue<T> {
+impl<T, const MODE: u32> Clone for SharedQueue<T, MODE> {
     fn clone(&self) -> Self {
         Self {
             header: self.header,
             buffer: self.buffer,
+            cooperative_descriptors: self.cooperative_descriptors,
             buffer_mask: self.buffer_mask,
+            cooperative_descriptor_mask: self.cooperative_descriptor_mask,
             region: Arc::clone(&self.region),
         }
     }
 }
 
-impl<T> SharedQueue<T> {
+impl<T, const MODE: u32> SharedQueue<T, MODE> {
     #[inline]
     fn capacity(&self) -> usize {
         self.buffer_mask.wrapping_add(1)
     }
 
-    fn reserve_write(&self) -> Option<(NonNull<T>, usize)> {
-        let position = self.reserve_write_batch(1)?;
-        let cell_index = position & self.buffer_mask;
+    fn reserve_write(&self) -> Option<(NonNull<T>, ProducerReservation)> {
+        let reservation = self.reserve_write_batch(1)?;
+        let cell_index = reservation.start & self.buffer_mask;
         // SAFETY: Mask ensures index is in bounds.
         let cell = unsafe { self.buffer.add(cell_index) };
-        Some((cell, position))
+        Some((cell, reservation))
     }
 
-    fn reserve_read(&self) -> Option<(NonNull<T>, usize)> {
-        let (position, _) = self.reserve_read_batch(1)?;
-        let cell_index = position & self.buffer_mask;
+    fn reserve_read(&self) -> Option<(NonNull<T>, ConsumerReservation)> {
+        let reservation = self.reserve_read_batch(1)?;
+        let cell_index = reservation.start & self.buffer_mask;
         // SAFETY: Mask ensures index is in bounds.
         let cell = unsafe { self.buffer.add(cell_index) };
-        Some((cell, position))
+        Some((cell, reservation))
     }
 
-    fn reserve_write_batch(&self, count: usize) -> Option<usize> {
+    fn reserve_write_batch(&self, count: usize) -> Option<ProducerReservation> {
         if count == 0 {
             return None;
         }
@@ -495,6 +825,21 @@ impl<T> SharedQueue<T> {
         if count > capacity {
             return None;
         }
+
+        if MODE == MODE_CLASSIC {
+            self.reserve_write_batch_classic(count, capacity)
+        } else {
+            self.reserve_write_batch_cooperative(count, capacity)
+        }
+    }
+
+    fn reserve_write_batch_classic(
+        &self,
+        count: usize,
+        capacity: usize,
+    ) -> Option<ProducerReservation> {
+        debug_assert!(count != 0);
+        debug_assert!(count <= capacity);
 
         // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
         let header = unsafe { self.header.as_ref() };
@@ -515,7 +860,10 @@ impl<T> SharedQueue<T> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    return Some(producer_reservation);
+                    return Some(ProducerReservation {
+                        start: producer_reservation,
+                        descriptor: 0,
+                    });
                 }
                 Err(current) => {
                     producer_reservation = current;
@@ -524,13 +872,97 @@ impl<T> SharedQueue<T> {
         }
     }
 
-    fn reserve_read_batch(&self, max: usize) -> Option<(usize, usize)> {
+    fn reserve_write_batch_cooperative(
+        &self,
+        count: usize,
+        capacity: usize,
+    ) -> Option<ProducerReservation> {
+        debug_assert!(count != 0);
+        debug_assert!(count <= capacity);
+
+        let descriptors = self.cooperative_descriptors?.producer;
+        let descriptor_capacity = self.cooperative_descriptor_mask.wrapping_add(1);
+
+        // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
+        let header = unsafe { self.header.as_ref() };
+        let mut packed_reservation = header.producer_reservation.load(Ordering::Relaxed);
+
+        loop {
+            let producer_reservation = cooperative_packed_item(packed_reservation);
+            let descriptor_reservation = cooperative_packed_descriptor(packed_reservation);
+
+            let consumer_release =
+                cooperative_packed_item(header.consumer_release.load(Ordering::Acquire));
+            let used_items = cooperative_cursor_sub(producer_reservation, consumer_release);
+            let item_limit = capacity - count;
+            if used_items > item_limit {
+                return None;
+            }
+
+            let producer_publication = header.producer_publication.load(Ordering::Acquire);
+            let descriptor_frontier = cooperative_packed_descriptor(producer_publication);
+            let used_descriptors =
+                cooperative_cursor_sub(descriptor_reservation, descriptor_frontier);
+            if used_descriptors >= descriptor_capacity {
+                // Descriptor capacity may be hidden behind ready producer
+                // descriptors whose owners have not drained the prefix yet.
+                // SAFETY: `self.header` points to a cooperative queue header.
+                unsafe { SharedQueueHeader::try_publish_cooperative(self.header) };
+                if header.producer_publication.load(Ordering::Acquire) != producer_publication {
+                    continue;
+                }
+                return None;
+            }
+
+            let new_reservation = cooperative_pack_cursor_pair(
+                cooperative_cursor_add(producer_reservation, count),
+                cooperative_cursor_add(descriptor_reservation, 1),
+            );
+            match header.producer_reservation.compare_exchange_weak(
+                packed_reservation,
+                new_reservation,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let descriptor_index =
+                        descriptor_reservation & self.cooperative_descriptor_mask;
+                    // SAFETY: Mask ensures the descriptor index is in bounds.
+                    let descriptor = unsafe { descriptors.add(descriptor_index).as_ref() };
+                    descriptor.initialize_reserved(producer_reservation, count);
+                    return Some(ProducerReservation {
+                        start: producer_reservation,
+                        descriptor: descriptor_reservation,
+                    });
+                }
+                Err(current) => {
+                    packed_reservation = current;
+                }
+            }
+        }
+    }
+
+    fn reserve_read_batch(&self, max: usize) -> Option<ConsumerReservation> {
         if max == 0 {
             return None;
         }
 
         let capacity = self.capacity();
         let max = max.min(capacity);
+
+        if MODE == MODE_CLASSIC {
+            self.reserve_read_batch_classic(max, capacity)
+        } else {
+            self.reserve_read_batch_cooperative(max, capacity)
+        }
+    }
+
+    fn reserve_read_batch_classic(
+        &self,
+        max: usize,
+        capacity: usize,
+    ) -> Option<ConsumerReservation> {
+        debug_assert!(max != 0);
 
         // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
         let header = unsafe { self.header.as_ref() };
@@ -552,10 +984,85 @@ impl<T> SharedQueue<T> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    return Some((consumer_reservation, count));
+                    return Some(ConsumerReservation {
+                        start: consumer_reservation,
+                        count,
+                        descriptor: 0,
+                    });
                 }
                 Err(current) => {
                     consumer_reservation = current;
+                }
+            }
+        }
+    }
+
+    fn reserve_read_batch_cooperative(
+        &self,
+        max: usize,
+        capacity: usize,
+    ) -> Option<ConsumerReservation> {
+        debug_assert!(max != 0);
+
+        let descriptors = self.cooperative_descriptors?.consumer;
+        let descriptor_capacity = self.cooperative_descriptor_mask.wrapping_add(1);
+
+        // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
+        let header = unsafe { self.header.as_ref() };
+        let mut packed_reservation = header.consumer_reservation.load(Ordering::Relaxed);
+
+        loop {
+            let consumer_reservation = cooperative_packed_item(packed_reservation);
+            let descriptor_reservation = cooperative_packed_descriptor(packed_reservation);
+
+            let producer_publication =
+                cooperative_packed_item(header.producer_publication.load(Ordering::Acquire));
+            let available = cooperative_cursor_sub(producer_publication, consumer_reservation);
+            if available == 0 || available > capacity {
+                return None;
+            }
+
+            let consumer_release = header.consumer_release.load(Ordering::Acquire);
+            let descriptor_release = cooperative_packed_descriptor(consumer_release);
+            let used_descriptors =
+                cooperative_cursor_sub(descriptor_reservation, descriptor_release);
+            if used_descriptors >= descriptor_capacity {
+                // Consumer descriptor capacity may be hidden behind ready
+                // release descriptors whose owners have not drained the
+                // prefix yet.
+                // SAFETY: `self.header` points to a cooperative queue header.
+                unsafe { SharedQueueHeader::try_release_cooperative(self.header) };
+                if header.consumer_release.load(Ordering::Acquire) != consumer_release {
+                    continue;
+                }
+                return None;
+            }
+
+            let count = available.min(max);
+            let new_reservation = cooperative_pack_cursor_pair(
+                cooperative_cursor_add(consumer_reservation, count),
+                cooperative_cursor_add(descriptor_reservation, 1),
+            );
+            match header.consumer_reservation.compare_exchange_weak(
+                packed_reservation,
+                new_reservation,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let descriptor_index =
+                        descriptor_reservation & self.cooperative_descriptor_mask;
+                    // SAFETY: Mask ensures the descriptor index is in bounds.
+                    let descriptor = unsafe { descriptors.add(descriptor_index).as_ref() };
+                    descriptor.initialize_reserved(consumer_reservation, count);
+                    return Some(ConsumerReservation {
+                        start: consumer_reservation,
+                        count,
+                        descriptor: descriptor_reservation,
+                    });
+                }
+                Err(current) => {
+                    packed_reservation = current;
                 }
             }
         }
@@ -565,6 +1072,29 @@ impl<T> SharedQueue<T> {
         // SAFETY: Header is non-null valid pointer, never accessed mutably elsewhere.
         let header = unsafe { self.header.as_ref() };
         ConsumerWaiter::new(&header.futex, &header.futex_waiters)
+    }
+
+    fn clear_producer_descriptors(&self) {
+        if let Some(descriptors) = self.cooperative_descriptors {
+            self.clear_descriptors(descriptors.producer);
+        }
+    }
+
+    fn clear_consumer_descriptors(&self) {
+        if let Some(descriptors) = self.cooperative_descriptors {
+            self.clear_descriptors(descriptors.consumer);
+        }
+    }
+
+    fn clear_descriptors(&self, descriptors: NonNull<CooperativeDescriptor>) {
+        let descriptor_capacity = self.cooperative_descriptor_mask.wrapping_add(1);
+        for index in 0..descriptor_capacity {
+            // SAFETY: `index < descriptor_capacity`, so the descriptor is in bounds.
+            let descriptor = unsafe { descriptors.add(index).as_ref() };
+            descriptor
+                .state
+                .store(COOPERATIVE_DESCRIPTOR_PENDING, Ordering::Release);
+        }
     }
 
     /// Creates a new shared queue from a header pointer and region.
@@ -579,23 +1109,68 @@ impl<T> SharedQueue<T> {
         let header_ref = unsafe { header.as_ref() };
         let buffer_mask = header_ref.buffer_mask as usize;
         let buffer_size_in_items = buffer_mask.wrapping_add(1);
+        let publication_mode = validate_mode::<MODE>()?;
+        if header_ref.publication_mode()? != publication_mode {
+            return Err(Error::InvalidBufferSize);
+        }
+        let cooperative_descriptor_mask = if MODE == MODE_COOPERATIVE {
+            header_ref.descriptor_mask as usize
+        } else {
+            0
+        };
+        let cooperative_descriptor_capacity = if MODE == MODE_COOPERATIVE {
+            cooperative_descriptor_mask.wrapping_add(1)
+        } else {
+            0
+        };
         if !buffer_size_in_items.is_power_of_two()
             || buffer_size_in_items == 0
-            || SharedQueueHeader::calculate_buffer_size_in_items::<T>(region.size())?
-                != buffer_size_in_items
+            || (MODE == MODE_COOPERATIVE
+                && (!cooperative_descriptor_capacity.is_power_of_two()
+                    || cooperative_descriptor_capacity == 0
+                    || cooperative_descriptor_capacity > buffer_size_in_items))
+            || SharedQueueHeader::calculate_buffer_size_in_items_for_layout::<T>(
+                region.size(),
+                publication_mode,
+                cooperative_descriptor_capacity,
+            )? != buffer_size_in_items
         {
             return Err(Error::InvalidBufferSize);
         }
 
+        let cooperative_descriptors = if MODE == MODE_COOPERATIVE {
+            // SAFETY:
+            // - `header` is non-null and aligned properly.
+            // - cooperative layout validation above proves both descriptor rings exist.
+            let producer =
+                unsafe { SharedQueueHeader::cooperative_producer_descriptors_from_header(header) };
+            // SAFETY:
+            // - `header` is non-null and aligned properly.
+            // - cooperative layout validation above proves both descriptor rings exist.
+            let consumer = unsafe {
+                SharedQueueHeader::cooperative_consumer_descriptors_from_header(
+                    header,
+                    cooperative_descriptor_capacity,
+                )
+            };
+            Some(CooperativeDescriptorRings { producer, consumer })
+        } else {
+            None
+        };
+
         // SAFETY:
         // - `header` is non-null and aligned properly.
         // - allocation at `header` is large enough to hold the header and the buffer.
-        let buffer = unsafe { Self::buffer_from_header(header) };
+        let buffer = unsafe {
+            Self::buffer_from_header(header, cooperative_descriptor_capacity, publication_mode)
+        };
         Ok(Self {
             header,
             buffer,
+            cooperative_descriptors,
             region,
             buffer_mask,
+            cooperative_descriptor_mask,
         })
     }
 
@@ -605,8 +1180,15 @@ impl<T> SharedQueue<T> {
     /// - The header must be non-null and properly aligned.
     /// - The allocation at `header` must be of sufficient size to hold the
     ///   header and padding bytes to align the trailing buffer of `T`.
-    unsafe fn buffer_from_header(header: NonNull<SharedQueueHeader>) -> NonNull<T> {
-        let buffer_offset = SharedQueueHeader::buffer_offset::<T>();
+    unsafe fn buffer_from_header(
+        header: NonNull<SharedQueueHeader>,
+        descriptor_capacity: usize,
+        publication_mode: PublicationMode,
+    ) -> NonNull<T> {
+        let buffer_offset = SharedQueueHeader::buffer_offset_for_capacities::<T>(
+            descriptor_capacity,
+            publication_mode,
+        );
 
         // SAFETY:
         // - buffer_offset will not overflow isize.
@@ -622,6 +1204,8 @@ struct SharedQueueHeader {
     magic: AtomicU64,
     version: u32,
     buffer_mask: u32,
+    publication_mode: u32,
+    descriptor_mask: u32,
 
     /// Producer reservation cursor.
     ///
@@ -631,8 +1215,10 @@ struct SharedQueueHeader {
     producer_reservation: CacheAlignedAtomicSize,
     /// Producer publication cursor.
     ///
-    /// Producers advance this in-order after filling reserved slots. Consumers
-    /// use it to determine how many initialized items are readable.
+    /// In classic mode this stores the item cursor. In cooperative mode this
+    /// stores the packed item and descriptor publication cursors. Producers
+    /// advance this in-order after filling reserved slots. Consumers use the
+    /// item cursor to determine how many initialized items are readable.
     producer_publication: CacheAlignedAtomicSize,
     /// Consumer reservation cursor.
     ///
@@ -642,8 +1228,10 @@ struct SharedQueueHeader {
     consumer_reservation: CacheAlignedAtomicSize,
     /// Consumer release cursor.
     ///
-    /// Consumers advance this in-order after dropping/reading claimed slots.
-    /// Producers use it to determine how much free space is available.
+    /// In classic mode this stores the item cursor. In cooperative mode this
+    /// stores the packed item and descriptor release cursors. Consumers advance
+    /// this in-order after dropping/reading claimed slots. Producers use the
+    /// item cursor to determine how much free space is available.
     consumer_release: CacheAlignedAtomicSize,
     /// Futex word used for consumer wait/wake coordination.
     ///
@@ -668,12 +1256,16 @@ impl SharedQueueHeader {
     ///   queue header.
     /// - The returned `region` must not be passed to any other queue-header
     ///   initialization routine.
-    unsafe fn create<T>(file: &File, size: usize) -> Result<(Arc<Region>, NonNull<Self>), Error> {
+    unsafe fn create<T>(
+        file: &File,
+        size: usize,
+        options: Options,
+    ) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         file.set_len(size as u64)?;
 
         let region = Region::map_file(file, size)?;
         // SAFETY: caller guarantees this mapping is initialized exactly once.
-        let header = unsafe { Self::create_in_region::<T>(&region) }?;
+        let header = unsafe { Self::create_in_region::<T>(&region, options) }?;
         Ok((region, header))
     }
 
@@ -681,8 +1273,12 @@ impl SharedQueueHeader {
     ///
     /// # Safety
     /// - This function must be called at most once for a given `region`.
-    unsafe fn create_in_region<T>(region: &Arc<Region>) -> Result<NonNull<Self>, Error> {
-        let buffer_size_in_items = Self::calculate_buffer_size_in_items::<T>(region.size())?;
+    unsafe fn create_in_region<T>(
+        region: &Arc<Region>,
+        options: Options,
+    ) -> Result<NonNull<Self>, Error> {
+        let (buffer_size_in_items, descriptor_capacity) =
+            Self::calculate_capacities_with_options::<T>(region.size(), options)?;
         let header = region.addr().cast::<Self>();
         // SAFETY: The header is non-null and aligned properly.
         //         Alignment is guaranteed because mmap ensures that the
@@ -690,11 +1286,18 @@ impl SharedQueueHeader {
         //         alignment of `SharedQueueHeader`.
         //         Access is exclusive because the caller guarantees this region
         //         is initialized at most once.
-        unsafe { Self::initialize(header, buffer_size_in_items) };
+        unsafe {
+            Self::initialize(
+                header,
+                buffer_size_in_items,
+                descriptor_capacity,
+                options.publication_mode(),
+            )
+        };
         Ok(header)
     }
 
-    const fn buffer_offset<T>() -> usize {
+    const fn classic_buffer_offset<T>() -> usize {
         const {
             assert!(
                 core::mem::align_of::<T>() <= crate::shmem::MINIMUM_REGION_ALIGNMENT,
@@ -705,7 +1308,116 @@ impl SharedQueueHeader {
         core::mem::size_of::<Self>().next_multiple_of(core::mem::align_of::<T>())
     }
 
-    const fn calculate_buffer_size_in_items<T>(file_size: usize) -> Result<usize, Error> {
+    const fn cooperative_descriptors_offset() -> usize {
+        core::mem::size_of::<Self>()
+            .next_multiple_of(core::mem::align_of::<CooperativeDescriptor>())
+    }
+
+    const fn descriptor_capacity_for_options(item_capacity: usize, options: Options) -> usize {
+        match options.publication_mode() {
+            PublicationMode::Classic => 0,
+            PublicationMode::Cooperative => {
+                if item_capacity == 0 {
+                    0
+                } else {
+                    let requested = if options.cooperative_descriptor_capacity() == 0 {
+                        DEFAULT_COOPERATIVE_DESCRIPTOR_CAPACITY
+                    } else {
+                        normalized_capacity(options.cooperative_descriptor_capacity())
+                    };
+                    if requested > item_capacity {
+                        item_capacity
+                    } else {
+                        requested
+                    }
+                }
+            }
+        }
+    }
+
+    const fn buffer_offset_for_capacities<T>(
+        descriptor_capacity: usize,
+        publication_mode: PublicationMode,
+    ) -> usize {
+        const {
+            assert!(
+                core::mem::align_of::<T>() <= crate::shmem::MINIMUM_REGION_ALIGNMENT,
+                "types with alignment > MINIMUM_REGION_ALIGNMENT are not supported"
+            )
+        }
+
+        match publication_mode {
+            PublicationMode::Classic => Self::classic_buffer_offset::<T>(),
+            PublicationMode::Cooperative => {
+                let after_descriptors = Self::cooperative_descriptors_offset()
+                    + 2 * descriptor_capacity * core::mem::size_of::<CooperativeDescriptor>();
+                after_descriptors.next_multiple_of(core::mem::align_of::<T>())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn calculate_buffer_size_in_items<T>(file_size: usize) -> Result<usize, Error> {
+        Self::calculate_buffer_size_in_items_for_layout::<T>(file_size, PublicationMode::Classic, 0)
+    }
+
+    fn calculate_capacities_with_options<T>(
+        file_size: usize,
+        options: Options,
+    ) -> Result<(usize, usize), Error> {
+        match options.publication_mode() {
+            PublicationMode::Classic => Ok((
+                Self::calculate_buffer_size_in_items_for_layout::<T>(
+                    file_size,
+                    PublicationMode::Classic,
+                    0,
+                )?,
+                0,
+            )),
+            PublicationMode::Cooperative => {
+                let descriptors_offset = Self::cooperative_descriptors_offset();
+                if file_size < descriptors_offset {
+                    return Err(Error::InvalidBufferSize);
+                }
+
+                let available_for_items = file_size - descriptors_offset;
+                let mut item_capacity = available_for_items / core::mem::size_of::<T>();
+                item_capacity = item_capacity.min(COOPERATIVE_MAX_CAPACITY);
+                if item_capacity == 0 {
+                    return Err(Error::InvalidBufferSize);
+                }
+                if !item_capacity.is_power_of_two() {
+                    item_capacity = item_capacity.next_power_of_two() >> 1;
+                    if item_capacity == 0 {
+                        return Err(Error::InvalidBufferSize);
+                    }
+                }
+
+                while item_capacity > 0 {
+                    let descriptor_capacity =
+                        Self::descriptor_capacity_for_options(item_capacity, options);
+                    if descriptor_capacity != 0
+                        && Self::total_size_for_capacities::<T>(
+                            item_capacity,
+                            descriptor_capacity,
+                            PublicationMode::Cooperative,
+                        ) <= file_size
+                    {
+                        return Ok((item_capacity, descriptor_capacity));
+                    }
+                    item_capacity >>= 1;
+                }
+
+                Err(Error::InvalidBufferSize)
+            }
+        }
+    }
+
+    fn calculate_buffer_size_in_items_for_layout<T>(
+        file_size: usize,
+        publication_mode: PublicationMode,
+        descriptor_capacity: usize,
+    ) -> Result<usize, Error> {
         const {
             assert!(
                 core::mem::size_of::<T>() > 0,
@@ -713,28 +1425,81 @@ impl SharedQueueHeader {
             )
         }
 
-        let buffer_offset = Self::buffer_offset::<T>();
-        if file_size < buffer_offset {
-            return Err(Error::InvalidBufferSize);
-        }
+        match publication_mode {
+            PublicationMode::Classic => {
+                let buffer_offset = Self::classic_buffer_offset::<T>();
+                if file_size < buffer_offset {
+                    return Err(Error::InvalidBufferSize);
+                }
 
-        // The buffer size (in units of T) must be a power of two.
-        let buffer_size_in_bytes = file_size - buffer_offset;
-        let mut buffer_size_in_items = buffer_size_in_bytes / core::mem::size_of::<T>();
-        if !buffer_size_in_items.is_power_of_two() {
-            // If not a power of two, round down to the previous power of two.
-            buffer_size_in_items = buffer_size_in_items.next_power_of_two() >> 1;
-            if buffer_size_in_items == 0 {
-                return Err(Error::InvalidBufferSize);
+                // The buffer size (in units of T) must be a power of two.
+                let buffer_size_in_bytes = file_size - buffer_offset;
+                let mut buffer_size_in_items = buffer_size_in_bytes / core::mem::size_of::<T>();
+                if !buffer_size_in_items.is_power_of_two() {
+                    // If not a power of two, round down to the previous power of two.
+                    buffer_size_in_items = buffer_size_in_items.next_power_of_two() >> 1;
+                    if buffer_size_in_items == 0 {
+                        return Err(Error::InvalidBufferSize);
+                    }
+                }
+
+                Self::validate_capacity(buffer_size_in_items)?;
+                Ok(buffer_size_in_items)
+            }
+            PublicationMode::Cooperative => {
+                if descriptor_capacity == 0
+                    || !descriptor_capacity.is_power_of_two()
+                    || descriptor_capacity > COOPERATIVE_MAX_CAPACITY
+                {
+                    return Err(Error::InvalidBufferSize);
+                }
+
+                let buffer_offset = Self::buffer_offset_for_capacities::<T>(
+                    descriptor_capacity,
+                    PublicationMode::Cooperative,
+                );
+                if file_size < buffer_offset {
+                    return Err(Error::InvalidBufferSize);
+                }
+                let mut buffer_size_in_items =
+                    (file_size - buffer_offset) / core::mem::size_of::<T>();
+                buffer_size_in_items = buffer_size_in_items.min(COOPERATIVE_MAX_CAPACITY);
+                if buffer_size_in_items == 0 {
+                    return Err(Error::InvalidBufferSize);
+                }
+                if !buffer_size_in_items.is_power_of_two() {
+                    buffer_size_in_items = buffer_size_in_items.next_power_of_two() >> 1;
+                    if buffer_size_in_items == 0 {
+                        return Err(Error::InvalidBufferSize);
+                    }
+                }
+
+                if buffer_size_in_items < descriptor_capacity {
+                    return Err(Error::InvalidBufferSize);
+                }
+
+                Self::validate_capacity(buffer_size_in_items)?;
+                Ok(buffer_size_in_items)
             }
         }
+    }
 
+    const fn total_size_for_capacities<T>(
+        item_capacity: usize,
+        descriptor_capacity: usize,
+        publication_mode: PublicationMode,
+    ) -> usize {
+        Self::buffer_offset_for_capacities::<T>(descriptor_capacity, publication_mode)
+            + item_capacity * core::mem::size_of::<T>()
+    }
+
+    fn validate_capacity(buffer_size_in_items: usize) -> Result<(), Error> {
         // The buffer mask is stored as u32, so the capacity must fit.
         if buffer_size_in_items > u32::MAX as usize + 1 {
             return Err(Error::InvalidBufferSize);
         }
 
-        Ok(buffer_size_in_items)
+        Ok(())
     }
 
     /// Initializes the shared queue header.
@@ -743,7 +1508,12 @@ impl SharedQueueHeader {
     /// - `header` must be non-null and properly aligned.
     /// - `header` allocation must be large enough to hold the header and the buffer.
     /// - `access` to `header` must be unique when this is called.
-    unsafe fn initialize(mut header_ptr: NonNull<Self>, buffer_size_in_items: usize) {
+    unsafe fn initialize(
+        mut header_ptr: NonNull<Self>,
+        buffer_size_in_items: usize,
+        descriptor_capacity: usize,
+        publication_mode: PublicationMode,
+    ) {
         // SAFETY:
         // - `header` is non-null and aligned properly.
         // - `access` to `header` is unique.
@@ -755,7 +1525,45 @@ impl SharedQueueHeader {
         header.futex.store(0, Ordering::Release);
         header.futex_waiters.store(0, Ordering::Release);
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
+        header.publication_mode = publication_mode.as_u32();
+        header.descriptor_mask = if descriptor_capacity == 0 {
+            0
+        } else {
+            u32::try_from(descriptor_capacity - 1).unwrap()
+        };
         header.version = VERSION;
+
+        if publication_mode == PublicationMode::Cooperative {
+            // SAFETY: The cooperative layout reserves exactly
+            // `descriptor_capacity` producer descriptor entries after the header.
+            let descriptors =
+                unsafe { Self::cooperative_producer_descriptors_from_header(header_ptr) };
+            for index in 0..descriptor_capacity {
+                // SAFETY: `index < descriptor_capacity`, so the descriptor is in bounds.
+                unsafe {
+                    descriptors
+                        .add(index)
+                        .as_ptr()
+                        .write(CooperativeDescriptor::new())
+                };
+            }
+
+            // SAFETY: The cooperative layout reserves exactly
+            // `descriptor_capacity` consumer descriptor entries after producer descriptors.
+            let descriptors = unsafe {
+                Self::cooperative_consumer_descriptors_from_header(header_ptr, descriptor_capacity)
+            };
+            for index in 0..descriptor_capacity {
+                // SAFETY: `index < descriptor_capacity`, so the descriptor is in bounds.
+                unsafe {
+                    descriptors
+                        .add(index)
+                        .as_ptr()
+                        .write(CooperativeDescriptor::new())
+                };
+            }
+        }
+
         header.magic.store(MAGIC, Ordering::Release);
     }
 
@@ -783,8 +1591,20 @@ impl SharedQueueHeader {
                     actual: header.version,
                 });
             }
+            let publication_mode = header.publication_mode()?;
             let buffer_size_in_items = (header.buffer_mask as usize).wrapping_add(1);
-            if buffer_size_in_items != Self::calculate_buffer_size_in_items::<T>(region.size())? {
+            let descriptor_capacity = if publication_mode == PublicationMode::Cooperative {
+                (header.descriptor_mask as usize).wrapping_add(1)
+            } else {
+                0
+            };
+            if buffer_size_in_items
+                != Self::calculate_buffer_size_in_items_for_layout::<T>(
+                    region.size(),
+                    publication_mode,
+                    descriptor_capacity,
+                )?
+            {
                 return Err(Error::InvalidBufferSize);
             }
         }
@@ -792,9 +1612,49 @@ impl SharedQueueHeader {
         Ok(header)
     }
 
+    fn publication_mode(&self) -> Result<PublicationMode, Error> {
+        PublicationMode::from_u32(self.publication_mode).ok_or(Error::InvalidBufferSize)
+    }
+
+    /// # Safety
+    /// - The header must be non-null and properly aligned.
+    /// - The allocation at `header` must include the cooperative descriptor ring.
+    unsafe fn cooperative_producer_descriptors_from_header(
+        header: NonNull<SharedQueueHeader>,
+    ) -> NonNull<CooperativeDescriptor> {
+        let descriptors_offset = Self::cooperative_descriptors_offset();
+
+        // SAFETY:
+        // - descriptors_offset will not overflow isize.
+        // - header allocation is large enough to hold the descriptor ring.
+        let descriptors = unsafe { header.byte_add(descriptors_offset) };
+        descriptors.cast()
+    }
+
+    /// # Safety
+    /// - The header must be non-null and properly aligned.
+    /// - The allocation at `header` must include both cooperative descriptor rings.
+    unsafe fn cooperative_consumer_descriptors_from_header(
+        header: NonNull<SharedQueueHeader>,
+        descriptor_capacity: usize,
+    ) -> NonNull<CooperativeDescriptor> {
+        let descriptors_offset = Self::cooperative_descriptors_offset()
+            + descriptor_capacity * core::mem::size_of::<CooperativeDescriptor>();
+
+        // SAFETY:
+        // - descriptors_offset will not overflow isize.
+        // - header allocation is large enough to hold both descriptor rings.
+        let descriptors = unsafe { header.byte_add(descriptors_offset) };
+        descriptors.cast()
+    }
+
     /// # Safety
     /// - `start..start+count` must be reserved by this producer.
-    unsafe fn publish_producer_publication(header_ptr: NonNull<Self>, start: usize, count: usize) {
+    unsafe fn publish_producer_publication_classic(
+        header_ptr: NonNull<Self>,
+        start: usize,
+        count: usize,
+    ) {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
         while header.producer_publication.load(Ordering::Acquire) != start {
@@ -804,6 +1664,140 @@ impl SharedQueueHeader {
             .producer_publication
             .store(start.wrapping_add(count), Ordering::Release);
         header.wake_consumers_if_waiting(count);
+    }
+
+    /// # Safety
+    /// - `start..start+count` must be reserved by this producer.
+    unsafe fn publish_producer_publication_cooperative(
+        header_ptr: NonNull<Self>,
+        start: usize,
+        count: usize,
+        descriptor_position: usize,
+    ) {
+        // SAFETY: `header_ptr` points to a cooperative queue header.
+        let descriptor = unsafe {
+            Self::cooperative_producer_descriptor_at(header_ptr, descriptor_position).as_ref()
+        };
+        debug_assert_eq!(descriptor.start.load(Ordering::Acquire), start);
+        debug_assert_eq!(descriptor.count.load(Ordering::Acquire), count);
+        descriptor
+            .state
+            .store(COOPERATIVE_DESCRIPTOR_READY, Ordering::Release);
+
+        // SAFETY: `header_ptr` points to a cooperative queue header.
+        unsafe { Self::try_publish_cooperative(header_ptr) };
+    }
+
+    /// # Safety
+    /// - `header_ptr` must point to a cooperative queue header.
+    unsafe fn try_publish_cooperative(header_ptr: NonNull<Self>) -> usize {
+        // SAFETY: `header_ptr` is a valid shared-memory header.
+        let header = unsafe { header_ptr.as_ref() };
+        let publication = header.producer_publication.load(Ordering::Acquire);
+
+        // SAFETY: forwarded from this function's safety contract.
+        unsafe { Self::try_publish_cooperative_from(header_ptr, publication) }
+    }
+
+    /// # Safety
+    /// - `header_ptr` must point to a cooperative queue header.
+    unsafe fn try_publish_cooperative_from(
+        header_ptr: NonNull<Self>,
+        mut publication: usize,
+    ) -> usize {
+        // SAFETY: `header_ptr` is a valid shared-memory header.
+        let header = unsafe { header_ptr.as_ref() };
+        let mut total_published = 0usize;
+        let mut descriptors_published = 0usize;
+
+        loop {
+            let descriptor_position = cooperative_packed_descriptor(publication);
+            let frontier = cooperative_packed_item(publication);
+
+            // SAFETY: `header_ptr` points to a cooperative queue header.
+            let descriptor = unsafe {
+                Self::cooperative_producer_descriptor_at(header_ptr, descriptor_position).as_ref()
+            };
+            if descriptor
+                .state
+                .compare_exchange(
+                    COOPERATIVE_DESCRIPTOR_READY,
+                    COOPERATIVE_DESCRIPTOR_PENDING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                let refreshed_publication = header.producer_publication.load(Ordering::Acquire);
+                if refreshed_publication != publication {
+                    publication = refreshed_publication;
+                    continue;
+                }
+                break;
+            }
+
+            let start = descriptor.start.load(Ordering::Acquire);
+            let count = descriptor.count.load(Ordering::Acquire);
+            if start != frontier || count == 0 {
+                descriptor
+                    .state
+                    .store(COOPERATIVE_DESCRIPTOR_READY, Ordering::Release);
+                let refreshed_publication = header.producer_publication.load(Ordering::Acquire);
+                if refreshed_publication != publication {
+                    publication = refreshed_publication;
+                    continue;
+                }
+                break;
+            }
+
+            let next = cooperative_cursor_add(frontier, count);
+            let next_descriptor_position = cooperative_cursor_add(descriptor_position, 1);
+            let next_publication = cooperative_pack_cursor_pair(next, next_descriptor_position);
+            header
+                .producer_publication
+                .store(next_publication, Ordering::Release);
+            total_published = total_published.wrapping_add(count);
+            descriptors_published = descriptors_published.wrapping_add(1);
+            publication = next_publication;
+        }
+
+        if total_published != 0 {
+            header.wake_consumers_if_waiting(total_published);
+        }
+        descriptors_published
+    }
+
+    /// # Safety
+    /// - `header` must point to a cooperative queue header.
+    unsafe fn cooperative_producer_descriptor_at(
+        header: NonNull<SharedQueueHeader>,
+        descriptor_position: usize,
+    ) -> NonNull<CooperativeDescriptor> {
+        // SAFETY: `header` points to a cooperative queue header.
+        let descriptors = unsafe { Self::cooperative_producer_descriptors_from_header(header) };
+        // SAFETY: `header` is a valid shared-memory header.
+        let header_ref = unsafe { header.as_ref() };
+        let index = descriptor_position & header_ref.descriptor_mask as usize;
+        // SAFETY: Mask ensures the descriptor index is in bounds.
+        unsafe { descriptors.add(index) }
+    }
+
+    /// # Safety
+    /// - `header` must point to a cooperative queue header.
+    unsafe fn cooperative_consumer_descriptor_at(
+        header: NonNull<SharedQueueHeader>,
+        descriptor_position: usize,
+    ) -> NonNull<CooperativeDescriptor> {
+        // SAFETY: `header` is a valid shared-memory header.
+        let header_ref = unsafe { header.as_ref() };
+        let descriptor_capacity = (header_ref.descriptor_mask as usize).wrapping_add(1);
+        // SAFETY: `header` points to a cooperative queue header.
+        let descriptors = unsafe {
+            Self::cooperative_consumer_descriptors_from_header(header, descriptor_capacity)
+        };
+        let index = descriptor_position & header_ref.descriptor_mask as usize;
+        // SAFETY: Mask ensures the descriptor index is in bounds.
+        unsafe { descriptors.add(index) }
     }
 
     /// # Safety
@@ -817,6 +1811,95 @@ impl SharedQueueHeader {
         header
             .consumer_release
             .store(start.wrapping_add(count), Ordering::Release);
+    }
+
+    /// # Safety
+    /// - `start..start+count` must be reserved by this consumer.
+    unsafe fn publish_consumer_release_cooperative(
+        header_ptr: NonNull<Self>,
+        start: usize,
+        count: usize,
+        descriptor_position: usize,
+    ) {
+        // SAFETY: `header_ptr` points to a cooperative queue header.
+        let descriptor = unsafe {
+            Self::cooperative_consumer_descriptor_at(header_ptr, descriptor_position).as_ref()
+        };
+        debug_assert_eq!(descriptor.start.load(Ordering::Acquire), start);
+        debug_assert_eq!(descriptor.count.load(Ordering::Acquire), count);
+        descriptor
+            .state
+            .store(COOPERATIVE_DESCRIPTOR_READY, Ordering::Release);
+
+        // SAFETY: `header_ptr` points to a cooperative queue header.
+        unsafe { Self::try_release_cooperative(header_ptr) };
+    }
+
+    /// # Safety
+    /// - `header_ptr` must point to a cooperative queue header.
+    unsafe fn try_release_cooperative(header_ptr: NonNull<Self>) {
+        // SAFETY: `header_ptr` is a valid shared-memory header.
+        let header = unsafe { header_ptr.as_ref() };
+        let release = header.consumer_release.load(Ordering::Acquire);
+
+        // SAFETY: forwarded from this function's safety contract.
+        unsafe { Self::try_release_cooperative_from(header_ptr, release) };
+    }
+
+    /// # Safety
+    /// - `header_ptr` must point to a cooperative queue header.
+    unsafe fn try_release_cooperative_from(header_ptr: NonNull<Self>, mut release: usize) {
+        // SAFETY: `header_ptr` is a valid shared-memory header.
+        let header = unsafe { header_ptr.as_ref() };
+
+        loop {
+            let descriptor_position = cooperative_packed_descriptor(release);
+            let frontier = cooperative_packed_item(release);
+
+            // SAFETY: `header_ptr` points to a cooperative queue header.
+            let descriptor = unsafe {
+                Self::cooperative_consumer_descriptor_at(header_ptr, descriptor_position).as_ref()
+            };
+            if descriptor
+                .state
+                .compare_exchange(
+                    COOPERATIVE_DESCRIPTOR_READY,
+                    COOPERATIVE_DESCRIPTOR_PENDING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                let refreshed_release = header.consumer_release.load(Ordering::Acquire);
+                if refreshed_release != release {
+                    release = refreshed_release;
+                    continue;
+                }
+                break;
+            }
+
+            let start = descriptor.start.load(Ordering::Acquire);
+            let count = descriptor.count.load(Ordering::Acquire);
+            if start != frontier || count == 0 {
+                descriptor
+                    .state
+                    .store(COOPERATIVE_DESCRIPTOR_READY, Ordering::Release);
+                let refreshed_release = header.consumer_release.load(Ordering::Acquire);
+                if refreshed_release != release {
+                    release = refreshed_release;
+                    continue;
+                }
+                break;
+            }
+
+            let next = cooperative_cursor_add(frontier, count);
+            let next_descriptor_position = cooperative_cursor_add(descriptor_position, 1);
+            let next_release = cooperative_pack_cursor_pair(next, next_descriptor_position);
+            header
+                .consumer_release
+                .store(next_release, Ordering::Release);
+            release = next_release;
+        }
     }
 
     /// Wakes registered consumers after new producer publication.
@@ -865,14 +1948,15 @@ impl Drop for ConsumerWaiter<'_> {
 }
 
 #[must_use]
-pub struct WriteGuard<'a, T> {
+pub struct WriteGuard<'a, T, const MODE: u32 = MODE_CLASSIC> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
     start: usize,
+    descriptor: usize,
     _marker: PhantomData<&'a mut T>,
 }
 
-impl<'a, T> WriteGuard<'a, T> {
+impl<'a, T, const MODE: u32> WriteGuard<'a, T, MODE> {
     /// Returns a mutable reference to the slot.
     ///
     /// # Safety
@@ -892,24 +1976,34 @@ impl<'a, T> WriteGuard<'a, T> {
     }
 }
 
-impl<'a, T> Drop for WriteGuard<'a, T> {
+impl<'a, T, const MODE: u32> Drop for WriteGuard<'a, T, MODE> {
     fn drop(&mut self) {
         // SAFETY: This guard owns one reserved producer slot.
         unsafe {
-            SharedQueueHeader::publish_producer_publication(self.header, self.start, 1);
+            if MODE == MODE_CLASSIC {
+                SharedQueueHeader::publish_producer_publication_classic(self.header, self.start, 1);
+            } else {
+                SharedQueueHeader::publish_producer_publication_cooperative(
+                    self.header,
+                    self.start,
+                    1,
+                    self.descriptor,
+                );
+            }
         }
     }
 }
 
 #[must_use]
-pub struct ReadGuard<'a, T> {
+pub struct ReadGuard<'a, T, const MODE: u32 = MODE_CLASSIC> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
     start: usize,
+    descriptor: usize,
     _marker: PhantomData<&'a T>,
 }
 
-impl<'a, T> ReadGuard<'a, T> {
+impl<'a, T, const MODE: u32> ReadGuard<'a, T, MODE> {
     pub fn as_ptr(&self) -> *const T {
         // SAFETY: The cell was reserved for reading.
         self.cell.as_ptr()
@@ -921,7 +2015,7 @@ impl<'a, T> ReadGuard<'a, T> {
     }
 }
 
-impl<'a, T> AsRef<T> for ReadGuard<'a, T> {
+impl<'a, T, const MODE: u32> AsRef<T> for ReadGuard<'a, T, MODE> {
     /// Returns a shared reference to the reserved slot.
     fn as_ref(&self) -> &T {
         // SAFETY: The cell was reserved for reading and is initialized.
@@ -929,26 +2023,36 @@ impl<'a, T> AsRef<T> for ReadGuard<'a, T> {
     }
 }
 
-impl<'a, T> Drop for ReadGuard<'a, T> {
+impl<'a, T, const MODE: u32> Drop for ReadGuard<'a, T, MODE> {
     fn drop(&mut self) {
         // SAFETY: This guard owns one reserved consumer slot.
         unsafe {
-            SharedQueueHeader::publish_consumer_release(self.header, self.start, 1);
+            if MODE == MODE_CLASSIC {
+                SharedQueueHeader::publish_consumer_release(self.header, self.start, 1);
+            } else {
+                SharedQueueHeader::publish_consumer_release_cooperative(
+                    self.header,
+                    self.start,
+                    1,
+                    self.descriptor,
+                );
+            }
         }
     }
 }
 
 #[must_use]
-pub struct WriteBatch<'a, T> {
+pub struct WriteBatch<'a, T, const MODE: u32 = MODE_CLASSIC> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
     start: usize,
+    descriptor: usize,
     count: usize,
     buffer_mask: usize,
     _marker: PhantomData<&'a mut T>,
 }
 
-impl<'a, T> WriteBatch<'a, T> {
+impl<'a, T, const MODE: u32> WriteBatch<'a, T, MODE> {
     pub fn len(&self) -> usize {
         self.count
     }
@@ -994,26 +2098,40 @@ impl<'a, T> WriteBatch<'a, T> {
     }
 }
 
-impl<'a, T> Drop for WriteBatch<'a, T> {
+impl<'a, T, const MODE: u32> Drop for WriteBatch<'a, T, MODE> {
     fn drop(&mut self) {
         // SAFETY: This batch owns `count` reserved producer slots.
         unsafe {
-            SharedQueueHeader::publish_producer_publication(self.header, self.start, self.count);
+            if MODE == MODE_CLASSIC {
+                SharedQueueHeader::publish_producer_publication_classic(
+                    self.header,
+                    self.start,
+                    self.count,
+                );
+            } else {
+                SharedQueueHeader::publish_producer_publication_cooperative(
+                    self.header,
+                    self.start,
+                    self.count,
+                    self.descriptor,
+                );
+            }
         }
     }
 }
 
 #[must_use]
-pub struct ReadBatch<'a, T> {
+pub struct ReadBatch<'a, T, const MODE: u32 = MODE_CLASSIC> {
     header: NonNull<SharedQueueHeader>,
     buffer: NonNull<T>,
     start: usize,
+    descriptor: usize,
     count: usize,
     buffer_mask: usize,
     _marker: PhantomData<&'a T>,
 }
 
-impl<'a, T> ReadBatch<'a, T> {
+impl<'a, T, const MODE: u32> ReadBatch<'a, T, MODE> {
     pub fn len(&self) -> usize {
         self.count
     }
@@ -1056,11 +2174,20 @@ impl<'a, T> ReadBatch<'a, T> {
     }
 }
 
-impl<'a, T> Drop for ReadBatch<'a, T> {
+impl<'a, T, const MODE: u32> Drop for ReadBatch<'a, T, MODE> {
     fn drop(&mut self) {
         // SAFETY: This batch owns `count` reserved consumer slots.
         unsafe {
-            SharedQueueHeader::publish_consumer_release(self.header, self.start, self.count);
+            if MODE == MODE_CLASSIC {
+                SharedQueueHeader::publish_consumer_release(self.header, self.start, self.count);
+            } else {
+                SharedQueueHeader::publish_consumer_release_cooperative(
+                    self.header,
+                    self.start,
+                    self.count,
+                    self.descriptor,
+                );
+            }
         }
     }
 }
@@ -1077,17 +2204,38 @@ mod tests {
     type Item = u64;
     const BUFFER_CAPACITY: usize = 512;
     const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
+    const COOPERATIVE_OPTIONS: Options = Options::new();
+    const COOPERATIVE_SMALL_DESCRIPTOR_OPTIONS: Options =
+        Options::new().with_cooperative_descriptor_capacity(2);
+    const COOPERATIVE_BUFFER_SIZE: usize = minimum_file_size_for_mode::<Item, { MODE_COOPERATIVE }>(
+        BUFFER_CAPACITY,
+        COOPERATIVE_OPTIONS,
+    );
+    const COOPERATIVE_SMALL_DESCRIPTOR_BUFFER_SIZE: usize =
+        minimum_file_size_for_mode::<Item, { MODE_COOPERATIVE }>(
+            8,
+            COOPERATIVE_SMALL_DESCRIPTOR_OPTIONS,
+        );
 
     fn create_test_queue<T>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
+        create_test_queue_with_options::<T, { MODE_CLASSIC }>(file_size, Options::default())
+    }
+
+    fn create_test_queue_with_options<T, const MODE: u32>(
+        file_size: usize,
+        options: Options,
+    ) -> (File, ModeProducer<T, MODE>, ModeConsumer<T, MODE>) {
         let file = create_temp_shmem_file().unwrap();
         let producer =
-            unsafe { Producer::create(&file, file_size) }.expect("Failed to create producer");
-        let consumer = unsafe { Consumer::join(&file) }.expect("Failed to join consumer");
+            unsafe { ModeProducer::<T, MODE>::create_with_options(&file, file_size, options) }
+                .expect("Failed to create producer");
+        let consumer =
+            unsafe { ModeConsumer::<T, MODE>::join(&file) }.expect("Failed to join consumer");
 
         (file, producer, consumer)
     }
 
-    fn wait_for_waiters<T>(producer: &Producer<T>, waiters: u32) {
+    fn wait_for_waiters<T, const MODE: u32>(producer: &ModeProducer<T, MODE>, waiters: u32) {
         let deadline = Instant::now() + Duration::from_secs(1);
         while unsafe { producer.queue.header.as_ref() }
             .futex_waiters
@@ -1102,7 +2250,7 @@ mod tests {
         }
     }
 
-    fn futex_waiters<T>(consumer: &Consumer<T>) -> u32 {
+    fn futex_waiters<T, const MODE: u32>(consumer: &ModeConsumer<T, MODE>) -> u32 {
         unsafe { consumer.queue.header.as_ref() }
             .futex_waiters
             .load(Ordering::Acquire)
@@ -1215,6 +2363,48 @@ mod tests {
     }
 
     #[test]
+    fn test_cooperative_minimum_file_size_rounds_up_capacity() {
+        let file = create_temp_shmem_file().unwrap();
+        let options = COOPERATIVE_OPTIONS;
+        let producer = unsafe {
+            CooperativeProducer::<u64>::create_with_options(
+                &file,
+                minimum_file_size_for_mode::<u64, { MODE_COOPERATIVE }>(3, options),
+                options,
+            )
+        }
+        .expect("create failed");
+        let consumer = unsafe { CooperativeConsumer::<u64>::join(&file) }.expect("join failed");
+
+        assert_eq!(producer.queue.capacity(), 4);
+        assert_eq!(consumer.queue.capacity(), 4);
+        assert_eq!(
+            unsafe { producer.queue.header.as_ref() }
+                .publication_mode()
+                .unwrap(),
+            PublicationMode::Cooperative
+        );
+    }
+
+    #[test]
+    fn test_cooperative_descriptor_capacity_is_configurable() {
+        let file = create_temp_shmem_file().unwrap();
+        let producer = unsafe {
+            CooperativeProducer::<u64>::create_with_options(
+                &file,
+                COOPERATIVE_SMALL_DESCRIPTOR_BUFFER_SIZE,
+                COOPERATIVE_SMALL_DESCRIPTOR_OPTIONS,
+            )
+        }
+        .expect("create failed");
+        let header = unsafe { producer.queue.header.as_ref() };
+
+        assert_eq!(producer.queue.capacity(), 8);
+        assert_eq!(producer.queue.cooperative_descriptor_mask + 1, 2);
+        assert_eq!(header.descriptor_mask + 1, 2);
+    }
+
+    #[test]
     fn test_multiple_producers_consumers() {
         let (file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
         let producer2 = unsafe { Producer::join(&file) }.expect("Failed to create producer2");
@@ -1279,6 +2469,501 @@ mod tests {
                 .load(Ordering::Acquire),
             0
         );
+    }
+
+    #[test]
+    fn test_cooperative_later_producer_drop_does_not_wait() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+
+        let mut first = unsafe { producer.reserve_write() }.expect("reserve first");
+        let mut second = unsafe { producer.reserve_write() }.expect("reserve second");
+
+        unsafe {
+            second.as_mut_ptr().write(20);
+        }
+        drop(second);
+
+        assert_eq!(consumer.try_read(), None);
+        assert_eq!(
+            unsafe { producer.queue.header.as_ref() }
+                .producer_publication
+                .load(Ordering::Acquire),
+            0
+        );
+
+        unsafe {
+            first.as_mut_ptr().write(10);
+        }
+        drop(first);
+
+        assert_eq!(consumer.try_read(), Some(10));
+        assert_eq!(consumer.try_read(), Some(20));
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_cooperative_publishes_ready_batch_prefix() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+
+        let mut first = unsafe { producer.reserve_write_batch(2) }.expect("reserve first");
+        let mut second = unsafe { producer.reserve_write_batch(3) }.expect("reserve second");
+        let mut third = unsafe { producer.reserve_write() }.expect("reserve third");
+
+        for (index, value) in [20, 21, 22].into_iter().enumerate() {
+            unsafe {
+                second.write(index, value);
+            }
+        }
+        drop(second);
+
+        unsafe {
+            third.as_mut_ptr().write(30);
+        }
+        drop(third);
+
+        assert_eq!(consumer.try_read(), None);
+
+        for (index, value) in [10, 11].into_iter().enumerate() {
+            unsafe {
+                first.write(index, value);
+            }
+        }
+        drop(first);
+
+        let mut values = Vec::new();
+        while let Some(value) = consumer.try_read() {
+            values.push(value);
+        }
+        assert_eq!(values, vec![10, 11, 20, 21, 22, 30]);
+    }
+
+    #[test]
+    fn test_cooperative_producer_descriptor_pressure_helps_ready_publication() {
+        let (_file, producer, consumer) =
+            create_test_queue_with_options::<Item, { MODE_COOPERATIVE }>(
+                COOPERATIVE_SMALL_DESCRIPTOR_BUFFER_SIZE,
+                COOPERATIVE_SMALL_DESCRIPTOR_OPTIONS,
+            );
+
+        let mut first = unsafe { producer.reserve_write() }.expect("reserve first");
+        let mut second = unsafe { producer.reserve_write() }.expect("reserve second");
+        unsafe {
+            first.as_mut_ptr().write(10);
+            second.as_mut_ptr().write(20);
+        }
+
+        // Simulate a producer that made its descriptor ready but did not drain
+        // the ready publication prefix.
+        let header = producer.queue.header;
+        let descriptor_position = first.descriptor;
+        let descriptor = unsafe {
+            SharedQueueHeader::cooperative_producer_descriptor_at(header, descriptor_position)
+                .as_ref()
+        };
+        descriptor
+            .state
+            .store(COOPERATIVE_DESCRIPTOR_READY, Ordering::Release);
+        std::mem::forget(first);
+
+        assert_eq!(
+            unsafe { header.as_ref() }
+                .producer_publication
+                .load(Ordering::Acquire),
+            0
+        );
+
+        let mut third = unsafe { producer.reserve_write() }.expect("descriptor reused");
+        unsafe {
+            third.as_mut_ptr().write(30);
+        }
+        drop(third);
+        drop(second);
+
+        assert_eq!(consumer.try_read(), Some(10));
+        assert_eq!(consumer.try_read(), Some(20));
+        assert_eq!(consumer.try_read(), Some(30));
+    }
+
+    #[test]
+    fn test_cooperative_publication_packs_item_and_descriptor_cursor() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+
+        producer.try_write(10).expect("write first");
+        producer.try_write(20).expect("write second");
+
+        let publication = unsafe { producer.queue.header.as_ref() }
+            .producer_publication
+            .load(Ordering::Acquire);
+        assert_eq!(cooperative_packed_item(publication), 2);
+        assert_eq!(cooperative_packed_descriptor(publication), 2);
+        assert_eq!(consumer.try_read(), Some(10));
+        assert_eq!(consumer.try_read(), Some(20));
+    }
+
+    #[test]
+    fn test_cooperative_publish_retries_after_stale_packed_cursor() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+
+        let mut first = unsafe { producer.reserve_write() }.expect("reserve first");
+        let mut second = unsafe { producer.reserve_write() }.expect("reserve second");
+        unsafe {
+            first.as_mut_ptr().write(10);
+            second.as_mut_ptr().write(20);
+        }
+        drop(first);
+
+        let header = producer.queue.header;
+        let second_descriptor_position = second.descriptor;
+        let descriptor = unsafe {
+            SharedQueueHeader::cooperative_producer_descriptor_at(
+                header,
+                second_descriptor_position,
+            )
+            .as_ref()
+        };
+        descriptor
+            .state
+            .store(COOPERATIVE_DESCRIPTOR_READY, Ordering::Release);
+        std::mem::forget(second);
+
+        let current_publication = unsafe { header.as_ref() }
+            .producer_publication
+            .load(Ordering::Acquire);
+        assert_eq!(cooperative_packed_item(current_publication), 1);
+        assert_eq!(cooperative_packed_descriptor(current_publication), 1);
+
+        // Simulate a helper that loaded the old packed cursor before the first
+        // descriptor was published. The old descriptor is no longer ready, so
+        // the CAS failure path must refresh and retry instead of stopping.
+        let published = unsafe {
+            SharedQueueHeader::try_publish_cooperative_from(
+                header,
+                cooperative_pack_cursor_pair(0, 0),
+            )
+        };
+
+        assert_eq!(published, 1);
+        let publication = unsafe { header.as_ref() }
+            .producer_publication
+            .load(Ordering::Acquire);
+        assert_eq!(cooperative_packed_item(publication), 2);
+        assert_eq!(cooperative_packed_descriptor(publication), 2);
+        assert_eq!(consumer.try_read(), Some(10));
+        assert_eq!(consumer.try_read(), Some(20));
+    }
+
+    #[test]
+    fn test_cooperative_reuses_producer_descriptor_from_publication_cursor() {
+        let options = Options::new().with_cooperative_descriptor_capacity(1);
+        let file_size = minimum_file_size_for_mode::<Item, { MODE_COOPERATIVE }>(4, options);
+        let (_file, producer, consumer) =
+            create_test_queue_with_options::<Item, { MODE_COOPERATIVE }>(file_size, options);
+
+        let mut first = unsafe { producer.reserve_write() }.expect("reserve first");
+        unsafe {
+            first.as_mut_ptr().write(10);
+        }
+
+        let header = producer.queue.header;
+        let descriptor = unsafe {
+            SharedQueueHeader::cooperative_producer_descriptor_at(header, first.descriptor).as_ref()
+        };
+
+        descriptor
+            .state
+            .store(COOPERATIVE_DESCRIPTOR_PENDING, Ordering::Release);
+        unsafe { header.as_ref() }
+            .producer_publication
+            .store(cooperative_pack_cursor_pair(1, 1), Ordering::Release);
+        std::mem::forget(first);
+
+        let mut second = unsafe { producer.reserve_write() }.expect("reserve second");
+        unsafe {
+            second.as_mut_ptr().write(20);
+        }
+        drop(second);
+
+        assert_eq!(
+            unsafe { header.as_ref() }
+                .producer_reservation
+                .load(Ordering::Acquire),
+            cooperative_pack_cursor_pair(2, 2)
+        );
+        assert_eq!(
+            unsafe { header.as_ref() }
+                .producer_publication
+                .load(Ordering::Acquire),
+            cooperative_pack_cursor_pair(2, 2)
+        );
+        assert_eq!(consumer.try_read(), Some(10));
+        assert_eq!(consumer.try_read(), Some(20));
+    }
+
+    #[test]
+    fn test_cooperative_descriptor_exhaustion_returns_none() {
+        let (_file, producer, consumer) =
+            create_test_queue_with_options::<Item, { MODE_COOPERATIVE }>(
+                COOPERATIVE_SMALL_DESCRIPTOR_BUFFER_SIZE,
+                COOPERATIVE_SMALL_DESCRIPTOR_OPTIONS,
+            );
+
+        let mut first = unsafe { producer.reserve_write() }.expect("reserve first");
+        let mut second = unsafe { producer.reserve_write() }.expect("reserve second");
+        assert!(unsafe { producer.reserve_write() }.is_none());
+
+        unsafe {
+            first.as_mut_ptr().write(10);
+            second.as_mut_ptr().write(20);
+        }
+        drop(first);
+        drop(second);
+
+        assert_eq!(consumer.try_read(), Some(10));
+        assert_eq!(consumer.try_read(), Some(20));
+
+        let mut third = unsafe { producer.reserve_write() }.expect("descriptor reused");
+        unsafe {
+            third.as_mut_ptr().write(30);
+        }
+        drop(third);
+        assert_eq!(consumer.try_read(), Some(30));
+    }
+
+    #[test]
+    fn test_cooperative_later_consumer_drop_does_not_wait() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+
+        assert!(producer.try_write_slice(&[10, 20]));
+
+        let first = consumer.reserve_read().expect("reserve first");
+        let second = consumer.reserve_read().expect("reserve second");
+        assert_eq!(*first.as_ref(), 10);
+        assert_eq!(*second.as_ref(), 20);
+
+        drop(second);
+
+        assert_eq!(
+            unsafe { producer.queue.header.as_ref() }
+                .consumer_release
+                .load(Ordering::Acquire),
+            0
+        );
+
+        drop(first);
+
+        let release = unsafe { producer.queue.header.as_ref() }
+            .consumer_release
+            .load(Ordering::Acquire);
+        assert_eq!(cooperative_packed_item(release), 2);
+        assert_eq!(cooperative_packed_descriptor(release), 2);
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_cooperative_consumer_descriptor_pressure_helps_ready_release() {
+        let (_file, producer, consumer) =
+            create_test_queue_with_options::<Item, { MODE_COOPERATIVE }>(
+                COOPERATIVE_SMALL_DESCRIPTOR_BUFFER_SIZE,
+                COOPERATIVE_SMALL_DESCRIPTOR_OPTIONS,
+            );
+
+        assert!(producer.try_write_slice(&[10, 20, 30]));
+        let first = consumer.reserve_read().expect("reserve first");
+        let second = consumer.reserve_read().expect("reserve second");
+        assert_eq!(*first.as_ref(), 10);
+        assert_eq!(*second.as_ref(), 20);
+
+        // Simulate a consumer that made its release descriptor ready but did
+        // not drain the ready release prefix.
+        let header = producer.queue.header;
+        let descriptor_position = first.descriptor;
+        let descriptor = unsafe {
+            SharedQueueHeader::cooperative_consumer_descriptor_at(header, descriptor_position)
+                .as_ref()
+        };
+        descriptor
+            .state
+            .store(COOPERATIVE_DESCRIPTOR_READY, Ordering::Release);
+        std::mem::forget(first);
+
+        assert_eq!(
+            unsafe { header.as_ref() }
+                .consumer_release
+                .load(Ordering::Acquire),
+            0
+        );
+
+        let third = consumer.reserve_read().expect("descriptor reused");
+        assert_eq!(*third.as_ref(), 30);
+        let release = unsafe { header.as_ref() }
+            .consumer_release
+            .load(Ordering::Acquire);
+        assert_eq!(cooperative_packed_item(release), 1);
+        assert_eq!(cooperative_packed_descriptor(release), 1);
+
+        drop(third);
+        drop(second);
+        let release = unsafe { header.as_ref() }
+            .consumer_release
+            .load(Ordering::Acquire);
+        assert_eq!(cooperative_packed_item(release), 3);
+        assert_eq!(cooperative_packed_descriptor(release), 3);
+    }
+
+    #[test]
+    fn test_cooperative_release_packs_item_and_descriptor_cursor() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+
+        assert!(producer.try_write_slice(&[10, 20]));
+        let first = consumer.reserve_read().expect("reserve first");
+        let second = consumer.reserve_read().expect("reserve second");
+        assert_eq!(*first.as_ref(), 10);
+        assert_eq!(*second.as_ref(), 20);
+        drop(first);
+        drop(second);
+
+        let release = unsafe { producer.queue.header.as_ref() }
+            .consumer_release
+            .load(Ordering::Acquire);
+        assert_eq!(cooperative_packed_item(release), 2);
+        assert_eq!(cooperative_packed_descriptor(release), 2);
+    }
+
+    #[test]
+    fn test_cooperative_release_retries_after_stale_packed_cursor() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+
+        assert!(producer.try_write_slice(&[10, 20]));
+        let first = consumer.reserve_read().expect("reserve first");
+        let second = consumer.reserve_read().expect("reserve second");
+        assert_eq!(*first.as_ref(), 10);
+        assert_eq!(*second.as_ref(), 20);
+        drop(first);
+
+        let header = producer.queue.header;
+        let second_descriptor_position = second.descriptor;
+        let descriptor = unsafe {
+            SharedQueueHeader::cooperative_consumer_descriptor_at(
+                header,
+                second_descriptor_position,
+            )
+            .as_ref()
+        };
+        descriptor
+            .state
+            .store(COOPERATIVE_DESCRIPTOR_READY, Ordering::Release);
+        std::mem::forget(second);
+
+        let current_release = unsafe { header.as_ref() }
+            .consumer_release
+            .load(Ordering::Acquire);
+        assert_eq!(cooperative_packed_item(current_release), 1);
+        assert_eq!(cooperative_packed_descriptor(current_release), 1);
+
+        // Simulate a helper that loaded the old packed cursor before the first
+        // descriptor was released. The old descriptor is no longer ready, so
+        // the CAS failure path must refresh and retry instead of stopping.
+        unsafe {
+            SharedQueueHeader::try_release_cooperative_from(
+                header,
+                cooperative_pack_cursor_pair(0, 0),
+            )
+        };
+
+        let release = unsafe { header.as_ref() }
+            .consumer_release
+            .load(Ordering::Acquire);
+        assert_eq!(cooperative_packed_item(release), 2);
+        assert_eq!(cooperative_packed_descriptor(release), 2);
+    }
+
+    #[test]
+    fn test_cooperative_reuses_consumer_descriptor_from_release_cursor() {
+        let options = Options::new().with_cooperative_descriptor_capacity(1);
+        let file_size = minimum_file_size_for_mode::<Item, { MODE_COOPERATIVE }>(4, options);
+        let (_file, producer, consumer) =
+            create_test_queue_with_options::<Item, { MODE_COOPERATIVE }>(file_size, options);
+
+        assert!(producer.try_write_slice(&[10, 20]));
+        let first = consumer.reserve_read().expect("reserve first");
+        assert_eq!(*first.as_ref(), 10);
+
+        let header = producer.queue.header;
+        let descriptor = unsafe {
+            SharedQueueHeader::cooperative_consumer_descriptor_at(header, first.descriptor).as_ref()
+        };
+
+        descriptor
+            .state
+            .store(COOPERATIVE_DESCRIPTOR_PENDING, Ordering::Release);
+        unsafe { header.as_ref() }
+            .consumer_release
+            .store(cooperative_pack_cursor_pair(1, 1), Ordering::Release);
+        std::mem::forget(first);
+
+        let second = consumer.reserve_read().expect("reserve second");
+        assert_eq!(*second.as_ref(), 20);
+        drop(second);
+
+        assert_eq!(
+            unsafe { header.as_ref() }
+                .consumer_reservation
+                .load(Ordering::Acquire),
+            cooperative_pack_cursor_pair(2, 2)
+        );
+        assert_eq!(
+            unsafe { header.as_ref() }
+                .consumer_release
+                .load(Ordering::Acquire),
+            cooperative_pack_cursor_pair(2, 2)
+        );
+    }
+
+    #[test]
+    fn test_cooperative_consumer_descriptor_exhaustion_returns_none() {
+        let (_file, producer, consumer) =
+            create_test_queue_with_options::<Item, { MODE_COOPERATIVE }>(
+                COOPERATIVE_SMALL_DESCRIPTOR_BUFFER_SIZE,
+                COOPERATIVE_SMALL_DESCRIPTOR_OPTIONS,
+            );
+
+        assert!(producer.try_write_slice(&[10, 20, 30]));
+
+        let first = consumer.reserve_read().expect("reserve first");
+        let second = consumer.reserve_read().expect("reserve second");
+        assert_eq!(*first.as_ref(), 10);
+        assert_eq!(*second.as_ref(), 20);
+        assert!(consumer.reserve_read().is_none());
+
+        drop(first);
+
+        let third = consumer.reserve_read().expect("descriptor reused");
+        assert_eq!(*third.as_ref(), 30);
+
+        drop(second);
+        drop(third);
+        assert_eq!(consumer.try_read(), None);
     }
 
     #[test]
@@ -1399,6 +3084,34 @@ mod tests {
     }
 
     #[test]
+    fn test_cooperative_read_timeout_wakes_consumer() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let value = consumer
+                .read_timeout(Duration::from_secs(1))
+                .expect("timeout read failed");
+            tx.send(value).unwrap();
+        });
+
+        wait_for_waiters(&producer, 1);
+        producer.try_write(42).expect("write failed");
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 42);
+        handle.join().unwrap();
+        assert_eq!(
+            unsafe { producer.queue.header.as_ref() }
+                .futex_waiters
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
     fn test_clone_producer() {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
         let producer2 = producer.clone();
@@ -1486,6 +3199,18 @@ mod tests {
     }
 
     #[test]
+    fn test_cooperative_pair_reuses_descriptor_slots_after_wrap() {
+        let (producer, consumer) =
+            cooperative_pair::<u64>(4, COOPERATIVE_OPTIONS).expect("pair failed");
+
+        for value in 0..16 {
+            producer.try_write(value).expect("write failed");
+            assert_eq!(consumer.try_read(), Some(value));
+        }
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
     fn test_pair_clone_roles() {
         let (producer, consumer) = pair::<u64>(64).expect("pair failed");
         let producer2 = producer.clone();
@@ -1560,8 +3285,85 @@ mod tests {
     }
 
     #[test]
+    fn test_cooperative_consumer_recover_as_exclusive_lossy() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+
+        for i in 0..4 {
+            producer.try_write(i).unwrap();
+        }
+
+        let guard = consumer.reserve_read().expect("reserve read");
+        assert_eq!(*guard.as_ref(), 0);
+        core::mem::forget(guard);
+
+        unsafe {
+            consumer.recover_as_exclusive_lossy();
+        }
+
+        assert_eq!(consumer.try_read(), Some(1));
+        assert_eq!(consumer.try_read(), Some(2));
+        assert_eq!(consumer.try_read(), Some(3));
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_cooperative_consumer_recover_as_exclusive() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
+
+        for i in 0..4 {
+            producer.try_write(i).unwrap();
+        }
+
+        let guard = consumer.reserve_read().expect("reserve read");
+        assert_eq!(*guard.as_ref(), 0);
+        core::mem::forget(guard);
+
+        unsafe {
+            consumer.recover_as_exclusive();
+        }
+
+        assert_eq!(consumer.try_read(), Some(0));
+        assert_eq!(consumer.try_read(), Some(1));
+        assert_eq!(consumer.try_read(), Some(2));
+        assert_eq!(consumer.try_read(), Some(3));
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
     fn test_producer_recover_as_exclusive() {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        producer.try_write(10).unwrap();
+
+        let mut guard = unsafe { producer.reserve_write() }.expect("reserve write");
+        unsafe {
+            guard.as_mut_ptr().write(99);
+        }
+        core::mem::forget(guard);
+
+        unsafe {
+            producer.recover_as_exclusive();
+        }
+
+        producer.try_write(20).unwrap();
+
+        assert_eq!(consumer.try_read(), Some(10));
+        assert_eq!(consumer.try_read(), Some(20));
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_cooperative_producer_recover_as_exclusive() {
+        let (_file, producer, consumer) = create_test_queue_with_options::<
+            Item,
+            { MODE_COOPERATIVE },
+        >(COOPERATIVE_BUFFER_SIZE, COOPERATIVE_OPTIONS);
 
         producer.try_write(10).unwrap();
 

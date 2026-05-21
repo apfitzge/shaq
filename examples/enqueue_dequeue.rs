@@ -6,9 +6,11 @@ use common::{
     run_total_throughput_loop, setup_exit_handler, Item, SYNC_CADENCE,
 };
 use shaq::{
-    broadcast::{Consumer as BroadcastConsumer, Producer as BroadcastProducer},
+    broadcast::{
+        CooperativeConsumer as BroadcastConsumer, CooperativeProducer as BroadcastProducer,
+    },
     error::WaitError,
-    mpmc::{Consumer as MpmcConsumer, Producer as MpmcProducer},
+    mpmc::{CooperativeConsumer as MpmcConsumer, CooperativeProducer as MpmcProducer},
     spsc::{Consumer as SpscConsumer, Producer as SpscProducer},
 };
 use std::{
@@ -122,7 +124,7 @@ fn parse_usize_arg(value: Option<String>, default: usize, name: &str) -> usize {
 
 fn print_usage() {
     eprintln!(
-        "Usage: cargo run --example enqueue_dequeue -- [-v|--verbose] [spsc|mpmc [producers] [consumers]|broadcast [producers] [consumers]]"
+        "Usage: cargo run --example enqueue_dequeue -- [-v|--verbose] [spsc|mpmc [producers] [consumers]|broadcast [producers] [consumers]]\nmpmc and broadcast use cooperative publication"
     );
 }
 
