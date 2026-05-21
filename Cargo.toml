@@ -10,16 +10,8 @@ license = "Apache-2.0"
 edition = "2021"
 include = ["src/*.rs", "Cargo.toml"]
 
-[target."cfg(unix)".dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2.180" }
-
-[target."cfg(windows)".dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Memory",
-] }
 
 [dev-dependencies]
 core_affinity = "0.8.3"

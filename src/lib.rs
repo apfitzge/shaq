@@ -1,5 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("shaq currently supports Linux only");
+
 use core::sync::atomic::AtomicUsize;
 
 // NB: To simplify casting we only support 64bit or wider systems.
