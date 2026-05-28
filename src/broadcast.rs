@@ -759,7 +759,7 @@ impl SharedQueueHeader {
         let region = Region::map_file(file, size)?;
         let header = region.addr().cast::<Self>();
         // SAFETY: caller guarantees this mapping is initialized exactly once.
-        unsafe { Self::initialize::<T>(header, ring_capacity) };
+        unsafe { Self::initialize(header, ring_capacity) };
         Ok((region, header))
     }
 
@@ -844,7 +844,7 @@ impl SharedQueueHeader {
         Ok(capacity)
     }
 
-    unsafe fn initialize<T>(mut header_ptr: NonNull<Self>, ring_capacity: usize) {
+    unsafe fn initialize(mut header_ptr: NonNull<Self>, ring_capacity: usize) {
         let payload_capacity = Self::payload_capacity_for_ring_capacity(ring_capacity)
             .expect("validated payload capacity");
 
