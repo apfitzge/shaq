@@ -384,8 +384,20 @@ impl<T> PayloadPool<T> {
         debug_assert!(count != 0);
 
         let free_head = self.free_head();
-        let mut head = PayloadPoolFreeHead(free_head.load(Ordering::Acquire));
-        loop {
+        self.pop_free_payloads_exact_from_head(
+            free_head,
+            count,
+            PayloadPoolFreeHead(free_head.load(Ordering::Acquire)),
+        )
+    }
+
+    fn pop_free_payloads_exact_from_head(
+        &self,
+        free_head: &AtomicU64,
+        count: usize,
+        mut head: PayloadPoolFreeHead,
+    ) -> Option<ReservedPayloads> {
+        'retry: loop {
             let first = head.encoded_first();
             if first == EMPTY_PAYLOAD {
                 return None;
@@ -395,7 +407,15 @@ impl<T> PayloadPool<T> {
             let mut last_payload_index = 0;
             for _ in 0..count {
                 if encoded == EMPTY_PAYLOAD {
-                    return None;
+                    // Another producer may have popped this prefix and cleared
+                    // its old tail after we loaded `head`. Only report
+                    // exhaustion if the shared head is still the one we walked.
+                    let current = PayloadPoolFreeHead(free_head.load(Ordering::Acquire));
+                    if current.0 == head.0 {
+                        return None;
+                    }
+                    head = current;
+                    continue 'retry;
                 }
                 let payload_index = decode_non_empty_payload_index(encoded);
                 assert!(
@@ -597,7 +617,7 @@ fn first_for_capacity(capacity: usize) -> u32 {
 mod tests {
     use super::{
         initial_free_head, initialize_payload_headers, PayloadHandle, PayloadHeader, PayloadPool,
-        PayloadReleaseBatch,
+        PayloadPoolFreeHead, PayloadReleaseBatch,
     };
     use core::{
         mem::MaybeUninit,
@@ -650,6 +670,25 @@ mod tests {
 
         let second = pool.reserve_payloads_exact(2).expect("second reserve");
         assert_eq!(second.first_payload_index(), 2);
+        assert!(pool.reserve_payloads_exact(1).is_none());
+    }
+
+    #[test]
+    fn stale_short_free_chain_retries_current_head() {
+        let (head, payload_headers, mut payloads) = initialized_pool(8);
+        let pool = pool(&head, &payload_headers, &mut payloads);
+        let stale_head = PayloadPoolFreeHead(initial_free_head(8));
+
+        let prefix = pool.reserve_payloads_exact(3).expect("reserve prefix");
+        assert_eq!(prefix.first_payload_index(), 0);
+
+        let current = pool
+            .pop_free_payloads_exact_from_head(&head, 4, stale_head)
+            .expect("reserve from current head after stale short chain");
+        assert_eq!(current.first_payload_index(), 3);
+
+        let last = pool.reserve_payloads_exact(1).expect("last payload");
+        assert_eq!(last.first_payload_index(), 7);
         assert!(pool.reserve_payloads_exact(1).is_none());
     }
 

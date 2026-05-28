@@ -14,8 +14,10 @@
 //!
 //! The high-level by-value APIs still copy payload bytes out of shared memory.
 //! As with the other shared-memory queues, callers must use the same `T` for all
-//! producers and consumers attached to the same region, and by-value reads must
-//! be valid for the chosen `T`.
+//! producers and consumers attached to the same region. Broadcast payloads may
+//! be overwritten, cancelled, recovered, or read by value without running `T`'s
+//! destructor on the shared-memory copy, so duplicating and forgetting payload
+//! values must be valid for the chosen `T`.
 
 mod payload_pool;
 
@@ -54,8 +56,9 @@ impl<T> Producer<T> {
     ///   consumers for the same file must use the same `T`.
     /// - If a process may read, dereference, inspect, or drop a queued value,
     ///   that operation must be valid for that value in that process.
-    /// - By-value APIs duplicate payloads with typed reads, so duplicating and
-    ///   forgetting the shared-memory payload must be valid for `T`.
+    /// - Broadcast payloads may be overwritten, cancelled, recovered, or read by
+    ///   value without running `T`'s destructor on the shared-memory copy, so
+    ///   duplicating and forgetting payload values must be valid for `T`.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer.
@@ -73,8 +76,9 @@ impl<T> Producer<T> {
     ///   consumers for the same file must use the same `T`.
     /// - If a process may read, dereference, inspect, or drop a queued value,
     ///   that operation must be valid for that value in that process.
-    /// - By-value APIs duplicate payloads with typed reads, so duplicating and
-    ///   forgetting the shared-memory payload must be valid for `T`.
+    /// - Broadcast payloads may be overwritten, cancelled, recovered, or read by
+    ///   value without running `T`'s destructor on the shared-memory copy, so
+    ///   duplicating and forgetting payload values must be valid for `T`.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (region, header) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` belongs to `region` and was validated by join.
@@ -191,8 +195,9 @@ impl<T> Consumer<T> {
     ///   consumers for the same file must use the same `T`.
     /// - If a process may read, dereference, inspect, or drop a queued value,
     ///   that operation must be valid for that value in that process.
-    /// - By-value APIs duplicate payloads with typed reads, so duplicating and
-    ///   forgetting the shared-memory payload must be valid for `T`.
+    /// - Broadcast payloads may be overwritten, cancelled, recovered, or read by
+    ///   value without running `T`'s destructor on the shared-memory copy, so
+    ///   duplicating and forgetting payload values must be valid for `T`.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer.
@@ -214,8 +219,9 @@ impl<T> Consumer<T> {
     ///   consumers for the same file must use the same `T`.
     /// - If a process may read, dereference, inspect, or drop a queued value,
     ///   that operation must be valid for that value in that process.
-    /// - By-value APIs duplicate payloads with typed reads, so duplicating and
-    ///   forgetting the shared-memory payload must be valid for `T`.
+    /// - Broadcast payloads may be overwritten, cancelled, recovered, or read by
+    ///   value without running `T`'s destructor on the shared-memory copy, so
+    ///   duplicating and forgetting payload values must be valid for `T`.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (region, header) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` belongs to `region` and was validated by join.
