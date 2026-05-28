@@ -18,6 +18,23 @@
 //! be overwritten, cancelled, recovered, or read by value without running `T`'s
 //! destructor on the shared-memory copy, so duplicating and forgetting payload
 //! values must be valid for the chosen `T`.
+//!
+//! # Safety and failure model
+//!
+//! The `try_` APIs are fallible, but they are not guaranteed to be non-blocking:
+//! publication may spin behind an earlier producer that is publishing to the
+//! ring. If a producer process exits after reserving ring positions but before
+//! advancing the publication cursor, later producers may remain blocked until
+//! [`Producer::recover_as_exclusive`] is used.
+//!
+//! Write batches reserve payload storage before reserving ring positions.
+//! Unpublished batches can therefore exhaust the fixed payload pool even though
+//! the broadcast ring is lossy. Old overwritten payloads are returned to the pool
+//! only after the new publication is visible, keeping the serialized publication
+//! window as small as possible.
+//!
+//! Zero-sized payload types and payload types whose alignment exceeds the shared
+//! memory region alignment are not supported.
 
 mod payload_pool;
 
@@ -54,11 +71,13 @@ impl<T> Producer<T> {
     ///   handle remains joined to the queue.
     /// - The queue does not validate `T` across processes. All producers and
     ///   consumers for the same file must use the same `T`.
-    /// - If a process may read, dereference, inspect, or drop a queued value,
-    ///   that operation must be valid for that value in that process.
-    /// - Broadcast payloads may be overwritten, cancelled, recovered, or read by
-    ///   value without running `T`'s destructor on the shared-memory copy, so
-    ///   duplicating and forgetting payload values must be valid for `T`.
+    /// - Any process that may read, dereference, inspect, duplicate, forget, or
+    ///   drop a queued value must be able to do so validly for that value in
+    ///   that process.
+    /// - Safe by-value reads duplicate payload bytes with typed reads. Broadcast
+    ///   payloads may also be overwritten, cancelled, or recovered without
+    ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
+    ///   make those operations valid.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer.
@@ -74,11 +93,13 @@ impl<T> Producer<T> {
     ///   concurrently truncated or resized while joined.
     /// - The queue does not validate `T` across processes. All producers and
     ///   consumers for the same file must use the same `T`.
-    /// - If a process may read, dereference, inspect, or drop a queued value,
-    ///   that operation must be valid for that value in that process.
-    /// - Broadcast payloads may be overwritten, cancelled, recovered, or read by
-    ///   value without running `T`'s destructor on the shared-memory copy, so
-    ///   duplicating and forgetting payload values must be valid for `T`.
+    /// - Any process that may read, dereference, inspect, duplicate, forget, or
+    ///   drop a queued value must be able to do so validly for that value in
+    ///   that process.
+    /// - Safe by-value reads duplicate payload bytes with typed reads. Broadcast
+    ///   payloads may also be overwritten, cancelled, or recovered without
+    ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
+    ///   make those operations valid.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (region, header) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` belongs to `region` and was validated by join.
@@ -106,11 +127,17 @@ impl<T> Producer<T> {
         })
     }
 
+    /// Returns the normalized ring capacity in items.
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
     /// Writes `item` into the queue, or returns it if no payload can be
     /// reserved.
     ///
     /// This may wait behind earlier producers that are publishing to the ring.
-    /// Payload exhaustion returns `Err(item)`.
+    /// The `try_` prefix means payload exhaustion returns `Err(item)`, not that
+    /// the operation is guaranteed to be non-blocking.
     ///
     /// Queue publication uses the queue's internal release ordering.
     pub fn try_write(&self, item: T) -> Result<(), T> {
@@ -143,12 +170,11 @@ impl<T> Producer<T> {
     /// Abandons all buffered and reserved values left behind by previous users.
     ///
     /// # Safety
-    /// - This must only be called when the caller can prove that no other
-    ///   process or thread is accessing the shared queue in any role.
-    /// - Existing [`Consumer`] handles have local cursors from before the
-    ///   recovery; recreate them or call [`Consumer::sync_to_latest`] before reuse.
-    /// - Racing with any live producer or consumer process/thread may corrupt
-    ///   the queue.
+    /// - The caller must have exclusive access through this producer handle. No
+    ///   other [`Producer`] or [`Consumer`] handle may be live or accessing the
+    ///   shared queue.
+    /// - Racing with any live producer or consumer process/thread may corrupt the
+    ///   queue.
     pub unsafe fn recover_as_exclusive(&self) {
         self.queue.recover_as_exclusive();
     }
@@ -193,11 +219,13 @@ impl<T> Consumer<T> {
     ///   handle remains joined to the queue.
     /// - The queue does not validate `T` across processes. All producers and
     ///   consumers for the same file must use the same `T`.
-    /// - If a process may read, dereference, inspect, or drop a queued value,
-    ///   that operation must be valid for that value in that process.
-    /// - Broadcast payloads may be overwritten, cancelled, recovered, or read by
-    ///   value without running `T`'s destructor on the shared-memory copy, so
-    ///   duplicating and forgetting payload values must be valid for `T`.
+    /// - Any process that may read, dereference, inspect, duplicate, forget, or
+    ///   drop a queued value must be able to do so validly for that value in
+    ///   that process.
+    /// - Safe by-value reads duplicate payload bytes with typed reads. Broadcast
+    ///   payloads may also be overwritten, cancelled, or recovered without
+    ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
+    ///   make those operations valid.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer.
@@ -217,11 +245,13 @@ impl<T> Consumer<T> {
     ///   concurrently truncated or resized while joined.
     /// - The queue does not validate `T` across processes. All producers and
     ///   consumers for the same file must use the same `T`.
-    /// - If a process may read, dereference, inspect, or drop a queued value,
-    ///   that operation must be valid for that value in that process.
-    /// - Broadcast payloads may be overwritten, cancelled, recovered, or read by
-    ///   value without running `T`'s destructor on the shared-memory copy, so
-    ///   duplicating and forgetting payload values must be valid for `T`.
+    /// - Any process that may read, dereference, inspect, duplicate, forget, or
+    ///   drop a queued value must be able to do so validly for that value in
+    ///   that process.
+    /// - Safe by-value reads duplicate payload bytes with typed reads. Broadcast
+    ///   payloads may also be overwritten, cancelled, or recovered without
+    ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
+    ///   make those operations valid.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (region, header) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` belongs to `region` and was validated by join.
@@ -234,6 +264,11 @@ impl<T> Consumer<T> {
         Producer {
             queue: self.queue.clone(),
         }
+    }
+
+    /// Returns the normalized ring capacity in items.
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
     }
 
     fn from_queue(queue: SharedQueue<T>) -> Self {
@@ -403,18 +438,6 @@ impl<T> Consumer<T> {
             pinned_payloads.clear();
             return Err(Self::record_overrun(&mut self.next, overrun, 0));
         }
-        for (index, pinned_payload) in pinned_payloads.iter().enumerate() {
-            if queue.handle_at(start.wrapping_add(index)) != pinned_payload.handle() {
-                queue.payload_pool.release_pinned_payloads(pinned_payloads);
-                pinned_payloads.clear();
-                return Err(Self::record_current_overrun(
-                    queue,
-                    &mut self.next,
-                    start,
-                    1,
-                ));
-            }
-        }
 
         Ok(DirectReadBatch {
             next: &mut self.next,
@@ -422,21 +445,6 @@ impl<T> Consumer<T> {
             start,
             pinned_payloads,
         })
-    }
-
-    /// Advances the consumer cursor over up to `max` published items without
-    /// pinning or reading payloads.
-    ///
-    /// This is useful for polling or benchmarking broadcast cursor progress
-    /// when the caller does not need payload access. It preserves normal
-    /// overrun reporting: if the consumer has fallen behind retained ring
-    /// capacity, the cursor is repositioned to the oldest currently available
-    /// item and the skipped count is returned.
-    pub fn try_advance(&mut self, max: usize) -> Result<usize, TryReadError> {
-        let (start, count) = self.readable_range(max)?;
-
-        self.next = start.wrapping_add(count);
-        Ok(count)
     }
 }
 
@@ -453,11 +461,18 @@ impl<T> Clone for Consumer<T> {
 unsafe impl<T: Send> Send for Consumer<T> {}
 unsafe impl<T: Send + Sync> Sync for Consumer<T> {}
 
-/// Calculates the minimum file size required for a queue with given capacity.
-/// Note that file size MAY need to be increased beyond this to account for
-/// page-size requirements.
+/// Calculates the minimum file size required for a queue with the requested
+/// capacity.
+///
+/// The returned size is for the normalized ring capacity, rounded up to a power
+/// of two.
+///
+/// # Panics
+/// Panics for zero capacity, capacities above the broadcast maximum,
+/// unsupported `T`, or layout arithmetic overflow. In const contexts these
+/// panics are compile-time errors.
 pub const fn minimum_file_size<T>(capacity: usize) -> usize {
-    let capacity = normalized_capacity(capacity);
+    let capacity = SharedQueueHeader::ring_capacity_for_requested_capacity(capacity);
     SharedQueueHeader::total_size_for_ring_capacity::<T>(capacity)
 }
 
@@ -699,14 +714,10 @@ impl<T> SharedQueue<T> {
         let header_ref = unsafe { header.as_ref() };
         let buffer_mask = header_ref.buffer_mask as usize;
         let buffer_size_in_items = buffer_mask.wrapping_add(1);
-        if !buffer_size_in_items.is_power_of_two()
-            || buffer_size_in_items == 0
-            || buffer_size_in_items > MAX_RING_CAPACITY
-            || SharedQueueHeader::calculate_ring_capacity::<T>(region.size())?
-                != buffer_size_in_items
-        {
-            return Err(Error::InvalidBufferSize);
-        }
+        SharedQueueHeader::validate_ring_capacity_for_file::<T>(
+            buffer_size_in_items,
+            region.size(),
+        )?;
 
         let payload_capacity =
             SharedQueueHeader::payload_capacity_for_ring_capacity(buffer_size_in_items)?;
@@ -779,26 +790,20 @@ impl SharedQueueHeader {
     }
 
     const fn payloads_offset<T>(ring_capacity: usize) -> usize {
-        const {
-            assert!(
-                core::mem::align_of::<T>() <= crate::shmem::MINIMUM_REGION_ALIGNMENT,
-                "types with alignment > MINIMUM_REGION_ALIGNMENT are not supported"
-            );
-            assert!(
-                core::mem::size_of::<T>() > 0,
-                "zero-sized types are not supported"
-            );
-        }
-
         let payload_capacity = ring_capacity * payload_pool::PAYLOADS_PER_RING_ENTRY;
         (Self::payload_headers_offset(ring_capacity)
             + payload_capacity * core::mem::size_of::<PayloadHeader>())
         .next_multiple_of(core::mem::align_of::<T>())
     }
 
-    const fn total_size_for_ring_capacity<T>(ring_capacity: usize) -> usize {
-        let payload_capacity = ring_capacity * payload_pool::PAYLOADS_PER_RING_ENTRY;
-        Self::payloads_offset::<T>(ring_capacity) + payload_capacity * core::mem::size_of::<T>()
+    const fn ring_capacity_for_requested_capacity(capacity: usize) -> usize {
+        assert!(capacity != 0, "broadcast capacity must be non-zero");
+        assert!(
+            capacity <= MAX_RING_CAPACITY,
+            "broadcast capacity exceeds maximum"
+        );
+
+        normalized_capacity(capacity)
     }
 
     fn payload_capacity_for_ring_capacity(ring_capacity: usize) -> Result<usize, Error> {
@@ -808,26 +813,80 @@ impl SharedQueueHeader {
         Ok(payload_capacity)
     }
 
-    fn total_size_checked<T>(ring_capacity: usize) -> Option<usize> {
-        let payload_capacity = ring_capacity.checked_mul(payload_pool::PAYLOADS_PER_RING_ENTRY)?;
-        let ring_end = Self::ring_offset()
-            .checked_add(ring_capacity.checked_mul(core::mem::size_of::<AtomicU64>())?)?;
+    const fn total_size_checked<T>(ring_capacity: usize) -> Option<usize> {
+        if core::mem::size_of::<T>() == 0
+            || core::mem::align_of::<T>() > crate::shmem::MINIMUM_REGION_ALIGNMENT
+        {
+            return None;
+        }
+
+        let Some(payload_capacity) =
+            ring_capacity.checked_mul(payload_pool::PAYLOADS_PER_RING_ENTRY)
+        else {
+            return None;
+        };
+        let Some(ring_bytes) = ring_capacity.checked_mul(core::mem::size_of::<AtomicU64>()) else {
+            return None;
+        };
+        let Some(ring_end) = Self::ring_offset().checked_add(ring_bytes) else {
+            return None;
+        };
         let payload_headers_offset =
             ring_end.next_multiple_of(core::mem::align_of::<PayloadHeader>());
-        let payload_headers_end = payload_headers_offset
-            .checked_add(payload_capacity.checked_mul(core::mem::size_of::<PayloadHeader>())?)?;
+        let Some(payload_header_bytes) =
+            payload_capacity.checked_mul(core::mem::size_of::<PayloadHeader>())
+        else {
+            return None;
+        };
+        let Some(payload_headers_end) = payload_headers_offset.checked_add(payload_header_bytes)
+        else {
+            return None;
+        };
         let payloads_offset = payload_headers_end.next_multiple_of(core::mem::align_of::<T>());
-        payloads_offset.checked_add(payload_capacity.checked_mul(core::mem::size_of::<T>())?)
+        let Some(payload_bytes) = payload_capacity.checked_mul(core::mem::size_of::<T>()) else {
+            return None;
+        };
+        payloads_offset.checked_add(payload_bytes)
+    }
+
+    const fn total_size_for_ring_capacity<T>(ring_capacity: usize) -> usize {
+        assert!(
+            core::mem::size_of::<T>() > 0,
+            "zero-sized types are not supported"
+        );
+        assert!(
+            core::mem::align_of::<T>() <= crate::shmem::MINIMUM_REGION_ALIGNMENT,
+            "types with alignment > MINIMUM_REGION_ALIGNMENT are not supported"
+        );
+
+        match Self::total_size_checked::<T>(ring_capacity) {
+            Some(size) => size,
+            None => panic!("broadcast queue size overflow"),
+        }
+    }
+
+    fn validate_ring_capacity_for_file<T>(
+        ring_capacity: usize,
+        file_size: usize,
+    ) -> Result<(), Error> {
+        if ring_capacity == 0
+            || !ring_capacity.is_power_of_two()
+            || ring_capacity > MAX_RING_CAPACITY
+        {
+            return Err(Error::InvalidBufferSize);
+        }
+
+        let Some(minimum_size) = Self::total_size_checked::<T>(ring_capacity) else {
+            return Err(Error::InvalidBufferSize);
+        };
+        if minimum_size > file_size {
+            return Err(Error::InvalidBufferSize);
+        }
+
+        Ok(())
     }
 
     fn calculate_ring_capacity<T>(file_size: usize) -> Result<usize, Error> {
-        const {
-            assert!(
-                core::mem::size_of::<T>() > 0,
-                "zero-sized types are not supported"
-            );
-        }
-
         let mut capacity = 1usize;
         let Some(minimum) = Self::total_size_checked::<T>(capacity) else {
             return Err(Error::InvalidBufferSize);
@@ -886,7 +945,9 @@ impl SharedQueueHeader {
 
     fn join<T>(file: &File) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         let file_size = file.metadata()?.len() as usize;
-        let expected_ring_capacity = Self::calculate_ring_capacity::<T>(file_size)?;
+        if file_size < core::mem::size_of::<Self>() {
+            return Err(Error::InvalidBufferSize);
+        }
         let region = Region::map_file(file, file_size)?;
         let header = region.addr().cast::<Self>();
         {
@@ -902,9 +963,7 @@ impl SharedQueueHeader {
                 });
             }
             let ring_capacity = (header_ref.buffer_mask as usize).wrapping_add(1);
-            if ring_capacity != expected_ring_capacity {
-                return Err(Error::InvalidBufferSize);
-            }
+            Self::validate_ring_capacity_for_file::<T>(ring_capacity, file_size)?;
         }
 
         Ok((region, header))
@@ -1439,20 +1498,6 @@ mod tests {
     }
 
     #[test]
-    fn test_try_advance_skips_without_pinning_payloads() {
-        let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
-
-        for i in 0..4 {
-            producer.try_write(i).unwrap();
-        }
-
-        assert_eq!(consumer.try_advance(2), Ok(2));
-        assert_eq!(consumer.try_read().unwrap(), 2);
-        assert_eq!(consumer.try_advance(8), Ok(1));
-        assert_eq!(consumer.try_read(), Err(TryReadError::Empty));
-    }
-
-    #[test]
     fn test_direct_read_batch_copies_payloads() {
         let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
@@ -1560,7 +1605,9 @@ mod tests {
 
     #[test]
     fn test_producer_recover_as_exclusive() {
-        let (file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let file = create_temp_shmem_file().unwrap();
+        let producer =
+            unsafe { Producer::<Item>::create(&file, BUFFER_SIZE) }.expect("create failed");
 
         for item in 0..BUFFER_CAPACITY as Item {
             producer.try_write(item).unwrap();
@@ -1572,14 +1619,11 @@ mod tests {
         unsafe {
             producer.recover_as_exclusive();
         }
-        consumer.sync_to_latest();
         let mut joined = unsafe { Consumer::<Item>::join(&file) }.expect("join after recovery");
 
-        assert_eq!(consumer.try_read(), Err(TryReadError::Empty));
         assert_eq!(joined.try_read(), Err(TryReadError::Empty));
         producer.try_write(2).unwrap();
 
-        assert_eq!(consumer.try_read().unwrap(), 2);
         assert_eq!(joined.try_read().unwrap(), 2);
     }
 
@@ -1620,6 +1664,24 @@ mod tests {
     }
 
     #[test]
+    fn test_join_allows_trailing_file_bytes() {
+        let file = create_temp_shmem_file().unwrap();
+        let exact_size = minimum_file_size::<u64>(4);
+        let producer =
+            unsafe { Producer::<u64>::create(&file, exact_size) }.expect("create failed");
+
+        file.set_len((exact_size + 4096) as u64)
+            .expect("grow queue file");
+
+        let joined_producer = unsafe { Producer::<u64>::join(&file) }.expect("producer join");
+        let joined_consumer = unsafe { Consumer::<u64>::join(&file) }.expect("consumer join");
+
+        assert_eq!(producer.capacity(), 4);
+        assert_eq!(joined_producer.capacity(), 4);
+        assert_eq!(joined_consumer.capacity(), 4);
+    }
+
+    #[test]
     fn test_clone_producer() {
         let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
         let producer2 = producer.clone();
@@ -1657,8 +1719,18 @@ mod tests {
             .expect("create failed");
         let consumer = unsafe { Consumer::<u64>::join(&file) }.expect("join failed");
 
-        assert_eq!(producer.queue.capacity(), 4);
-        assert_eq!(consumer.queue.capacity(), 4);
+        assert_eq!(producer.capacity(), 4);
+        assert_eq!(consumer.capacity(), 4);
         assert_eq!(producer.queue.payload_pool.capacity(), 8);
+    }
+
+    #[test]
+    fn test_minimum_file_size_rejects_invalid_inputs() {
+        assert!(std::panic::catch_unwind(|| minimum_file_size::<u64>(0)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| minimum_file_size::<u64>(MAX_RING_CAPACITY + 1)).is_err()
+        );
+        assert!(std::panic::catch_unwind(|| minimum_region_size::<u64>(usize::MAX)).is_err());
+        assert!(std::panic::catch_unwind(|| minimum_file_size::<()>(1)).is_err());
     }
 }

@@ -9,7 +9,7 @@ const EMPTY_PAYLOAD: u32 = 0;
 
 /// Payload descriptor. `state` is owned by the payload lifetime protocol;
 /// `next_free` is owned by the pool's free-payload implementation.
-#[repr(C, align(64))]
+#[repr(C)]
 pub(super) struct PayloadHeader {
     /// High 32 bits: generation. Low 32 bits: reference count.
     state: AtomicU64,
@@ -620,7 +620,7 @@ mod tests {
         PayloadPoolFreeHead, PayloadReleaseBatch,
     };
     use core::{
-        mem::MaybeUninit,
+        mem::{size_of, MaybeUninit},
         ptr::NonNull,
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -657,6 +657,11 @@ mod tests {
             NonNull::new(payloads.as_mut_ptr().cast()).expect("non-empty payload slice"),
             payload_headers.len(),
         )
+    }
+
+    #[test]
+    fn payload_header_uses_compact_layout() {
+        assert_eq!(size_of::<PayloadHeader>(), 16);
     }
 
     #[test]

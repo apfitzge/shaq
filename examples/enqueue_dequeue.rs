@@ -477,8 +477,14 @@ fn run_broadcast_consumer(
     consumer_reserve_failures: Arc<AtomicU64>,
 ) {
     run_consumer_loop(exit, move || {
-        if let Err(TryReadError::Skipped(skipped)) = consumer.try_advance(SYNC_CADENCE) {
-            consumer_reserve_failures.fetch_add(skipped as u64, Ordering::Relaxed);
+        // SAFETY: the benchmark claims payload references but does not
+        // dereference payload bytes.
+        match unsafe { consumer.try_read_direct_batch(SYNC_CADENCE) } {
+            Ok(batch) => batch.commit(),
+            Err(TryReadError::Skipped(skipped)) => {
+                consumer_reserve_failures.fetch_add(skipped as u64, Ordering::Relaxed);
+            }
+            Err(TryReadError::Empty) => {}
         }
     });
 }
