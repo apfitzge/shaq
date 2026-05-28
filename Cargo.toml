@@ -2,13 +2,13 @@
 name = "shaq"
 authors = ["Anza Maintainers <maintainers@anza.xyz>"]
 version = "3.0.0"
-description = "SPSC FIFO queue backed by shared memory for IPC"
+description = "Shared-memory SPSC, MPMC, and broadcast queues for IPC"
 readme = "README.md"
 homepage = "https://anza.xyz/"
 repository = "https://github.com/anza-xyz/shaq"
 license = "Apache-2.0"
 edition = "2021"
-include = ["src/*.rs", "Cargo.toml"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 
 [target."cfg(unix)".dependencies]
 libc = { version = "0.2.180" }
