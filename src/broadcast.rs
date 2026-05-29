@@ -15,10 +15,12 @@
 //!
 //! The high-level by-value APIs still copy payload bytes out of shared memory.
 //! As with the other shared-memory queues, callers must use the same `T` for all
-//! producers and consumers attached to the same region. Broadcast payloads may
-//! be overwritten, cancelled, recovered, or read by value without running `T`'s
-//! destructor on the shared-memory copy, so duplicating and forgetting payload
-//! values must be valid for the chosen `T`.
+//! producers and consumers attached to the same region. The consumer-slot count
+//! is a const generic on [`Producer`] and [`Consumer`]; it defaults to
+//! [`DEFAULT_CONSUMER_SLOTS`] and is validated when joining. Broadcast payloads
+//! may be overwritten, cancelled, recovered, or read by value without running
+//! `T`'s destructor on the shared-memory copy, so duplicating and forgetting
+//! payload values must be valid for the chosen `T`.
 //!
 //! # Safety and failure model
 //!
@@ -55,13 +57,13 @@ use std::{fs::File, sync::Arc};
 /// Unique identifier for broadcast queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
 const MAX_RING_CAPACITY: usize = 1usize << 30;
-const MAX_CONSUMERS: usize = 64;
+pub const DEFAULT_CONSUMER_SLOTS: usize = 8;
 
-pub struct Producer<T> {
-    queue: SharedQueue<T>,
+pub struct Producer<T, const CONSUMER_SLOTS: usize = DEFAULT_CONSUMER_SLOTS> {
+    queue: SharedQueue<T, CONSUMER_SLOTS>,
 }
 
-impl<T> Producer<T> {
+impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
     /// Creates a new producer for the shared queue in the provided file with
     /// the given size.
     ///
@@ -73,7 +75,8 @@ impl<T> Producer<T> {
     /// - After initialization, `file` must not be truncated or resized while any
     ///   handle remains joined to the queue.
     /// - The queue does not validate `T` across processes. All producers and
-    ///   consumers for the same file must use the same `T`.
+    ///   consumers for the same file must use the same `T` and
+    ///   `CONSUMER_SLOTS`.
     /// - Any process that may read, dereference, inspect, duplicate, forget, or
     ///   drop a queued value must be able to do so validly for that value in
     ///   that process.
@@ -84,7 +87,8 @@ impl<T> Producer<T> {
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer.
-        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
+        let (region, header) =
+            unsafe { SharedQueueHeader::create::<T, CONSUMER_SLOTS>(file, file_size) }?;
         // SAFETY: `header` belongs to `region` and was initialized above.
         unsafe { Self::from_header(region, header) }
     }
@@ -95,7 +99,8 @@ impl<T> Producer<T> {
     /// - `file` must refer to a live initialized broadcast queue and must not be
     ///   concurrently truncated or resized while joined.
     /// - The queue does not validate `T` across processes. All producers and
-    ///   consumers for the same file must use the same `T`.
+    ///   consumers for the same file must use the same `T` and
+    ///   `CONSUMER_SLOTS`.
     /// - Any process that may read, dereference, inspect, duplicate, forget, or
     ///   drop a queued value must be able to do so validly for that value in
     ///   that process.
@@ -104,7 +109,7 @@ impl<T> Producer<T> {
     ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
     ///   make those operations valid.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
-        let (region, header) = SharedQueueHeader::join::<T>(file)?;
+        let (region, header) = SharedQueueHeader::join::<T, CONSUMER_SLOTS>(file)?;
         // SAFETY: `header` belongs to `region` and was validated by join.
         unsafe { Self::from_header(region, header) }
     }
@@ -113,8 +118,13 @@ impl<T> Producer<T> {
     ///
     /// The consumer starts at the current producer publication cursor and will
     /// only observe values published after it joins.
-    pub fn join_as_consumer(&self) -> Result<Consumer<T>, Error> {
+    pub fn join_as_consumer(&self) -> Result<Consumer<T, CONSUMER_SLOTS>, Error> {
         Consumer::from_queue(self.queue.clone())
+    }
+
+    /// Calculates the minimum file size for this producer's consumer-slot count.
+    pub const fn minimum_file_size(capacity: usize) -> usize {
+        minimum_file_size_for_consumer_slots::<T, CONSUMER_SLOTS>(capacity)
     }
 
     /// # Safety
@@ -159,7 +169,7 @@ impl<T> Producer<T> {
     /// [`WriteBatch::publish`] after initializing them. Batch payload
     /// reservation uses one pool reservation operation for the whole batch.
     #[must_use]
-    pub fn reserve_write_batch(&self, count: usize) -> Option<WriteBatch<'_, T>> {
+    pub fn reserve_write_batch(&self, count: usize) -> Option<WriteBatch<'_, T, CONSUMER_SLOTS>> {
         let chain = self.queue.reserve_write_batch(count)?;
         Some(WriteBatch {
             queue: &self.queue,
@@ -183,7 +193,7 @@ impl<T> Producer<T> {
     }
 }
 
-impl<T> Clone for Producer<T> {
+impl<T, const CONSUMER_SLOTS: usize> Clone for Producer<T, CONSUMER_SLOTS> {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
@@ -191,8 +201,8 @@ impl<T> Clone for Producer<T> {
     }
 }
 
-unsafe impl<T: Send> Send for Producer<T> {}
-unsafe impl<T: Send + Sync> Sync for Producer<T> {}
+unsafe impl<T: Send, const CONSUMER_SLOTS: usize> Send for Producer<T, CONSUMER_SLOTS> {}
+unsafe impl<T: Send + Sync, const CONSUMER_SLOTS: usize> Sync for Producer<T, CONSUMER_SLOTS> {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TryReadError {
@@ -200,14 +210,14 @@ pub enum TryReadError {
     Skipped(usize),
 }
 
-pub struct Consumer<T> {
-    queue: SharedQueue<T>,
+pub struct Consumer<T, const CONSUMER_SLOTS: usize = DEFAULT_CONSUMER_SLOTS> {
+    queue: SharedQueue<T, CONSUMER_SLOTS>,
     hazard: ConsumerHazard,
     next: usize,
     read_batch_payloads: Vec<ProtectedPayload>,
 }
 
-impl<T> Consumer<T> {
+impl<T, const CONSUMER_SLOTS: usize> Consumer<T, CONSUMER_SLOTS> {
     /// Creates a new consumer for the shared queue in the provided file with
     /// the given size.
     ///
@@ -222,7 +232,8 @@ impl<T> Consumer<T> {
     /// - After initialization, `file` must not be truncated or resized while any
     ///   handle remains joined to the queue.
     /// - The queue does not validate `T` across processes. All producers and
-    ///   consumers for the same file must use the same `T`.
+    ///   consumers for the same file must use the same `T` and
+    ///   `CONSUMER_SLOTS`.
     /// - Any process that may read, dereference, inspect, duplicate, forget, or
     ///   drop a queued value must be able to do so validly for that value in
     ///   that process.
@@ -233,7 +244,8 @@ impl<T> Consumer<T> {
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer.
-        let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
+        let (region, header) =
+            unsafe { SharedQueueHeader::create::<T, CONSUMER_SLOTS>(file, file_size) }?;
         // SAFETY: `header` belongs to `region` and was initialized above.
         let queue = unsafe { SharedQueue::from_header(region, header) }?;
         Self::from_queue(queue)
@@ -248,7 +260,8 @@ impl<T> Consumer<T> {
     /// - `file` must refer to a live initialized broadcast queue and must not be
     ///   concurrently truncated or resized while joined.
     /// - The queue does not validate `T` across processes. All producers and
-    ///   consumers for the same file must use the same `T`.
+    ///   consumers for the same file must use the same `T` and
+    ///   `CONSUMER_SLOTS`.
     /// - Any process that may read, dereference, inspect, duplicate, forget, or
     ///   drop a queued value must be able to do so validly for that value in
     ///   that process.
@@ -257,17 +270,22 @@ impl<T> Consumer<T> {
     ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
     ///   make those operations valid.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
-        let (region, header) = SharedQueueHeader::join::<T>(file)?;
+        let (region, header) = SharedQueueHeader::join::<T, CONSUMER_SLOTS>(file)?;
         // SAFETY: `header` belongs to `region` and was validated by join.
         let queue = unsafe { SharedQueue::from_header(region, header) }?;
         Self::from_queue(queue)
     }
 
     /// Creates a Producer that shares the same memory mapping.
-    pub fn join_as_producer(&self) -> Producer<T> {
+    pub fn join_as_producer(&self) -> Producer<T, CONSUMER_SLOTS> {
         Producer {
             queue: self.queue.clone(),
         }
+    }
+
+    /// Calculates the minimum file size for this consumer's consumer-slot count.
+    pub const fn minimum_file_size(capacity: usize) -> usize {
+        minimum_file_size_for_consumer_slots::<T, CONSUMER_SLOTS>(capacity)
     }
 
     /// Returns the normalized ring capacity in items.
@@ -275,7 +293,7 @@ impl<T> Consumer<T> {
         self.queue.capacity()
     }
 
-    fn from_queue(queue: SharedQueue<T>) -> Result<Self, Error> {
+    fn from_queue(queue: SharedQueue<T, CONSUMER_SLOTS>) -> Result<Self, Error> {
         let next = queue.published();
         let hazard = queue.acquire_consumer_hazard()?;
         Ok(Self {
@@ -325,7 +343,7 @@ impl<T> Consumer<T> {
     }
 
     fn record_current_overrun(
-        queue: &SharedQueue<T>,
+        queue: &SharedQueue<T, CONSUMER_SLOTS>,
         next: &mut usize,
         start: usize,
         min_skipped: usize,
@@ -380,7 +398,9 @@ impl<T> Consumer<T> {
     /// # Safety
     /// Callers must only access the returned payload in ways valid for
     /// shared-memory bytes of `T` in this process.
-    pub unsafe fn try_read_direct(&mut self) -> Result<DirectRead<'_, T>, TryReadError> {
+    pub unsafe fn try_read_direct(
+        &mut self,
+    ) -> Result<DirectRead<'_, T, CONSUMER_SLOTS>, TryReadError> {
         let (start, _) = self.readable_range(1)?;
 
         self.hazard.protect(start, 1);
@@ -419,7 +439,7 @@ impl<T> Consumer<T> {
     pub unsafe fn try_read_direct_batch(
         &mut self,
         max: usize,
-    ) -> Result<DirectReadBatch<'_, T>, TryReadError> {
+    ) -> Result<DirectReadBatch<'_, T, CONSUMER_SLOTS>, TryReadError> {
         let (start, count) = self.readable_range(max)?;
 
         let queue = &self.queue;
@@ -462,14 +482,14 @@ impl<T> Consumer<T> {
     }
 }
 
-impl<T> Drop for Consumer<T> {
+impl<T, const CONSUMER_SLOTS: usize> Drop for Consumer<T, CONSUMER_SLOTS> {
     fn drop(&mut self) {
         self.hazard.release_owner();
     }
 }
 
-unsafe impl<T: Send> Send for Consumer<T> {}
-unsafe impl<T: Send + Sync> Sync for Consumer<T> {}
+unsafe impl<T: Send, const CONSUMER_SLOTS: usize> Send for Consumer<T, CONSUMER_SLOTS> {}
+unsafe impl<T: Send + Sync, const CONSUMER_SLOTS: usize> Sync for Consumer<T, CONSUMER_SLOTS> {}
 
 /// Calculates the minimum file size required for a queue with the requested
 /// capacity.
@@ -482,13 +502,37 @@ unsafe impl<T: Send + Sync> Sync for Consumer<T> {}
 /// unsupported `T`, or layout arithmetic overflow. In const contexts these
 /// panics are compile-time errors.
 pub const fn minimum_file_size<T>(capacity: usize) -> usize {
+    minimum_file_size_for_consumer_slots::<T, DEFAULT_CONSUMER_SLOTS>(capacity)
+}
+
+/// Calculates the minimum file size required for a queue with the requested
+/// capacity and consumer-slot count.
+///
+/// The returned size is for the normalized ring capacity, rounded up to a power
+/// of two.
+///
+/// # Panics
+/// Panics for zero capacity, zero consumer slots, capacities above the broadcast
+/// maximum, unsupported `T`, or layout arithmetic overflow. In const contexts
+/// these panics are compile-time errors.
+pub const fn minimum_file_size_for_consumer_slots<T, const CONSUMER_SLOTS: usize>(
+    capacity: usize,
+) -> usize {
     let capacity = SharedQueueHeader::ring_capacity_for_requested_capacity(capacity);
-    SharedQueueHeader::total_size_for_ring_capacity::<T>(capacity)
+    SharedQueueHeader::total_size_for_ring_capacity::<T, CONSUMER_SLOTS>(capacity)
 }
 
 /// Calculates the minimum region size required for a queue with given capacity.
 pub const fn minimum_region_size<T>(capacity: usize) -> usize {
     minimum_file_size::<T>(capacity)
+}
+
+/// Calculates the minimum region size required for a queue with given capacity
+/// and consumer-slot count.
+pub const fn minimum_region_size_for_consumer_slots<T, const CONSUMER_SLOTS: usize>(
+    capacity: usize,
+) -> usize {
+    minimum_file_size_for_consumer_slots::<T, CONSUMER_SLOTS>(capacity)
 }
 
 /// Shared-memory broadcast queue view.
@@ -499,13 +543,13 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 /// offset 0
 /// +---------------------------+
 /// | SharedQueueHeader         |
-/// |   cacheline 0             | magic, version, buffer_mask
+/// |   cacheline 0             | magic, version, buffer_mask, consumer_slots
 /// |   cacheline 1             | payload_pool_head
 /// |   cacheline 2             | payload_retired_head
 /// |   cacheline 3             | producer_reservation
 /// |   cacheline 4             | producer_publication
 /// +---------------------------+
-/// | consumer hazard slots     | [ConsumerHazardSlot; 64]
+/// | consumer hazard slots     | [ConsumerHazardSlot; CONSUMER_SLOTS]
 /// +---------------------------+
 /// | ring                      | [PayloadHandle; ring_capacity]
 /// +---------------------------+
@@ -517,7 +561,7 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 ///
 /// `ring_capacity` is `buffer_mask + 1`; `payload_capacity` is
 /// `ring_capacity * payload_pool::PAYLOADS_PER_RING_ENTRY`.
-struct SharedQueue<T> {
+struct SharedQueue<T, const CONSUMER_SLOTS: usize> {
     /// Shared metadata and producer cursors.
     header: NonNull<SharedQueueHeader>,
     /// Published values. Each entry contains a `PayloadHandle`.
@@ -659,21 +703,21 @@ impl HazardRange {
 }
 
 #[derive(Clone, Copy)]
-struct HazardSnapshot {
-    ranges: [HazardRange; MAX_CONSUMERS],
+struct HazardSnapshot<const CONSUMER_SLOTS: usize> {
+    ranges: [HazardRange; CONSUMER_SLOTS],
     len: usize,
 }
 
-impl HazardSnapshot {
+impl<const CONSUMER_SLOTS: usize> HazardSnapshot<CONSUMER_SLOTS> {
     fn new() -> Self {
         Self {
-            ranges: [HazardRange { start: 0, end: 0 }; MAX_CONSUMERS],
+            ranges: [HazardRange { start: 0, end: 0 }; CONSUMER_SLOTS],
             len: 0,
         }
     }
 
     fn push(&mut self, range: HazardRange) {
-        debug_assert!(self.len < MAX_CONSUMERS);
+        debug_assert!(self.len < CONSUMER_SLOTS);
         self.ranges[self.len] = range;
         self.len += 1;
     }
@@ -685,7 +729,7 @@ impl HazardSnapshot {
     }
 }
 
-impl<T> Clone for SharedQueue<T> {
+impl<T, const CONSUMER_SLOTS: usize> Clone for SharedQueue<T, CONSUMER_SLOTS> {
     fn clone(&self) -> Self {
         Self {
             header: self.header,
@@ -698,7 +742,7 @@ impl<T> Clone for SharedQueue<T> {
     }
 }
 
-impl<T> SharedQueue<T> {
+impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
     #[inline]
     fn capacity(&self) -> usize {
         self.buffer_mask.wrapping_add(1)
@@ -849,8 +893,8 @@ impl<T> SharedQueue<T> {
     }
 
     fn acquire_consumer_hazard(&self) -> Result<ConsumerHazard, Error> {
-        for index in 0..MAX_CONSUMERS {
-            // SAFETY: index is bounded by MAX_CONSUMERS.
+        for index in 0..CONSUMER_SLOTS {
+            // SAFETY: index is bounded by CONSUMER_SLOTS.
             let slot = unsafe { self.hazard_slots.add(index) };
             // SAFETY: slot points into the live hazard table.
             if unsafe { slot.as_ref() }.acquire() {
@@ -861,10 +905,10 @@ impl<T> SharedQueue<T> {
         Err(Error::ConsumerSlotsExhausted)
     }
 
-    fn hazard_snapshot(&self) -> HazardSnapshot {
+    fn hazard_snapshot(&self) -> HazardSnapshot<CONSUMER_SLOTS> {
         let mut snapshot = HazardSnapshot::new();
-        for index in 0..MAX_CONSUMERS {
-            // SAFETY: index is bounded by MAX_CONSUMERS.
+        for index in 0..CONSUMER_SLOTS {
+            // SAFETY: index is bounded by CONSUMER_SLOTS.
             let slot = unsafe { self.hazard_slots.add(index).as_ref() };
             if let Some(range) = slot.active_range() {
                 snapshot.push(range);
@@ -890,8 +934,8 @@ impl<T> SharedQueue<T> {
             unsafe { self.ring.add(index).as_ref() }
                 .store(PayloadHandle::EMPTY.0, Ordering::Release);
         }
-        for index in 0..MAX_CONSUMERS {
-            // SAFETY: index is bounded by MAX_CONSUMERS.
+        for index in 0..CONSUMER_SLOTS {
+            // SAFETY: index is bounded by CONSUMER_SLOTS.
             unsafe { self.hazard_slots.add(index).as_ref() }.reset();
         }
         self.payload_pool.recover_as_exclusive();
@@ -909,7 +953,7 @@ impl<T> SharedQueue<T> {
         let header_ref = unsafe { header.as_ref() };
         let buffer_mask = header_ref.buffer_mask as usize;
         let buffer_size_in_items = buffer_mask.wrapping_add(1);
-        SharedQueueHeader::validate_ring_capacity_for_file::<T>(
+        SharedQueueHeader::validate_ring_capacity_for_file::<T, CONSUMER_SLOTS>(
             buffer_size_in_items,
             region.size(),
         )?;
@@ -919,13 +963,21 @@ impl<T> SharedQueue<T> {
         // SAFETY: layout validation above proves these regions exist.
         let hazard_slots = unsafe { SharedQueueHeader::hazard_slots_from_header(header) };
         // SAFETY: layout validation above proves these regions exist.
-        let ring = unsafe { SharedQueueHeader::ring_from_header(header) };
+        let ring = unsafe { SharedQueueHeader::ring_from_header::<CONSUMER_SLOTS>(header) };
         // SAFETY: layout validation above proves these regions exist.
-        let payload_headers =
-            unsafe { SharedQueueHeader::payload_headers_from_header(header, buffer_size_in_items) };
+        let payload_headers = unsafe {
+            SharedQueueHeader::payload_headers_from_header::<CONSUMER_SLOTS>(
+                header,
+                buffer_size_in_items,
+            )
+        };
         // SAFETY: layout validation above proves these regions exist.
-        let payloads =
-            unsafe { SharedQueueHeader::payloads_from_header::<T>(header, buffer_size_in_items) };
+        let payloads = unsafe {
+            SharedQueueHeader::payloads_from_header::<T, CONSUMER_SLOTS>(
+                header,
+                buffer_size_in_items,
+            )
+        };
 
         Ok(Self {
             header,
@@ -950,6 +1002,7 @@ struct SharedQueueHeader {
     magic: AtomicU64,
     version: u32,
     buffer_mask: u32,
+    consumer_slots: u32,
 
     /// Payload-pool free-list head.
     payload_pool_head: CacheAlignedAtomicU64,
@@ -970,14 +1023,17 @@ struct SharedQueueHeader {
 }
 
 impl SharedQueueHeader {
-    unsafe fn create<T>(file: &File, size: usize) -> Result<(Arc<Region>, NonNull<Self>), Error> {
+    unsafe fn create<T, const CONSUMER_SLOTS: usize>(
+        file: &File,
+        size: usize,
+    ) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         file.set_len(size as u64)?;
 
-        let ring_capacity = Self::calculate_ring_capacity::<T>(size)?;
+        let ring_capacity = Self::calculate_ring_capacity::<T, CONSUMER_SLOTS>(size)?;
         let region = Region::map_file(file, size)?;
         let header = region.addr().cast::<Self>();
         // SAFETY: caller guarantees this mapping is initialized exactly once.
-        unsafe { Self::initialize(header, ring_capacity) };
+        unsafe { Self::initialize::<CONSUMER_SLOTS>(header, ring_capacity) };
         Ok((region, header))
     }
 
@@ -985,19 +1041,19 @@ impl SharedQueueHeader {
         core::mem::size_of::<Self>().next_multiple_of(core::mem::align_of::<ConsumerHazardSlot>())
     }
 
-    const fn ring_offset() -> usize {
-        (Self::hazard_slots_offset() + MAX_CONSUMERS * core::mem::size_of::<ConsumerHazardSlot>())
+    const fn ring_offset<const CONSUMER_SLOTS: usize>() -> usize {
+        (Self::hazard_slots_offset() + CONSUMER_SLOTS * core::mem::size_of::<ConsumerHazardSlot>())
             .next_multiple_of(core::mem::align_of::<AtomicU64>())
     }
 
-    const fn payload_headers_offset(ring_capacity: usize) -> usize {
-        (Self::ring_offset() + ring_capacity * core::mem::size_of::<AtomicU64>())
+    const fn payload_headers_offset<const CONSUMER_SLOTS: usize>(ring_capacity: usize) -> usize {
+        (Self::ring_offset::<CONSUMER_SLOTS>() + ring_capacity * core::mem::size_of::<AtomicU64>())
             .next_multiple_of(core::mem::align_of::<PayloadHeader>())
     }
 
-    const fn payloads_offset<T>(ring_capacity: usize) -> usize {
+    const fn payloads_offset<T, const CONSUMER_SLOTS: usize>(ring_capacity: usize) -> usize {
         let payload_capacity = ring_capacity * payload_pool::PAYLOADS_PER_RING_ENTRY;
-        (Self::payload_headers_offset(ring_capacity)
+        (Self::payload_headers_offset::<CONSUMER_SLOTS>(ring_capacity)
             + payload_capacity * core::mem::size_of::<PayloadHeader>())
         .next_multiple_of(core::mem::align_of::<T>())
     }
@@ -1019,9 +1075,13 @@ impl SharedQueueHeader {
         Ok(payload_capacity)
     }
 
-    const fn total_size_checked<T>(ring_capacity: usize) -> Option<usize> {
+    const fn total_size_checked<T, const CONSUMER_SLOTS: usize>(
+        ring_capacity: usize,
+    ) -> Option<usize> {
         if core::mem::size_of::<T>() == 0
             || core::mem::align_of::<T>() > crate::shmem::MINIMUM_REGION_ALIGNMENT
+            || CONSUMER_SLOTS == 0
+            || CONSUMER_SLOTS > u32::MAX as usize
         {
             return None;
         }
@@ -1034,11 +1094,28 @@ impl SharedQueueHeader {
         let Some(ring_bytes) = ring_capacity.checked_mul(core::mem::size_of::<AtomicU64>()) else {
             return None;
         };
-        let Some(ring_end) = Self::ring_offset().checked_add(ring_bytes) else {
+        let Some(hazard_slots_bytes) =
+            CONSUMER_SLOTS.checked_mul(core::mem::size_of::<ConsumerHazardSlot>())
+        else {
             return None;
         };
-        let payload_headers_offset =
-            ring_end.next_multiple_of(core::mem::align_of::<PayloadHeader>());
+        let Some(hazard_slots_end) = Self::hazard_slots_offset().checked_add(hazard_slots_bytes)
+        else {
+            return None;
+        };
+        let Some(ring_offset) =
+            checked_next_multiple_of(hazard_slots_end, core::mem::align_of::<AtomicU64>())
+        else {
+            return None;
+        };
+        let Some(ring_end) = ring_offset.checked_add(ring_bytes) else {
+            return None;
+        };
+        let Some(payload_headers_offset) =
+            checked_next_multiple_of(ring_end, core::mem::align_of::<PayloadHeader>())
+        else {
+            return None;
+        };
         let Some(payload_header_bytes) =
             payload_capacity.checked_mul(core::mem::size_of::<PayloadHeader>())
         else {
@@ -1048,14 +1125,28 @@ impl SharedQueueHeader {
         else {
             return None;
         };
-        let payloads_offset = payload_headers_end.next_multiple_of(core::mem::align_of::<T>());
+        let Some(payloads_offset) =
+            checked_next_multiple_of(payload_headers_end, core::mem::align_of::<T>())
+        else {
+            return None;
+        };
         let Some(payload_bytes) = payload_capacity.checked_mul(core::mem::size_of::<T>()) else {
             return None;
         };
         payloads_offset.checked_add(payload_bytes)
     }
 
-    const fn total_size_for_ring_capacity<T>(ring_capacity: usize) -> usize {
+    const fn total_size_for_ring_capacity<T, const CONSUMER_SLOTS: usize>(
+        ring_capacity: usize,
+    ) -> usize {
+        assert!(
+            CONSUMER_SLOTS != 0,
+            "broadcast consumer slot count must be non-zero"
+        );
+        assert!(
+            CONSUMER_SLOTS <= u32::MAX as usize,
+            "broadcast consumer slot count exceeds maximum"
+        );
         assert!(
             core::mem::size_of::<T>() > 0,
             "zero-sized types are not supported"
@@ -1065,13 +1156,13 @@ impl SharedQueueHeader {
             "types with alignment > MINIMUM_REGION_ALIGNMENT are not supported"
         );
 
-        match Self::total_size_checked::<T>(ring_capacity) {
+        match Self::total_size_checked::<T, CONSUMER_SLOTS>(ring_capacity) {
             Some(size) => size,
             None => panic!("broadcast queue size overflow"),
         }
     }
 
-    fn validate_ring_capacity_for_file<T>(
+    fn validate_ring_capacity_for_file<T, const CONSUMER_SLOTS: usize>(
         ring_capacity: usize,
         file_size: usize,
     ) -> Result<(), Error> {
@@ -1082,7 +1173,8 @@ impl SharedQueueHeader {
             return Err(Error::InvalidBufferSize);
         }
 
-        let Some(minimum_size) = Self::total_size_checked::<T>(ring_capacity) else {
+        let Some(minimum_size) = Self::total_size_checked::<T, CONSUMER_SLOTS>(ring_capacity)
+        else {
             return Err(Error::InvalidBufferSize);
         };
         if minimum_size > file_size {
@@ -1092,9 +1184,11 @@ impl SharedQueueHeader {
         Ok(())
     }
 
-    fn calculate_ring_capacity<T>(file_size: usize) -> Result<usize, Error> {
+    fn calculate_ring_capacity<T, const CONSUMER_SLOTS: usize>(
+        file_size: usize,
+    ) -> Result<usize, Error> {
         let mut capacity = 1usize;
-        let Some(minimum) = Self::total_size_checked::<T>(capacity) else {
+        let Some(minimum) = Self::total_size_checked::<T, CONSUMER_SLOTS>(capacity) else {
             return Err(Error::InvalidBufferSize);
         };
         if file_size < minimum {
@@ -1103,7 +1197,7 @@ impl SharedQueueHeader {
 
         while capacity < MAX_RING_CAPACITY {
             let next = capacity << 1;
-            let Some(size) = Self::total_size_checked::<T>(next) else {
+            let Some(size) = Self::total_size_checked::<T, CONSUMER_SLOTS>(next) else {
                 break;
             };
             if size > file_size {
@@ -1115,7 +1209,10 @@ impl SharedQueueHeader {
         Ok(capacity)
     }
 
-    unsafe fn initialize(mut header_ptr: NonNull<Self>, ring_capacity: usize) {
+    unsafe fn initialize<const CONSUMER_SLOTS: usize>(
+        mut header_ptr: NonNull<Self>,
+        ring_capacity: usize,
+    ) {
         let payload_capacity = Self::payload_capacity_for_ring_capacity(ring_capacity)
             .expect("validated payload capacity");
 
@@ -1131,11 +1228,12 @@ impl SharedQueueHeader {
             .payload_retired_head
             .store(payload_pool::initial_retired_head(), Ordering::Release);
         header.buffer_mask = u32::try_from(ring_capacity - 1).unwrap();
+        header.consumer_slots = u32::try_from(CONSUMER_SLOTS).expect("validated consumer slots");
         header.version = VERSION;
 
-        // SAFETY: The calculated layout reserves MAX_CONSUMERS hazard slots.
+        // SAFETY: The calculated layout reserves CONSUMER_SLOTS hazard slots.
         let hazard_slots = unsafe { Self::hazard_slots_from_header(header_ptr) };
-        for index in 0..MAX_CONSUMERS {
+        for index in 0..CONSUMER_SLOTS {
             // SAFETY: index is in bounds for the hazard slot array.
             unsafe {
                 hazard_slots
@@ -1146,7 +1244,7 @@ impl SharedQueueHeader {
         }
 
         // SAFETY: The calculated layout reserves `ring_capacity` entries.
-        let ring = unsafe { Self::ring_from_header(header_ptr) };
+        let ring = unsafe { Self::ring_from_header::<CONSUMER_SLOTS>(header_ptr) };
         for index in 0..ring_capacity {
             // SAFETY: index is in bounds for the ring array.
             unsafe {
@@ -1156,15 +1254,18 @@ impl SharedQueueHeader {
             };
         }
 
-        let payload_headers =
-            unsafe { Self::payload_headers_from_header(header_ptr, ring_capacity) };
+        let payload_headers = unsafe {
+            Self::payload_headers_from_header::<CONSUMER_SLOTS>(header_ptr, ring_capacity)
+        };
         // SAFETY: The calculated layout reserves `payload_capacity` payload headers.
         unsafe { payload_pool::initialize_payload_headers(payload_headers, payload_capacity) };
 
         header.magic.store(MAGIC, Ordering::Release);
     }
 
-    fn join<T>(file: &File) -> Result<(Arc<Region>, NonNull<Self>), Error> {
+    fn join<T, const CONSUMER_SLOTS: usize>(
+        file: &File,
+    ) -> Result<(Arc<Region>, NonNull<Self>), Error> {
         let file_size = file.metadata()?.len() as usize;
         if file_size < core::mem::size_of::<Self>() {
             return Err(Error::InvalidBufferSize);
@@ -1183,15 +1284,23 @@ impl SharedQueueHeader {
                     actual: header_ref.version,
                 });
             }
+            if header_ref.consumer_slots as usize != CONSUMER_SLOTS {
+                return Err(Error::InvalidConsumerSlots {
+                    expected: CONSUMER_SLOTS,
+                    actual: header_ref.consumer_slots as usize,
+                });
+            }
             let ring_capacity = (header_ref.buffer_mask as usize).wrapping_add(1);
-            Self::validate_ring_capacity_for_file::<T>(ring_capacity, file_size)?;
+            Self::validate_ring_capacity_for_file::<T, CONSUMER_SLOTS>(ring_capacity, file_size)?;
         }
 
         Ok((region, header))
     }
 
-    unsafe fn ring_from_header(header: NonNull<Self>) -> NonNull<AtomicU64> {
-        let offset = Self::ring_offset();
+    unsafe fn ring_from_header<const CONSUMER_SLOTS: usize>(
+        header: NonNull<Self>,
+    ) -> NonNull<AtomicU64> {
+        let offset = Self::ring_offset::<CONSUMER_SLOTS>();
         // SAFETY: caller guarantees the allocation includes the ring layout.
         unsafe { header.byte_add(offset).cast() }
     }
@@ -1202,19 +1311,31 @@ impl SharedQueueHeader {
         unsafe { header.byte_add(offset).cast() }
     }
 
-    unsafe fn payload_headers_from_header(
+    unsafe fn payload_headers_from_header<const CONSUMER_SLOTS: usize>(
         header: NonNull<Self>,
         ring_capacity: usize,
     ) -> NonNull<PayloadHeader> {
-        let offset = Self::payload_headers_offset(ring_capacity);
+        let offset = Self::payload_headers_offset::<CONSUMER_SLOTS>(ring_capacity);
         // SAFETY: caller guarantees the allocation includes the payload-header layout.
         unsafe { header.byte_add(offset).cast() }
     }
 
-    unsafe fn payloads_from_header<T>(header: NonNull<Self>, ring_capacity: usize) -> NonNull<T> {
-        let offset = Self::payloads_offset::<T>(ring_capacity);
+    unsafe fn payloads_from_header<T, const CONSUMER_SLOTS: usize>(
+        header: NonNull<Self>,
+        ring_capacity: usize,
+    ) -> NonNull<T> {
+        let offset = Self::payloads_offset::<T, CONSUMER_SLOTS>(ring_capacity);
         // SAFETY: caller guarantees the allocation includes the payload layout.
         unsafe { header.byte_add(offset).cast() }
+    }
+}
+
+const fn checked_next_multiple_of(value: usize, multiple: usize) -> Option<usize> {
+    let remainder = value % multiple;
+    if remainder == 0 {
+        Some(value)
+    } else {
+        value.checked_add(multiple - remainder)
     }
 }
 
@@ -1253,15 +1374,15 @@ impl<I> WriteIterResult<I> {
 }
 
 #[must_use]
-pub struct WriteBatch<'a, T> {
-    queue: &'a SharedQueue<T>,
+pub struct WriteBatch<'a, T, const CONSUMER_SLOTS: usize = DEFAULT_CONSUMER_SLOTS> {
+    queue: &'a SharedQueue<T, CONSUMER_SLOTS>,
     chain: ReservedPayloads,
     next_write_payload_index: u32,
     written: usize,
     _marker: PhantomData<&'a mut T>,
 }
 
-impl<'a, T> WriteBatch<'a, T> {
+impl<'a, T, const CONSUMER_SLOTS: usize> WriteBatch<'a, T, CONSUMER_SLOTS> {
     pub fn len(&self) -> usize {
         self.chain.len()
     }
@@ -1338,22 +1459,22 @@ impl<'a, T> WriteBatch<'a, T> {
     }
 }
 
-impl<'a, T> Drop for WriteBatch<'a, T> {
+impl<'a, T, const CONSUMER_SLOTS: usize> Drop for WriteBatch<'a, T, CONSUMER_SLOTS> {
     fn drop(&mut self) {
         self.queue.payload_pool.cancel_reserved_payloads(self.chain);
     }
 }
 
 #[must_use]
-pub struct DirectRead<'a, T> {
+pub struct DirectRead<'a, T, const CONSUMER_SLOTS: usize = DEFAULT_CONSUMER_SLOTS> {
     next: &'a mut usize,
-    queue: &'a SharedQueue<T>,
+    queue: &'a SharedQueue<T, CONSUMER_SLOTS>,
     hazard: ConsumerHazard,
     start: usize,
     payload: ProtectedPayload,
 }
 
-impl<'a, T> DirectRead<'a, T> {
+impl<'a, T, const CONSUMER_SLOTS: usize> DirectRead<'a, T, CONSUMER_SLOTS> {
     /// Returns a raw pointer to the hazard-protected payload.
     pub fn as_ptr(&self) -> *const T {
         self.queue
@@ -1380,7 +1501,7 @@ impl<'a, T> DirectRead<'a, T> {
     }
 }
 
-impl<'a, T> AsRef<T> for DirectRead<'a, T> {
+impl<'a, T, const CONSUMER_SLOTS: usize> AsRef<T> for DirectRead<'a, T, CONSUMER_SLOTS> {
     /// Returns a shared reference to the hazard-protected payload.
     fn as_ref(&self) -> &T {
         // SAFETY: This guard publishes a hazard for an initialized payload.
@@ -1393,22 +1514,22 @@ impl<'a, T> AsRef<T> for DirectRead<'a, T> {
     }
 }
 
-impl<'a, T> Drop for DirectRead<'a, T> {
+impl<'a, T, const CONSUMER_SLOTS: usize> Drop for DirectRead<'a, T, CONSUMER_SLOTS> {
     fn drop(&mut self) {
         self.hazard.clear();
     }
 }
 
 #[must_use]
-pub struct DirectReadBatch<'a, T> {
+pub struct DirectReadBatch<'a, T, const CONSUMER_SLOTS: usize = DEFAULT_CONSUMER_SLOTS> {
     next: &'a mut usize,
-    queue: &'a SharedQueue<T>,
+    queue: &'a SharedQueue<T, CONSUMER_SLOTS>,
     hazard: ConsumerHazard,
     start: usize,
     payloads: &'a mut Vec<ProtectedPayload>,
 }
 
-impl<'a, T> DirectReadBatch<'a, T> {
+impl<'a, T, const CONSUMER_SLOTS: usize> DirectReadBatch<'a, T, CONSUMER_SLOTS> {
     pub fn len(&self) -> usize {
         self.payloads.len()
     }
@@ -1463,7 +1584,7 @@ impl<'a, T> DirectReadBatch<'a, T> {
     }
 }
 
-impl<'a, T> Drop for DirectReadBatch<'a, T> {
+impl<'a, T, const CONSUMER_SLOTS: usize> Drop for DirectReadBatch<'a, T, CONSUMER_SLOTS> {
     fn drop(&mut self) {
         self.hazard.clear();
         self.payloads.clear();
@@ -1480,10 +1601,21 @@ mod tests {
     const BUFFER_SIZE: usize = minimum_file_size::<Item>(BUFFER_CAPACITY);
 
     fn create_test_queue<T>(file_size: usize) -> (File, Producer<T>, Consumer<T>) {
+        create_test_queue_with_slots::<T, DEFAULT_CONSUMER_SLOTS>(file_size)
+    }
+
+    fn create_test_queue_with_slots<T, const CONSUMER_SLOTS: usize>(
+        file_size: usize,
+    ) -> (
+        File,
+        Producer<T, CONSUMER_SLOTS>,
+        Consumer<T, CONSUMER_SLOTS>,
+    ) {
         let file = create_temp_shmem_file().unwrap();
-        let producer =
-            unsafe { Producer::create(&file, file_size) }.expect("Failed to create producer");
-        let consumer = unsafe { Consumer::join(&file) }.expect("Failed to join consumer");
+        let producer = unsafe { Producer::<T, CONSUMER_SLOTS>::create(&file, file_size) }
+            .expect("Failed to create producer");
+        let consumer =
+            unsafe { Consumer::<T, CONSUMER_SLOTS>::join(&file) }.expect("Failed to join consumer");
 
         (file, producer, consumer)
     }
@@ -1934,13 +2066,47 @@ mod tests {
     }
 
     #[test]
-    fn test_consumer_slots_exhaustion_and_drop_releases_slot() {
+    fn test_join_rejects_consumer_slot_mismatch() {
+        const CREATED_SLOTS: usize = 2;
+        const JOINED_SLOTS: usize = 3;
+        const BUFFER_SIZE: usize =
+            minimum_file_size_for_consumer_slots::<Item, CREATED_SLOTS>(BUFFER_CAPACITY);
+
         let file = create_temp_shmem_file().unwrap();
-        let producer =
-            unsafe { Producer::<Item>::create(&file, BUFFER_SIZE) }.expect("create failed");
+        let _producer = unsafe { Producer::<Item, CREATED_SLOTS>::create(&file, BUFFER_SIZE) }
+            .expect("create failed");
+
+        match unsafe { Producer::<Item, JOINED_SLOTS>::join(&file) } {
+            Err(Error::InvalidConsumerSlots { expected, actual }) => {
+                assert_eq!(expected, JOINED_SLOTS);
+                assert_eq!(actual, CREATED_SLOTS);
+            }
+            Err(err) => panic!("unexpected producer join error: {err}"),
+            Ok(_) => panic!("producer join unexpectedly succeeded"),
+        }
+
+        match unsafe { Consumer::<Item, JOINED_SLOTS>::join(&file) } {
+            Err(Error::InvalidConsumerSlots { expected, actual }) => {
+                assert_eq!(expected, JOINED_SLOTS);
+                assert_eq!(actual, CREATED_SLOTS);
+            }
+            Err(err) => panic!("unexpected consumer join error: {err}"),
+            Ok(_) => panic!("consumer join unexpectedly succeeded"),
+        }
+    }
+
+    #[test]
+    fn test_consumer_slots_exhaustion_and_drop_releases_slot() {
+        const CONSUMER_SLOTS: usize = 2;
+        const BUFFER_SIZE: usize =
+            minimum_file_size_for_consumer_slots::<Item, CONSUMER_SLOTS>(BUFFER_CAPACITY);
+
+        let file = create_temp_shmem_file().unwrap();
+        let producer = unsafe { Producer::<Item, CONSUMER_SLOTS>::create(&file, BUFFER_SIZE) }
+            .expect("create failed");
         let mut consumers = Vec::new();
 
-        for _ in 0..MAX_CONSUMERS {
+        for _ in 0..CONSUMER_SLOTS {
             consumers.push(producer.join_as_consumer().expect("join consumer"));
         }
 
@@ -1956,10 +2122,15 @@ mod tests {
 
     #[test]
     fn test_consumer_try_clone_reports_slot_exhaustion() {
-        let (_file, _producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        const CONSUMER_SLOTS: usize = 2;
+        const BUFFER_SIZE: usize =
+            minimum_file_size_for_consumer_slots::<Item, CONSUMER_SLOTS>(BUFFER_CAPACITY);
+
+        let (_file, _producer, consumer) =
+            create_test_queue_with_slots::<Item, CONSUMER_SLOTS>(BUFFER_SIZE);
         let mut consumers = Vec::new();
 
-        for _ in 1..MAX_CONSUMERS {
+        for _ in 1..CONSUMER_SLOTS {
             consumers.push(consumer.try_clone().expect("clone consumer"));
         }
 
@@ -2021,5 +2192,8 @@ mod tests {
         );
         assert!(std::panic::catch_unwind(|| minimum_region_size::<u64>(usize::MAX)).is_err());
         assert!(std::panic::catch_unwind(|| minimum_file_size::<()>(1)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| minimum_file_size_for_consumer_slots::<u64, 0>(1)).is_err()
+        );
     }
 }

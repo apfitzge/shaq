@@ -85,6 +85,13 @@ fn parse_config_or_exit() -> Config {
         Some("broadcast") => {
             let producers = parse_usize_arg(positional.get(1).cloned(), 2, "producers");
             let consumers = parse_usize_arg(positional.get(2).cloned(), 2, "consumers");
+            if consumers > broadcast::DEFAULT_CONSUMER_SLOTS {
+                eprintln!(
+                    "Broadcast consumers cannot exceed {} in this example",
+                    broadcast::DEFAULT_CONSUMER_SLOTS
+                );
+                std::process::exit(2);
+            }
             if positional.len() > 3 {
                 eprintln!("Too many arguments for broadcast mode");
                 print_usage();
@@ -119,6 +126,10 @@ fn parse_usize_arg(value: Option<String>, default: usize, name: &str) -> usize {
 fn print_usage() {
     eprintln!(
         "Usage: cargo run --example enqueue_dequeue -- [-v|--verbose] [spsc|mpmc [producers] [consumers]|broadcast [producers] [consumers]]"
+    );
+    eprintln!(
+        "Broadcast consumers are capped at {} in this example",
+        broadcast::DEFAULT_CONSUMER_SLOTS
     );
 }
 
