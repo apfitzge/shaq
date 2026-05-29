@@ -35,6 +35,10 @@
 //! the broadcast ring is lossy. Old overwritten payloads are reclaimed only
 //! after the new publication is visible, keeping the serialized publication
 //! window as small as possible.
+//! Producer handles keep a process-local payload cache to reduce shared free-list
+//! traffic. Normal producer drop returns cached payloads to shared memory; an
+//! abandoned producer may strand cached payloads until
+//! [`Producer::recover_as_exclusive`] is used.
 //!
 //! Zero-sized payload types and payload types whose alignment exceeds the shared
 //! memory region alignment are not supported.
@@ -43,6 +47,7 @@ mod payload_pool;
 
 use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomicSize, VERSION};
 use core::{
+    cell::UnsafeCell,
     marker::PhantomData,
     mem::ManuallyDrop,
     ptr::NonNull,
@@ -57,10 +62,13 @@ use std::{fs::File, sync::Arc};
 /// Unique identifier for broadcast queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
 const MAX_RING_CAPACITY: usize = 1usize << 30;
+const PRODUCER_PAYLOAD_CACHE_REFILL: usize = 64;
+const PRODUCER_RETIRED_RECLAIM_THRESHOLD: usize = 64;
 pub const DEFAULT_CONSUMER_SLOTS: usize = 8;
 
 pub struct Producer<T, const CONSUMER_SLOTS: usize = DEFAULT_CONSUMER_SLOTS> {
     queue: SharedQueue<T, CONSUMER_SLOTS>,
+    local: UnsafeCell<ProducerLocal>,
 }
 
 impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
@@ -84,6 +92,8 @@ impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
     ///   payloads may also be overwritten, cancelled, or recovered without
     ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
     ///   make those operations valid.
+    /// - If a producer exits without dropping its handle, payloads in that
+    ///   producer's local cache remain unavailable until exclusive recovery.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
         // designated sole initializer.
@@ -108,6 +118,8 @@ impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
     ///   payloads may also be overwritten, cancelled, or recovered without
     ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
     ///   make those operations valid.
+    /// - If a producer exits without dropping its handle, payloads in that
+    ///   producer's local cache remain unavailable until exclusive recovery.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (region, header) = SharedQueueHeader::join::<T, CONSUMER_SLOTS>(file)?;
         // SAFETY: `header` belongs to `region` and was validated by join.
@@ -137,6 +149,7 @@ impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
         Ok(Self {
             // SAFETY: forwarded from this function's safety contract.
             queue: unsafe { SharedQueue::from_header(region, header) }?,
+            local: UnsafeCell::new(ProducerLocal::new()),
         })
     }
 
@@ -170,9 +183,9 @@ impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
     /// reservation uses one pool reservation operation for the whole batch.
     #[must_use]
     pub fn reserve_write_batch(&self, count: usize) -> Option<WriteBatch<'_, T, CONSUMER_SLOTS>> {
-        let chain = self.queue.reserve_write_batch(count)?;
+        let chain = self.with_local(|local| self.queue.reserve_write_batch(count, local))?;
         Some(WriteBatch {
-            queue: &self.queue,
+            producer: self,
             chain,
             next_write_payload_index: chain.first_payload_index(),
             written: 0,
@@ -189,7 +202,27 @@ impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
     /// - Racing with any live producer or consumer process/thread may corrupt the
     ///   queue.
     pub unsafe fn recover_as_exclusive(&self) {
+        self.with_local(|local| *local = ProducerLocal::new());
         self.queue.recover_as_exclusive();
+    }
+
+    #[inline]
+    fn with_local<R>(&self, f: impl FnOnce(&mut ProducerLocal) -> R) -> R {
+        // SAFETY: `Producer` is not `Sync`, so this handle cannot be used
+        // concurrently from multiple threads without external synchronization.
+        f(unsafe { &mut *self.local.get() })
+    }
+
+    fn publish_reserved_payload_chain(&self, chain: ReservedPayloads) {
+        self.with_local(|local| self.queue.publish_reserved_payload_chain(chain, local));
+    }
+
+    fn cancel_reserved_payloads(&self, chain: ReservedPayloads) {
+        self.with_local(|local| self.queue.cancel_reserved_payloads(chain, local));
+    }
+
+    fn flush_local(&self) {
+        self.with_local(|local| self.queue.flush_producer_local(local));
     }
 }
 
@@ -197,12 +230,18 @@ impl<T, const CONSUMER_SLOTS: usize> Clone for Producer<T, CONSUMER_SLOTS> {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
+            local: UnsafeCell::new(ProducerLocal::new()),
         }
     }
 }
 
+impl<T, const CONSUMER_SLOTS: usize> Drop for Producer<T, CONSUMER_SLOTS> {
+    fn drop(&mut self) {
+        self.flush_local();
+    }
+}
+
 unsafe impl<T: Send, const CONSUMER_SLOTS: usize> Send for Producer<T, CONSUMER_SLOTS> {}
-unsafe impl<T: Send + Sync, const CONSUMER_SLOTS: usize> Sync for Producer<T, CONSUMER_SLOTS> {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TryReadError {
@@ -280,6 +319,7 @@ impl<T, const CONSUMER_SLOTS: usize> Consumer<T, CONSUMER_SLOTS> {
     pub fn join_as_producer(&self) -> Producer<T, CONSUMER_SLOTS> {
         Producer {
             queue: self.queue.clone(),
+            local: UnsafeCell::new(ProducerLocal::new()),
         }
     }
 
@@ -405,7 +445,7 @@ impl<T, const CONSUMER_SLOTS: usize> Consumer<T, CONSUMER_SLOTS> {
 
         self.hazard.protect(start, 1);
         let handle = self.queue.handle_at(start);
-        let Some(payload) = self.queue.payload_pool.payload_for_handle(handle) else {
+        let Some(payload) = self.queue.payload_pool.payload_for_protected_handle(handle) else {
             self.hazard.clear();
             return Err(Self::record_current_overrun(
                 &self.queue,
@@ -453,7 +493,7 @@ impl<T, const CONSUMER_SLOTS: usize> Consumer<T, CONSUMER_SLOTS> {
         for index in 0..count {
             let position = start.wrapping_add(index);
             let handle = queue.handle_at(position);
-            let Some(payload) = queue.payload_pool.payload_for_handle(handle) else {
+            let Some(payload) = queue.payload_pool.payload_for_protected_handle(handle) else {
                 self.hazard.clear();
                 payloads.clear();
                 return Err(Self::record_current_overrun(
@@ -584,6 +624,20 @@ struct WindowOverrun {
     next: usize,
 }
 
+struct ProducerLocal {
+    free: PayloadReleaseBatch,
+    retired: PayloadReleaseBatch,
+}
+
+impl ProducerLocal {
+    const fn new() -> Self {
+        Self {
+            free: PayloadReleaseBatch::new(),
+            retired: PayloadReleaseBatch::new(),
+        }
+    }
+}
+
 #[repr(C, align(64))]
 struct CacheAlignedAtomicU64 {
     inner: AtomicU64,
@@ -631,11 +685,11 @@ impl ConsumerHazardSlot {
     fn protect(&self, start: usize, end: usize) {
         self.start.store(start, Ordering::Relaxed);
         self.end.store(end, Ordering::Relaxed);
-        self.state.store(HAZARD_ACTIVE, Ordering::SeqCst);
+        self.state.store(HAZARD_ACTIVE, Ordering::Release);
     }
 
     fn clear(&self) {
-        self.state.store(HAZARD_INACTIVE, Ordering::SeqCst);
+        self.state.store(HAZARD_INACTIVE, Ordering::Release);
     }
 
     fn release_owner(&self) {
@@ -654,7 +708,7 @@ impl ConsumerHazardSlot {
     }
 
     fn active_range(&self) -> Option<HazardRange> {
-        if self.state.load(Ordering::SeqCst) != HAZARD_ACTIVE {
+        if self.state.load(Ordering::Acquire) != HAZARD_ACTIVE {
             return None;
         }
 
@@ -778,15 +832,44 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
         }
     }
 
-    fn reserve_write_batch(&self, count: usize) -> Option<ReservedPayloads> {
+    fn reserve_write_batch(
+        &self,
+        count: usize,
+        local: &mut ProducerLocal,
+    ) -> Option<ReservedPayloads> {
         if count == 0 || count > self.capacity() {
             return None;
         }
 
-        self.payload_pool.reserve_payloads_exact(count).or_else(|| {
-            self.reclaim_retired_payloads();
-            self.payload_pool.reserve_payloads_exact(count)
-        })
+        if let Some(chain) = self.reserve_from_local_free(count, local) {
+            return Some(chain);
+        }
+
+        self.reclaim_local_retired(local);
+        if let Some(chain) = self.reserve_from_local_free(count, local) {
+            return Some(chain);
+        }
+
+        self.reclaim_shared_retired(local);
+        if let Some(chain) = self.reserve_from_local_free(count, local) {
+            return Some(chain);
+        }
+
+        let refill_count = count
+            .max(PRODUCER_PAYLOAD_CACHE_REFILL)
+            .min(self.capacity());
+        if let Some(refill) = self.payload_pool.take_free_payloads_exact(refill_count) {
+            self.payload_pool
+                .prepend_reserved_payloads_to_batch(refill, &mut local.free);
+        } else if refill_count != count {
+            let refill = self.payload_pool.take_free_payloads_exact(count)?;
+            self.payload_pool
+                .prepend_reserved_payloads_to_batch(refill, &mut local.free);
+        } else {
+            return None;
+        }
+
+        self.reserve_from_local_free(count, local)
     }
 
     fn reserve_ring_positions(&self, count: usize) -> usize {
@@ -820,12 +903,11 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
         }
     }
 
-    fn publish_reserved_payload_chain(&self, chain: ReservedPayloads) {
+    fn publish_reserved_payload_chain(&self, chain: ReservedPayloads, local: &mut ProducerLocal) {
         let count = chain.len();
         debug_assert!(count != 0 && count <= self.capacity());
 
         let start = self.reserve_ring_positions(count);
-        let mut retire_batch = PayloadReleaseBatch::new();
         let mut cursor = self
             .payload_pool
             .payload_cursor(chain.first_payload_index());
@@ -838,7 +920,7 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
             self.payload_pool.retire_to_batch(
                 old,
                 position.wrapping_sub(self.capacity()),
-                &mut retire_batch,
+                &mut local.retired,
             );
             if index != last_index {
                 cursor.advance();
@@ -846,11 +928,23 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
         }
 
         self.publish_reserved(start, count);
-        let hazards = self.hazard_snapshot();
+        if local.retired.len() >= PRODUCER_RETIRED_RECLAIM_THRESHOLD {
+            self.reclaim_local_retired(local);
+        }
+    }
+
+    fn cancel_reserved_payloads(&self, chain: ReservedPayloads, local: &mut ProducerLocal) {
         self.payload_pool
-            .reclaim_retired_batch(retire_batch, |sequence| hazards.protects(sequence));
-        self.payload_pool
-            .reclaim_retired_payloads(|sequence| hazards.protects(sequence));
+            .prepend_reserved_payloads_to_batch(chain, &mut local.free);
+    }
+
+    fn flush_producer_local(&self, local: &mut ProducerLocal) {
+        self.reclaim_local_retired(local);
+
+        let free = local.free.take();
+        let retired = local.retired.take();
+        self.payload_pool.flush_release_batch(free);
+        self.payload_pool.flush_retired_batch(retired);
     }
 
     fn publish_reserved(&self, start: usize, count: usize) {
@@ -869,7 +963,9 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
         let ring_index = position & self.buffer_mask;
         // SAFETY: Mask ensures index is in bounds.
         let cell = unsafe { self.ring.add(ring_index).as_ref() };
-        PayloadHandle(cell.swap(handle.0, Ordering::AcqRel))
+        let old = PayloadHandle(cell.load(Ordering::Acquire));
+        cell.store(handle.0, Ordering::Release);
+        old
     }
 
     #[inline]
@@ -917,10 +1013,40 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
         snapshot
     }
 
-    fn reclaim_retired_payloads(&self) {
+    fn reserve_from_local_free(
+        &self,
+        count: usize,
+        local: &mut ProducerLocal,
+    ) -> Option<ReservedPayloads> {
+        let chain = self
+            .payload_pool
+            .pop_batch_payloads_exact(&mut local.free, count)?;
+        self.payload_pool.prepare_reserved_payloads(chain);
+        Some(chain)
+    }
+
+    fn reclaim_local_retired(&self, local: &mut ProducerLocal) {
+        if local.retired.is_empty() {
+            return;
+        }
+
         let hazards = self.hazard_snapshot();
-        self.payload_pool
-            .reclaim_retired_payloads(|sequence| hazards.protects(sequence));
+        let retired = local.retired.take();
+        self.payload_pool.reclaim_retired_batch_to_batches(
+            retired,
+            |sequence| hazards.protects(sequence),
+            &mut local.free,
+            &mut local.retired,
+        );
+    }
+
+    fn reclaim_shared_retired(&self, local: &mut ProducerLocal) {
+        let hazards = self.hazard_snapshot();
+        self.payload_pool.reclaim_retired_payloads_to_batches(
+            |sequence| hazards.protects(sequence),
+            &mut local.free,
+            &mut local.retired,
+        );
     }
 
     fn recover_as_exclusive(&self) {
@@ -1375,7 +1501,7 @@ impl<I> WriteIterResult<I> {
 
 #[must_use]
 pub struct WriteBatch<'a, T, const CONSUMER_SLOTS: usize = DEFAULT_CONSUMER_SLOTS> {
-    queue: &'a SharedQueue<T, CONSUMER_SLOTS>,
+    producer: &'a Producer<T, CONSUMER_SLOTS>,
     chain: ReservedPayloads,
     next_write_payload_index: u32,
     written: usize,
@@ -1396,8 +1522,11 @@ impl<'a, T, const CONSUMER_SLOTS: usize> WriteBatch<'a, T, CONSUMER_SLOTS> {
         let payload_index = self.next_write_payload_index;
         self.written += 1;
         if self.written != self.len() {
-            self.next_write_payload_index =
-                self.queue.payload_pool.next_payload_index(payload_index);
+            self.next_write_payload_index = self
+                .producer
+                .queue
+                .payload_pool
+                .next_payload_index(payload_index);
         }
         payload_index
     }
@@ -1414,7 +1543,8 @@ impl<'a, T, const CONSUMER_SLOTS: usize> WriteBatch<'a, T, CONSUMER_SLOTS> {
         let payload_index = self.advance_payload();
         // SAFETY: This batch owns the reserved payload.
         unsafe {
-            self.queue
+            self.producer
+                .queue
                 .payload_pool
                 .payload_at(payload_index)
                 .as_ptr()
@@ -1455,13 +1585,13 @@ impl<'a, T, const CONSUMER_SLOTS: usize> WriteBatch<'a, T, CONSUMER_SLOTS> {
     pub fn publish(self) {
         assert_eq!(self.written, self.len());
         let this = ManuallyDrop::new(self);
-        this.queue.publish_reserved_payload_chain(this.chain);
+        this.producer.publish_reserved_payload_chain(this.chain);
     }
 }
 
 impl<'a, T, const CONSUMER_SLOTS: usize> Drop for WriteBatch<'a, T, CONSUMER_SLOTS> {
     fn drop(&mut self) {
-        self.queue.payload_pool.cancel_reserved_payloads(self.chain);
+        self.producer.cancel_reserved_payloads(self.chain);
     }
 }
 
@@ -1713,6 +1843,27 @@ mod tests {
 
         assert!(producer.reserve_write_batch(BUFFER_CAPACITY).is_some());
         assert_eq!(consumer.try_read(), Err(TryReadError::Empty));
+    }
+
+    #[test]
+    fn test_producer_drop_flushes_local_payload_cache() {
+        let file = create_temp_shmem_file().unwrap();
+        let producer1 =
+            unsafe { Producer::<Item>::create(&file, BUFFER_SIZE) }.expect("create failed");
+        let producer2 = unsafe { Producer::<Item>::join(&file) }.expect("join failed");
+
+        let batch = producer1.reserve_write_batch(1).expect("reserve cached");
+        drop(batch);
+
+        let held = producer2
+            .reserve_write_batch(BUFFER_CAPACITY)
+            .expect("reserve remaining shared payloads");
+        assert!(producer2.reserve_write_batch(1).is_none());
+
+        drop(producer1);
+
+        assert!(producer2.reserve_write_batch(1).is_some());
+        drop(held);
     }
 
     #[test]

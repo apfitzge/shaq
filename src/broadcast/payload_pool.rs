@@ -113,6 +113,7 @@ impl ProtectedPayload {
 pub(super) struct PayloadReleaseBatch {
     first_payload_index: Option<u32>,
     last_payload_index: Option<u32>,
+    count: usize,
 }
 
 impl PayloadReleaseBatch {
@@ -121,7 +122,23 @@ impl PayloadReleaseBatch {
         Self {
             first_payload_index: None,
             last_payload_index: None,
+            count: 0,
         }
+    }
+
+    #[inline]
+    pub(super) fn len(&self) -> usize {
+        self.count
+    }
+
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    #[inline]
+    pub(super) fn take(&mut self) -> Self {
+        core::mem::replace(self, Self::new())
     }
 }
 
@@ -163,33 +180,45 @@ impl<T> PayloadPool<T> {
         }
     }
 
-    #[inline]
     #[cfg(test)]
     pub(super) fn capacity(&self) -> usize {
         self.capacity
     }
 
+    #[cfg(test)]
     pub(super) fn reserve_payloads_exact(&self, count: usize) -> Option<ReservedPayloads> {
         if count == 0 {
             return None;
         }
 
-        let chain = self.pop_free_payloads_exact(count)?;
+        let chain = self.take_free_payloads_exact(count)?;
+        self.prepare_reserved_payloads(chain);
+        Some(chain)
+    }
+
+    pub(super) fn take_free_payloads_exact(&self, count: usize) -> Option<ReservedPayloads> {
+        if count == 0 {
+            return None;
+        }
+
+        self.pop_free_payloads_exact(count)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cancel_reserved_payloads(&self, chain: ReservedPayloads) {
+        debug_assert!(chain.count != 0);
+        self.push_free_payloads(chain.first_payload_index, chain.last_payload_index);
+    }
+
+    pub(super) fn prepare_reserved_payloads(&self, chain: ReservedPayloads) {
         let mut cursor = self.payload_cursor(chain.first_payload_index);
-        let last_index = count.wrapping_sub(1);
-        for index in 0..count {
+        let last_index = chain.count.wrapping_sub(1);
+        for index in 0..chain.count {
             self.prepare_reserved_payload(cursor.current());
             if index != last_index {
                 cursor.advance();
             }
         }
-
-        Some(chain)
-    }
-
-    pub(super) fn cancel_reserved_payloads(&self, chain: ReservedPayloads) {
-        debug_assert!(chain.count != 0);
-        self.push_free_payloads(chain.first_payload_index, chain.last_payload_index);
     }
 
     #[inline]
@@ -201,7 +230,15 @@ impl<T> PayloadPool<T> {
         PayloadHandle::new(payload_index, generation)
     }
 
-    pub(super) fn payload_for_handle(&self, handle: PayloadHandle) -> Option<ProtectedPayload> {
+    pub(super) fn payload_for_protected_handle(
+        &self,
+        handle: PayloadHandle,
+    ) -> Option<ProtectedPayload> {
+        self.valid_payload_index(handle).map(ProtectedPayload::new)
+    }
+
+    #[cfg(test)]
+    fn payload_for_handle(&self, handle: PayloadHandle) -> Option<ProtectedPayload> {
         let payload_index = self.valid_payload_index(handle)?;
         let generation = self
             .payload_header(payload_index)
@@ -234,6 +271,7 @@ impl<T> PayloadPool<T> {
         self.prepend_payload(payload_index, batch);
     }
 
+    #[cfg(test)]
     pub(super) fn reclaim_retired_batch<F>(&self, batch: PayloadReleaseBatch, is_protected: F)
     where
         F: FnMut(usize) -> bool,
@@ -243,12 +281,40 @@ impl<T> PayloadPool<T> {
         }
     }
 
+    pub(super) fn reclaim_retired_batch_to_batches<F>(
+        &self,
+        batch: PayloadReleaseBatch,
+        is_protected: F,
+        free_batch: &mut PayloadReleaseBatch,
+        retired_batch: &mut PayloadReleaseBatch,
+    ) where
+        F: FnMut(usize) -> bool,
+    {
+        if let Some(first) = batch.first_payload_index {
+            self.partition_retired_payload_chain(first, is_protected, free_batch, retired_batch);
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn reclaim_retired_payloads<F>(&self, is_protected: F)
     where
         F: FnMut(usize) -> bool,
     {
         if let Some(first) = self.take_retired_payloads() {
             self.reclaim_payload_chain(first, is_protected);
+        }
+    }
+
+    pub(super) fn reclaim_retired_payloads_to_batches<F>(
+        &self,
+        is_protected: F,
+        free_batch: &mut PayloadReleaseBatch,
+        retired_batch: &mut PayloadReleaseBatch,
+    ) where
+        F: FnMut(usize) -> bool,
+    {
+        if let Some(first) = self.take_retired_payloads() {
+            self.partition_retired_payload_chain(first, is_protected, free_batch, retired_batch);
         }
     }
 
@@ -262,6 +328,58 @@ impl<T> PayloadPool<T> {
         if let (Some(first), Some(last)) = (batch.first_payload_index, batch.last_payload_index) {
             self.push_free_payloads(first, last);
         }
+    }
+
+    pub(super) fn prepend_reserved_payloads_to_batch(
+        &self,
+        chain: ReservedPayloads,
+        batch: &mut PayloadReleaseBatch,
+    ) {
+        self.prepend_payload_chain(
+            chain.first_payload_index,
+            chain.last_payload_index,
+            chain.count,
+            batch,
+        );
+    }
+
+    pub(super) fn pop_batch_payloads_exact(
+        &self,
+        batch: &mut PayloadReleaseBatch,
+        count: usize,
+    ) -> Option<ReservedPayloads> {
+        if count == 0 || count > batch.count {
+            return None;
+        }
+
+        let first_payload_index = batch.first_payload_index?;
+        let mut last_payload_index = first_payload_index;
+        let last_index = count.wrapping_sub(1);
+        for index in 0..count {
+            if index != last_index {
+                last_payload_index = self.next_payload_index(last_payload_index);
+            }
+        }
+
+        let next = self
+            .payload_header(last_payload_index)
+            .next_free
+            .load(Ordering::Relaxed);
+        self.payload_header(last_payload_index)
+            .next_free
+            .store(EMPTY_PAYLOAD, Ordering::Relaxed);
+
+        batch.count -= count;
+        batch.first_payload_index = decode_payload_index(next);
+        if batch.count == 0 {
+            batch.last_payload_index = None;
+        }
+
+        Some(ReservedPayloads {
+            first_payload_index,
+            last_payload_index,
+            count,
+        })
     }
 
     #[inline]
@@ -315,12 +433,33 @@ impl<T> PayloadPool<T> {
             .store(generation, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn reclaim_payload_chain<F>(&self, first_payload_index: u32, mut is_protected: F)
     where
         F: FnMut(usize) -> bool,
     {
         let mut free_batch = PayloadReleaseBatch::new();
         let mut retired_batch = PayloadReleaseBatch::new();
+        self.partition_retired_payload_chain(
+            first_payload_index,
+            &mut is_protected,
+            &mut free_batch,
+            &mut retired_batch,
+        );
+
+        self.flush_release_batch(free_batch);
+        self.flush_retired_batch(retired_batch);
+    }
+
+    fn partition_retired_payload_chain<F>(
+        &self,
+        first_payload_index: u32,
+        mut is_protected: F,
+        free_batch: &mut PayloadReleaseBatch,
+        retired_batch: &mut PayloadReleaseBatch,
+    ) where
+        F: FnMut(usize) -> bool,
+    {
         let mut encoded = encode_payload_index(first_payload_index);
 
         while encoded != EMPTY_PAYLOAD {
@@ -330,16 +469,13 @@ impl<T> PayloadPool<T> {
             let sequence = payload_header.retired_sequence.load(Ordering::Relaxed);
 
             if is_protected(sequence) {
-                self.prepend_payload(payload_index, &mut retired_batch);
+                self.prepend_payload(payload_index, retired_batch);
             } else {
-                self.prepend_payload(payload_index, &mut free_batch);
+                self.prepend_payload(payload_index, free_batch);
             }
 
             encoded = next;
         }
-
-        self.flush_release_batch(free_batch);
-        self.flush_retired_batch(retired_batch);
     }
 
     fn valid_payload_index(&self, handle: PayloadHandle) -> Option<u32> {
@@ -503,6 +639,29 @@ impl<T> PayloadPool<T> {
             batch.last_payload_index = Some(payload_index);
         }
         batch.first_payload_index = Some(payload_index);
+        batch.count += 1;
+    }
+
+    fn prepend_payload_chain(
+        &self,
+        first_payload_index: u32,
+        last_payload_index: u32,
+        count: usize,
+        batch: &mut PayloadReleaseBatch,
+    ) {
+        debug_assert!(count != 0);
+        self.payload_header(last_payload_index).next_free.store(
+            batch
+                .first_payload_index
+                .map(encode_payload_index)
+                .unwrap_or(EMPTY_PAYLOAD),
+            Ordering::Relaxed,
+        );
+        if batch.last_payload_index.is_none() {
+            batch.last_payload_index = Some(last_payload_index);
+        }
+        batch.first_payload_index = Some(first_payload_index);
+        batch.count += count;
     }
 
     fn reset_free_links(&self) {

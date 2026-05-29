@@ -356,8 +356,9 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
         let queue_size = broadcast::minimum_file_size::<Item>(QUEUE_CAPACITY);
         let _ = BroadcastProducer::<Item>::create(&queue_file, queue_size).unwrap();
     }
-    // SAFETY: Queue was created above; joining once and sharing handles is safe.
-    let producer = Arc::new(unsafe { BroadcastProducer::<Item>::join(&queue_file) }.unwrap());
+    // SAFETY: Queue was created above; each cloned producer handle keeps its own
+    // local producer cache and can publish independently.
+    let producer = unsafe { BroadcastProducer::<Item>::join(&queue_file) }.unwrap();
 
     let mut handles = Vec::new();
 
@@ -464,7 +465,7 @@ fn run_mpmc_consumer(
 }
 
 fn run_broadcast_producer(
-    producer: Arc<BroadcastProducer<Item>>,
+    producer: BroadcastProducer<Item>,
     exit: Arc<AtomicBool>,
     report_prefix: Option<String>,
     total_items_produced: Arc<AtomicU64>,
