@@ -1,26 +1,27 @@
 use core::{
     ptr::NonNull,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 pub(super) const PAYLOADS_PER_RING_ENTRY: usize = 2;
 
 const EMPTY_PAYLOAD: u32 = 0;
 
-/// Payload descriptor. `state` is owned by the payload lifetime protocol;
-/// `next_free` is owned by the pool's free-payload implementation.
+/// Payload descriptor. `generation` is copied into ring handles; `next_free`
+/// links payloads through the free and retired lists.
 #[repr(C)]
 pub(super) struct PayloadHeader {
-    /// High 32 bits: generation. Low 32 bits: reference count.
-    state: AtomicU64,
+    generation: AtomicU32,
     next_free: AtomicU32,
+    retired_sequence: AtomicUsize,
 }
 
 impl PayloadHeader {
     const fn new(next_free: u32) -> Self {
         Self {
-            state: AtomicU64::new(0),
+            generation: AtomicU32::new(0),
             next_free: AtomicU32::new(next_free),
+            retired_sequence: AtomicUsize::new(0),
         }
     }
 }
@@ -50,36 +51,13 @@ impl PayloadHandle {
     }
 }
 
-/// Payload lifetime state: high 32 bits are generation, low 32 bits are the
-/// active reader/reference count.
+/// Payload pool head: high 32 bits are the ABA tag, low 32 bits are a nullable
+/// payload index encoded as `payload_index + 1`, with zero meaning empty.
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-struct PayloadLifetimeState(u64);
+struct PayloadPoolHead(u64);
 
-impl PayloadLifetimeState {
-    #[inline]
-    const fn new(generation: u32, refcnt: u32) -> Self {
-        Self(((generation as u64) << 32) | refcnt as u64)
-    }
-
-    #[inline]
-    fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-
-    #[inline]
-    fn refcnt(self) -> u32 {
-        self.0 as u32
-    }
-}
-
-/// Payload pool free head: high 32 bits are the ABA tag, low 32 bits are a
-/// nullable payload index encoded as `payload_index + 1`, with zero meaning empty.
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-struct PayloadPoolFreeHead(u64);
-
-impl PayloadPoolFreeHead {
+impl PayloadPoolHead {
     #[inline]
     const fn new(encoded_first: u32, tag: u32) -> Self {
         Self(((tag as u64) << 32) | encoded_first as u64)
@@ -116,28 +94,19 @@ impl ReservedPayloads {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct PinnedPayload {
-    handle: PayloadHandle,
+pub(super) struct ProtectedPayload {
     payload_index: u32,
 }
 
-impl PinnedPayload {
+impl ProtectedPayload {
     #[inline]
-    fn new(handle: PayloadHandle, payload_index: u32) -> Self {
-        Self {
-            handle,
-            payload_index,
-        }
+    fn new(payload_index: u32) -> Self {
+        Self { payload_index }
     }
 
     #[inline]
     fn payload_index(self) -> u32 {
         self.payload_index
-    }
-
-    #[inline]
-    pub(super) fn handle(self) -> PayloadHandle {
-        self.handle
     }
 }
 
@@ -158,6 +127,7 @@ impl PayloadReleaseBatch {
 
 pub(super) struct PayloadPool<T> {
     free_head: NonNull<AtomicU64>,
+    retired_head: NonNull<AtomicU64>,
     payload_headers: NonNull<PayloadHeader>,
     payloads: NonNull<T>,
     capacity: usize,
@@ -167,6 +137,7 @@ impl<T> Clone for PayloadPool<T> {
     fn clone(&self) -> Self {
         Self {
             free_head: self.free_head,
+            retired_head: self.retired_head,
             payload_headers: self.payload_headers,
             payloads: self.payloads,
             capacity: self.capacity,
@@ -178,12 +149,14 @@ impl<T> PayloadPool<T> {
     #[inline]
     pub(super) fn new(
         free_head: NonNull<AtomicU64>,
+        retired_head: NonNull<AtomicU64>,
         payload_headers: NonNull<PayloadHeader>,
         payloads: NonNull<T>,
         capacity: usize,
     ) -> Self {
         Self {
             free_head,
+            retired_head,
             payload_headers,
             payloads,
             capacity,
@@ -216,82 +189,72 @@ impl<T> PayloadPool<T> {
 
     pub(super) fn cancel_reserved_payloads(&self, chain: ReservedPayloads) {
         debug_assert!(chain.count != 0);
-
-        let mut cursor = self.payload_cursor(chain.first_payload_index);
-        let last_index = chain.count.wrapping_sub(1);
-        for index in 0..chain.count {
-            let payload_index = cursor.current();
-            let payload_header = self.payload_header(payload_index);
-            let generation =
-                PayloadLifetimeState(payload_header.state.load(Ordering::Relaxed)).generation();
-            payload_header.state.store(
-                PayloadLifetimeState::new(generation, 0).0,
-                Ordering::Relaxed,
-            );
-            if index != last_index {
-                cursor.advance();
-            }
-        }
         self.push_free_payloads(chain.first_payload_index, chain.last_payload_index);
     }
 
     #[inline]
     pub(super) fn handle_for_payload(&self, payload_index: u32) -> PayloadHandle {
-        let state = PayloadLifetimeState(
-            self.payload_header(payload_index)
-                .state
-                .load(Ordering::Relaxed),
-        );
-        PayloadHandle::new(payload_index, state.generation())
+        let generation = self
+            .payload_header(payload_index)
+            .generation
+            .load(Ordering::Relaxed);
+        PayloadHandle::new(payload_index, generation)
     }
 
-    pub(super) fn pin(&self, handle: PayloadHandle) -> Option<PinnedPayload> {
-        let payload_index = handle.payload_index()?;
-        if payload_index as usize >= self.capacity {
-            return None;
+    pub(super) fn payload_for_handle(&self, handle: PayloadHandle) -> Option<ProtectedPayload> {
+        let payload_index = self.valid_payload_index(handle)?;
+        let generation = self
+            .payload_header(payload_index)
+            .generation
+            .load(Ordering::Acquire);
+        if generation == handle.generation() {
+            Some(ProtectedPayload::new(payload_index))
+        } else {
+            None
         }
+    }
 
-        let generation = handle.generation();
+    pub(super) fn retire_to_batch(
+        &self,
+        handle: PayloadHandle,
+        sequence: usize,
+        batch: &mut PayloadReleaseBatch,
+    ) {
+        let Some(payload_index) = self.valid_payload_index(handle) else {
+            return;
+        };
         let payload_header = self.payload_header(payload_index);
-        let mut state = PayloadLifetimeState(payload_header.state.load(Ordering::Acquire));
-        loop {
-            if state.generation() != generation {
-                return None;
-            }
-            let refcnt = state.refcnt();
-            if refcnt == 0 || refcnt == u32::MAX {
-                return None;
-            }
-            let new_state = PayloadLifetimeState::new(generation, refcnt.wrapping_add(1));
-            match payload_header.state.compare_exchange_weak(
-                state.0,
-                new_state.0,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(PinnedPayload::new(handle, payload_index)),
-                Err(current) => state = PayloadLifetimeState(current),
-            }
+        if payload_header.generation.load(Ordering::Acquire) != handle.generation() {
+            return;
+        }
+
+        payload_header
+            .retired_sequence
+            .store(sequence, Ordering::Relaxed);
+        self.prepend_payload(payload_index, batch);
+    }
+
+    pub(super) fn reclaim_retired_batch<F>(&self, batch: PayloadReleaseBatch, is_protected: F)
+    where
+        F: FnMut(usize) -> bool,
+    {
+        if let Some(first) = batch.first_payload_index {
+            self.reclaim_payload_chain(first, is_protected);
         }
     }
 
-    pub(super) fn release_handle(&self, handle: PayloadHandle) {
-        if let Some(payload_index) = self.release_candidate(handle) {
-            self.push_free_payloads(payload_index, payload_index);
+    pub(super) fn reclaim_retired_payloads<F>(&self, is_protected: F)
+    where
+        F: FnMut(usize) -> bool,
+    {
+        if let Some(first) = self.take_retired_payloads() {
+            self.reclaim_payload_chain(first, is_protected);
         }
     }
 
-    pub(super) fn release_pinned_payloads(&self, payloads: &[PinnedPayload]) {
-        let mut batch = PayloadReleaseBatch::new();
-        for payload in payloads {
-            self.release_to_batch(payload.handle, &mut batch);
-        }
-        self.flush_release_batch(batch);
-    }
-
-    pub(super) fn release_to_batch(&self, handle: PayloadHandle, batch: &mut PayloadReleaseBatch) {
-        if let Some(payload_index) = self.release_candidate(handle) {
-            self.prepend_free_payload(payload_index, batch);
+    pub(super) fn flush_retired_batch(&self, batch: PayloadReleaseBatch) {
+        if let (Some(first), Some(last)) = (batch.first_payload_index, batch.last_payload_index) {
+            self.push_retired_payloads(first, last);
         }
     }
 
@@ -302,7 +265,7 @@ impl<T> PayloadPool<T> {
     }
 
     #[inline]
-    pub(super) fn pinned_payload_ptr(&self, payload: PinnedPayload) -> NonNull<T> {
+    pub(super) fn protected_payload_ptr(&self, payload: ProtectedPayload) -> NonNull<T> {
         self.payload_at(payload.payload_index())
     }
 
@@ -329,13 +292,9 @@ impl<T> PayloadPool<T> {
 
     pub(super) fn recover_as_exclusive(&self) {
         for index in 0..self.capacity {
-            let payload_header = self.payload_header(index as u32);
-            let generation =
-                PayloadLifetimeState(payload_header.state.load(Ordering::Relaxed)).generation();
-            payload_header.state.store(
-                PayloadLifetimeState::new(generation, 0).0,
-                Ordering::Relaxed,
-            );
+            self.payload_header(index as u32)
+                .retired_sequence
+                .store(0, Ordering::Relaxed);
         }
 
         self.reset_free_links();
@@ -344,32 +303,51 @@ impl<T> PayloadPool<T> {
     #[inline]
     fn prepare_reserved_payload(&self, payload_index: u32) {
         let payload_header = self.payload_header(payload_index);
-        let mut generation = PayloadLifetimeState(payload_header.state.load(Ordering::Relaxed))
-            .generation()
+        let mut generation = payload_header
+            .generation
+            .load(Ordering::Relaxed)
             .wrapping_add(1);
         if generation == 0 {
             generation = 1;
         }
-        payload_header.state.store(
-            PayloadLifetimeState::new(generation, 1).0,
-            Ordering::Relaxed,
-        );
+        payload_header
+            .generation
+            .store(generation, Ordering::Relaxed);
     }
 
-    fn release_candidate(&self, handle: PayloadHandle) -> Option<u32> {
-        let payload_index = handle.payload_index()?;
-        if payload_index as usize >= self.capacity {
-            return None;
+    fn reclaim_payload_chain<F>(&self, first_payload_index: u32, mut is_protected: F)
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let mut free_batch = PayloadReleaseBatch::new();
+        let mut retired_batch = PayloadReleaseBatch::new();
+        let mut encoded = encode_payload_index(first_payload_index);
+
+        while encoded != EMPTY_PAYLOAD {
+            let payload_index = decode_non_empty_payload_index(encoded);
+            let payload_header = self.payload_header(payload_index);
+            let next = payload_header.next_free.load(Ordering::Relaxed);
+            let sequence = payload_header.retired_sequence.load(Ordering::Relaxed);
+
+            if is_protected(sequence) {
+                self.prepend_payload(payload_index, &mut retired_batch);
+            } else {
+                self.prepend_payload(payload_index, &mut free_batch);
+            }
+
+            encoded = next;
         }
 
-        let payload_header = self.payload_header(payload_index);
-        let previous = PayloadLifetimeState(payload_header.state.fetch_sub(1, Ordering::AcqRel));
-        let previous_refcnt = previous.refcnt();
-        debug_assert!(previous_refcnt != 0);
-        if previous_refcnt == 1 {
-            Some(payload_index)
-        } else {
+        self.flush_release_batch(free_batch);
+        self.flush_retired_batch(retired_batch);
+    }
+
+    fn valid_payload_index(&self, handle: PayloadHandle) -> Option<u32> {
+        let payload_index = handle.payload_index()?;
+        if payload_index as usize >= self.capacity {
             None
+        } else {
+            Some(payload_index)
         }
     }
 
@@ -380,6 +358,12 @@ impl<T> PayloadPool<T> {
     }
 
     #[inline]
+    fn retired_head(&self) -> &AtomicU64 {
+        // SAFETY: `retired_head` points into the live shared queue header.
+        unsafe { self.retired_head.as_ref() }
+    }
+
+    #[inline]
     fn pop_free_payloads_exact(&self, count: usize) -> Option<ReservedPayloads> {
         debug_assert!(count != 0);
 
@@ -387,7 +371,7 @@ impl<T> PayloadPool<T> {
         self.pop_free_payloads_exact_from_head(
             free_head,
             count,
-            PayloadPoolFreeHead(free_head.load(Ordering::Acquire)),
+            PayloadPoolHead(free_head.load(Ordering::Acquire)),
         )
     }
 
@@ -395,7 +379,7 @@ impl<T> PayloadPool<T> {
         &self,
         free_head: &AtomicU64,
         count: usize,
-        mut head: PayloadPoolFreeHead,
+        mut head: PayloadPoolHead,
     ) -> Option<ReservedPayloads> {
         'retry: loop {
             let first = head.encoded_first();
@@ -410,7 +394,7 @@ impl<T> PayloadPool<T> {
                     // Another producer may have popped this prefix and cleared
                     // its old tail after we loaded `head`. Only report
                     // exhaustion if the shared head is still the one we walked.
-                    let current = PayloadPoolFreeHead(free_head.load(Ordering::Acquire));
+                    let current = PayloadPoolHead(free_head.load(Ordering::Acquire));
                     if current.0 == head.0 {
                         return None;
                     }
@@ -429,7 +413,7 @@ impl<T> PayloadPool<T> {
                     .load(Ordering::Relaxed);
             }
 
-            let new_head = PayloadPoolFreeHead::new(encoded, head.tag().wrapping_add(1));
+            let new_head = PayloadPoolHead::new(encoded, head.tag().wrapping_add(1));
             match free_head.compare_exchange_weak(
                 head.0,
                 new_head.0,
@@ -447,36 +431,67 @@ impl<T> PayloadPool<T> {
                         count,
                     });
                 }
-                Err(current) => head = PayloadPoolFreeHead(current),
+                Err(current) => head = PayloadPoolHead(current),
+            }
+        }
+    }
+
+    fn take_retired_payloads(&self) -> Option<u32> {
+        let retired_head = self.retired_head();
+        let mut head = PayloadPoolHead(retired_head.load(Ordering::Acquire));
+
+        loop {
+            let first = head.encoded_first();
+            if first == EMPTY_PAYLOAD {
+                return None;
+            }
+
+            let new_head = PayloadPoolHead::new(EMPTY_PAYLOAD, head.tag().wrapping_add(1));
+            match retired_head.compare_exchange_weak(
+                head.0,
+                new_head.0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(decode_non_empty_payload_index(first)),
+                Err(current) => head = PayloadPoolHead(current),
             }
         }
     }
 
     #[inline]
     fn push_free_payloads(&self, first_payload_index: u32, last_payload_index: u32) {
+        self.push_payloads(self.free_head(), first_payload_index, last_payload_index);
+    }
+
+    #[inline]
+    fn push_retired_payloads(&self, first_payload_index: u32, last_payload_index: u32) {
+        self.push_payloads(self.retired_head(), first_payload_index, last_payload_index);
+    }
+
+    fn push_payloads(&self, head: &AtomicU64, first_payload_index: u32, last_payload_index: u32) {
         let first = encode_payload_index(first_payload_index);
-        let free_head = self.free_head();
-        let mut head = PayloadPoolFreeHead(free_head.load(Ordering::Acquire));
+        let mut current = PayloadPoolHead(head.load(Ordering::Acquire));
 
         loop {
             self.payload_header(last_payload_index)
                 .next_free
-                .store(head.encoded_first(), Ordering::Relaxed);
-            let new_head = PayloadPoolFreeHead::new(first, head.tag().wrapping_add(1));
-            match free_head.compare_exchange_weak(
-                head.0,
+                .store(current.encoded_first(), Ordering::Relaxed);
+            let new_head = PayloadPoolHead::new(first, current.tag().wrapping_add(1));
+            match head.compare_exchange_weak(
+                current.0,
                 new_head.0,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => return,
-                Err(current) => head = PayloadPoolFreeHead(current),
+                Err(next) => current = PayloadPoolHead(next),
             }
         }
     }
 
     #[inline]
-    fn prepend_free_payload(&self, payload_index: u32, batch: &mut PayloadReleaseBatch) {
+    fn prepend_payload(&self, payload_index: u32, batch: &mut PayloadReleaseBatch) {
         self.payload_header(payload_index).next_free.store(
             batch
                 .first_payload_index
@@ -498,13 +513,20 @@ impl<T> PayloadPool<T> {
         }
 
         let free_head = self.free_head();
-        let current = PayloadPoolFreeHead(free_head.load(Ordering::Acquire));
+        let current_free = PayloadPoolHead(free_head.load(Ordering::Acquire));
         free_head.store(
-            PayloadPoolFreeHead::new(
+            PayloadPoolHead::new(
                 first_for_capacity(self.capacity),
-                current.tag().wrapping_add(1),
+                current_free.tag().wrapping_add(1),
             )
             .0,
+            Ordering::Release,
+        );
+
+        let retired_head = self.retired_head();
+        let current_retired = PayloadPoolHead(retired_head.load(Ordering::Acquire));
+        retired_head.store(
+            PayloadPoolHead::new(EMPTY_PAYLOAD, current_retired.tag().wrapping_add(1)).0,
             Ordering::Release,
         );
     }
@@ -554,7 +576,12 @@ pub(super) fn capacity_for_ring_capacity(ring_capacity: usize) -> Option<usize> 
 
 #[inline]
 pub(super) fn initial_free_head(capacity: usize) -> u64 {
-    PayloadPoolFreeHead::new(first_for_capacity(capacity), 0).0
+    PayloadPoolHead::new(first_for_capacity(capacity), 0).0
+}
+
+#[inline]
+pub(super) const fn initial_retired_head() -> u64 {
+    PayloadPoolHead::new(EMPTY_PAYLOAD, 0).0
 }
 
 pub(super) unsafe fn initialize_payload_headers(
@@ -572,7 +599,7 @@ pub(super) unsafe fn initialize_payload_headers(
     }
 }
 
-/// Nullable payload index stored in `PayloadHandle`, `PayloadPoolFreeHead`, and free-list links.
+/// Nullable payload index stored in `PayloadHandle`, `PayloadPoolHead`, and free-list links.
 /// Zero means empty; non-zero values are `payload_index + 1`.
 #[inline]
 fn encode_payload_index(payload_index: u32) -> u32 {
@@ -616,8 +643,8 @@ fn first_for_capacity(capacity: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_free_head, initialize_payload_headers, PayloadHandle, PayloadHeader, PayloadPool,
-        PayloadPoolFreeHead, PayloadReleaseBatch,
+        initial_free_head, initial_retired_head, initialize_payload_headers, PayloadHandle,
+        PayloadHeader, PayloadPool, PayloadPoolHead, PayloadReleaseBatch,
     };
     use core::{
         mem::{size_of, MaybeUninit},
@@ -625,8 +652,16 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    fn initialized_pool(capacity: usize) -> (AtomicU64, Vec<PayloadHeader>, Vec<MaybeUninit<u64>>) {
-        let head = AtomicU64::new(initial_free_head(capacity));
+    fn initialized_pool(
+        capacity: usize,
+    ) -> (
+        AtomicU64,
+        AtomicU64,
+        Vec<PayloadHeader>,
+        Vec<MaybeUninit<u64>>,
+    ) {
+        let free_head = AtomicU64::new(initial_free_head(capacity));
+        let retired_head = AtomicU64::new(initial_retired_head());
         let mut payload_headers = Vec::with_capacity(capacity);
         let mut payloads = Vec::with_capacity(capacity);
         for _ in 0..capacity {
@@ -642,16 +677,18 @@ mod tests {
             payload_headers.set_len(capacity);
         }
 
-        (head, payload_headers, payloads)
+        (free_head, retired_head, payload_headers, payloads)
     }
 
     fn pool<'a>(
-        head: &'a AtomicU64,
+        free_head: &'a AtomicU64,
+        retired_head: &'a AtomicU64,
         payload_headers: &'a [PayloadHeader],
         payloads: &'a mut [MaybeUninit<u64>],
     ) -> PayloadPool<u64> {
         PayloadPool::new(
-            NonNull::from(head),
+            NonNull::from(free_head),
+            NonNull::from(retired_head),
             NonNull::new(payload_headers.as_ptr().cast_mut())
                 .expect("non-empty payload header slice"),
             NonNull::new(payloads.as_mut_ptr().cast()).expect("non-empty payload slice"),
@@ -666,8 +703,8 @@ mod tests {
 
     #[test]
     fn reserve_payloads_exact_removes_requested_prefix() {
-        let (head, payload_headers, mut payloads) = initialized_pool(4);
-        let pool = pool(&head, &payload_headers, &mut payloads);
+        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(4);
+        let pool = pool(&free_head, &retired_head, &payload_headers, &mut payloads);
 
         let first = pool.reserve_payloads_exact(2).expect("first reserve");
         assert_eq!(first.first_payload_index(), 0);
@@ -680,15 +717,15 @@ mod tests {
 
     #[test]
     fn stale_short_free_chain_retries_current_head() {
-        let (head, payload_headers, mut payloads) = initialized_pool(8);
-        let pool = pool(&head, &payload_headers, &mut payloads);
-        let stale_head = PayloadPoolFreeHead(initial_free_head(8));
+        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(8);
+        let pool = pool(&free_head, &retired_head, &payload_headers, &mut payloads);
+        let stale_head = PayloadPoolHead(initial_free_head(8));
 
         let prefix = pool.reserve_payloads_exact(3).expect("reserve prefix");
         assert_eq!(prefix.first_payload_index(), 0);
 
         let current = pool
-            .pop_free_payloads_exact_from_head(&head, 4, stale_head)
+            .pop_free_payloads_exact_from_head(&free_head, 4, stale_head)
             .expect("reserve from current head after stale short chain");
         assert_eq!(current.first_payload_index(), 3);
 
@@ -699,8 +736,8 @@ mod tests {
 
     #[test]
     fn cancel_reserved_payloads_restores_chain_to_pool() {
-        let (head, payload_headers, mut payloads) = initialized_pool(4);
-        let pool = pool(&head, &payload_headers, &mut payloads);
+        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(4);
+        let pool = pool(&free_head, &retired_head, &payload_headers, &mut payloads);
 
         let removed = pool.reserve_payloads_exact(2).expect("reserve");
         pool.cancel_reserved_payloads(removed);
@@ -711,49 +748,49 @@ mod tests {
     }
 
     #[test]
-    fn release_batch_restores_reusable_payloads_together() {
-        let (head, payload_headers, mut payloads) = initialized_pool(4);
-        let pool = pool(&head, &payload_headers, &mut payloads);
-        assert!(pool.reserve_payloads_exact(4).is_some());
+    fn reclaim_retired_payloads_restores_reusable_payloads() {
+        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(4);
+        let pool = pool(&free_head, &retired_head, &payload_headers, &mut payloads);
+        let _reserved = pool.reserve_payloads_exact(4).expect("reserve all");
 
         let mut batch = PayloadReleaseBatch::new();
-        pool.release_to_batch(pool.handle_for_payload(2), &mut batch);
-        pool.release_to_batch(pool.handle_for_payload(0), &mut batch);
-        pool.flush_release_batch(batch);
+        pool.retire_to_batch(pool.handle_for_payload(2), 12, &mut batch);
+        pool.retire_to_batch(pool.handle_for_payload(0), 10, &mut batch);
+        pool.reclaim_retired_batch(batch, |_| false);
 
         let chain = pool.reserve_payloads_exact(2).expect("reserve released");
-        assert_eq!(chain.first_payload_index(), 0);
+        assert_eq!(chain.len(), 2);
         assert!(pool.reserve_payloads_exact(1).is_none());
     }
 
     #[test]
-    fn pin_blocks_reuse_until_released() {
-        let (head, payload_headers, mut payloads) = initialized_pool(1);
-        let pool = pool(&head, &payload_headers, &mut payloads);
+    fn protected_retired_payload_blocks_reuse_until_unprotected() {
+        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(1);
+        let pool = pool(&free_head, &retired_head, &payload_headers, &mut payloads);
 
         let reserved = pool.reserve_payloads_exact(1).expect("reserve");
         let handle = pool.handle_for_payload(reserved.first_payload_index());
-        let pinned = pool.pin(handle).expect("pin");
-
-        pool.release_handle(handle);
+        let mut batch = PayloadReleaseBatch::new();
+        pool.retire_to_batch(handle, 5, &mut batch);
+        pool.reclaim_retired_batch(batch, |sequence| sequence == 5);
         assert!(pool.reserve_payloads_exact(1).is_none());
 
-        pool.release_handle(pinned.handle());
+        pool.reclaim_retired_payloads(|_| false);
         assert!(pool.reserve_payloads_exact(1).is_some());
     }
 
     #[test]
-    fn invalid_handle_does_not_pin() {
-        let (head, payload_headers, mut payloads) = initialized_pool(1);
-        let pool = pool(&head, &payload_headers, &mut payloads);
+    fn invalid_handle_does_not_resolve_to_payload() {
+        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(1);
+        let pool = pool(&free_head, &retired_head, &payload_headers, &mut payloads);
 
-        assert!(pool.pin(PayloadHandle::EMPTY).is_none());
+        assert!(pool.payload_for_handle(PayloadHandle::EMPTY).is_none());
     }
 
     #[test]
     fn recover_as_exclusive_restores_all_payloads() {
-        let (head, payload_headers, mut payloads) = initialized_pool(4);
-        let pool = pool(&head, &payload_headers, &mut payloads);
+        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(4);
+        let pool = pool(&free_head, &retired_head, &payload_headers, &mut payloads);
         assert!(pool.reserve_payloads_exact(4).is_some());
         assert!(pool.reserve_payloads_exact(1).is_none());
 

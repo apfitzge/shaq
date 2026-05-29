@@ -1,16 +1,17 @@
 //! Bounded lossy broadcast queue with separated payload storage.
 //!
 //! The broadcast ring stores only single-atomic payload handles. Payload bytes
-//! live in a separate fixed-size pool and are reclaimed with reference counts.
-//! Consumers that obtain a direct read guard pin the payload, so producers
-//! can overwrite ring entries without racing the guarded payload bytes.
+//! live in a separate fixed-size pool and are reclaimed by producers after
+//! checking consumer hazard ranges. Consumers that obtain a direct read guard
+//! publish the guarded sequence range, so producers can overwrite ring entries
+//! without racing the guarded payload bytes.
 //!
 //! Producer reservation first claims payload storage only. Ring positions are
 //! reserved during explicit publication, after payload bytes have been written.
-//! A consumer that has not pinned a payload before its ring position is reserved
-//! for overwrite may observe an overrun and skip forward. A consumer that
-//! already holds a direct read guard keeps a payload reference until the guard
-//! is dropped.
+//! A consumer that has not published a hazard before its ring position is
+//! reserved for overwrite may observe an overrun and skip forward. A consumer
+//! that already holds a direct read guard keeps the guarded payloads retired
+//! until the guard is dropped and a producer reclaims them.
 //!
 //! The high-level by-value APIs still copy payload bytes out of shared memory.
 //! As with the other shared-memory queues, callers must use the same `T` for all
@@ -29,8 +30,8 @@
 //!
 //! Write batches reserve payload storage before reserving ring positions.
 //! Unpublished batches can therefore exhaust the fixed payload pool even though
-//! the broadcast ring is lossy. Old overwritten payloads are returned to the pool
-//! only after the new publication is visible, keeping the serialized publication
+//! the broadcast ring is lossy. Old overwritten payloads are reclaimed only
+//! after the new publication is visible, keeping the serialized publication
 //! window as small as possible.
 //!
 //! Zero-sized payload types and payload types whose alignment exceeds the shared
@@ -43,16 +44,18 @@ use core::{
     marker::PhantomData,
     mem::ManuallyDrop,
     ptr::NonNull,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use payload_pool::{
-    PayloadHandle, PayloadHeader, PayloadPool, PayloadReleaseBatch, PinnedPayload, ReservedPayloads,
+    PayloadHandle, PayloadHeader, PayloadPool, PayloadReleaseBatch, ProtectedPayload,
+    ReservedPayloads,
 };
 use std::{fs::File, sync::Arc};
 
 /// Unique identifier for broadcast queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
 const MAX_RING_CAPACITY: usize = 1usize << 30;
+const MAX_CONSUMERS: usize = 64;
 
 pub struct Producer<T> {
     queue: SharedQueue<T>,
@@ -110,7 +113,7 @@ impl<T> Producer<T> {
     ///
     /// The consumer starts at the current producer publication cursor and will
     /// only observe values published after it joins.
-    pub fn join_as_consumer(&self) -> Consumer<T> {
+    pub fn join_as_consumer(&self) -> Result<Consumer<T>, Error> {
         Consumer::from_queue(self.queue.clone())
     }
 
@@ -199,8 +202,9 @@ pub enum TryReadError {
 
 pub struct Consumer<T> {
     queue: SharedQueue<T>,
+    hazard: ConsumerHazard,
     next: usize,
-    read_batch_payloads: Vec<PinnedPayload>,
+    read_batch_payloads: Vec<ProtectedPayload>,
 }
 
 impl<T> Consumer<T> {
@@ -232,7 +236,7 @@ impl<T> Consumer<T> {
         let (region, header) = unsafe { SharedQueueHeader::create::<T>(file, file_size) }?;
         // SAFETY: `header` belongs to `region` and was initialized above.
         let queue = unsafe { SharedQueue::from_header(region, header) }?;
-        Ok(Self::from_queue(queue))
+        Self::from_queue(queue)
     }
 
     /// Joins an existing consumer for the shared queue in the provided file.
@@ -256,7 +260,7 @@ impl<T> Consumer<T> {
         let (region, header) = SharedQueueHeader::join::<T>(file)?;
         // SAFETY: `header` belongs to `region` and was validated by join.
         let queue = unsafe { SharedQueue::from_header(region, header) }?;
-        Ok(Self::from_queue(queue))
+        Self::from_queue(queue)
     }
 
     /// Creates a Producer that shares the same memory mapping.
@@ -271,13 +275,26 @@ impl<T> Consumer<T> {
         self.queue.capacity()
     }
 
-    fn from_queue(queue: SharedQueue<T>) -> Self {
+    fn from_queue(queue: SharedQueue<T>) -> Result<Self, Error> {
         let next = queue.published();
-        Self {
+        let hazard = queue.acquire_consumer_hazard()?;
+        Ok(Self {
             queue,
+            hazard,
             next,
             read_batch_payloads: Vec::new(),
-        }
+        })
+    }
+
+    /// Creates another consumer with the same local cursor.
+    pub fn try_clone(&self) -> Result<Self, Error> {
+        let hazard = self.queue.acquire_consumer_hazard()?;
+        Ok(Self {
+            queue: self.queue.clone(),
+            hazard,
+            next: self.next,
+            read_batch_payloads: Vec::new(),
+        })
     }
 
     fn readable_range(&mut self, max: usize) -> Result<(usize, usize), TryReadError> {
@@ -346,7 +363,8 @@ impl<T> Consumer<T> {
 
     /// Attempts to read and commit one value from the queue.
     ///
-    /// The payload is duplicated from pinned payload storage with a typed read.
+    /// The payload is duplicated from hazard-protected payload storage with a
+    /// typed read.
     pub fn try_read(&mut self) -> Result<T, TryReadError> {
         // SAFETY: construction establishes the broadcast payload contract.
         let direct = unsafe { self.try_read_direct()? };
@@ -355,9 +373,9 @@ impl<T> Consumer<T> {
 
     /// Attempts to directly access one value from the queue.
     ///
-    /// The returned guard pins the payload. References and pointers obtained
-    /// from the guard remain stable until the guard is dropped, even if
-    /// producers overwrite the ring entry.
+    /// The returned guard publishes this consumer's hazard range. References
+    /// and pointers obtained from the guard remain stable until the guard is
+    /// dropped, even if producers overwrite the ring entry.
     ///
     /// # Safety
     /// Callers must only access the returned payload in ways valid for
@@ -365,8 +383,10 @@ impl<T> Consumer<T> {
     pub unsafe fn try_read_direct(&mut self) -> Result<DirectRead<'_, T>, TryReadError> {
         let (start, _) = self.readable_range(1)?;
 
+        self.hazard.protect(start, 1);
         let handle = self.queue.handle_at(start);
-        let Some(pinned_payload) = self.queue.payload_pool.pin(handle) else {
+        let Some(payload) = self.queue.payload_pool.payload_for_handle(handle) else {
+            self.hazard.clear();
             return Err(Self::record_current_overrun(
                 &self.queue,
                 &mut self.next,
@@ -376,30 +396,22 @@ impl<T> Consumer<T> {
         };
 
         if let Err(overrun) = self.queue.validate_window(start, 1) {
-            self.queue.payload_pool.release_handle(handle);
+            self.hazard.clear();
             return Err(Self::record_overrun(&mut self.next, overrun, 0));
-        }
-        if self.queue.handle_at(start) != handle {
-            self.queue.payload_pool.release_handle(handle);
-            return Err(Self::record_current_overrun(
-                &self.queue,
-                &mut self.next,
-                start,
-                1,
-            ));
         }
 
         Ok(DirectRead {
             next: &mut self.next,
             queue: &self.queue,
+            hazard: self.hazard,
             start,
-            pinned_payload,
+            payload,
         })
     }
 
     /// Attempts to directly access up to `max` values from the queue.
     ///
-    /// The returned guard pins every payload in the batch.
+    /// The returned guard publishes one hazard range for the batch.
     ///
     /// # Safety
     /// Callers must only access returned payloads in ways valid for
@@ -411,18 +423,19 @@ impl<T> Consumer<T> {
         let (start, count) = self.readable_range(max)?;
 
         let queue = &self.queue;
-        let pinned_payloads = &mut self.read_batch_payloads;
-        pinned_payloads.clear();
-        if pinned_payloads.capacity() < count {
-            pinned_payloads.reserve_exact(count - pinned_payloads.capacity());
+        let payloads = &mut self.read_batch_payloads;
+        payloads.clear();
+        if payloads.capacity() < count {
+            payloads.reserve_exact(count - payloads.capacity());
         }
 
+        self.hazard.protect(start, count);
         for index in 0..count {
             let position = start.wrapping_add(index);
             let handle = queue.handle_at(position);
-            let Some(pinned_payload) = queue.payload_pool.pin(handle) else {
-                queue.payload_pool.release_pinned_payloads(pinned_payloads);
-                pinned_payloads.clear();
+            let Some(payload) = queue.payload_pool.payload_for_handle(handle) else {
+                self.hazard.clear();
+                payloads.clear();
                 return Err(Self::record_current_overrun(
                     queue,
                     &mut self.next,
@@ -430,31 +443,28 @@ impl<T> Consumer<T> {
                     1,
                 ));
             };
-            pinned_payloads.push(pinned_payload);
+            payloads.push(payload);
         }
 
         if let Err(overrun) = queue.validate_window(start, count) {
-            queue.payload_pool.release_pinned_payloads(pinned_payloads);
-            pinned_payloads.clear();
+            self.hazard.clear();
+            payloads.clear();
             return Err(Self::record_overrun(&mut self.next, overrun, 0));
         }
 
         Ok(DirectReadBatch {
             next: &mut self.next,
             queue,
+            hazard: self.hazard,
             start,
-            pinned_payloads,
+            payloads,
         })
     }
 }
 
-impl<T> Clone for Consumer<T> {
-    fn clone(&self) -> Self {
-        Self {
-            queue: self.queue.clone(),
-            next: self.next,
-            read_batch_payloads: Vec::new(),
-        }
+impl<T> Drop for Consumer<T> {
+    fn drop(&mut self) {
+        self.hazard.release_owner();
     }
 }
 
@@ -491,8 +501,11 @@ pub const fn minimum_region_size<T>(capacity: usize) -> usize {
 /// | SharedQueueHeader         |
 /// |   cacheline 0             | magic, version, buffer_mask
 /// |   cacheline 1             | payload_pool_head
-/// |   cacheline 2             | producer_reservation
-/// |   cacheline 3             | producer_publication
+/// |   cacheline 2             | payload_retired_head
+/// |   cacheline 3             | producer_reservation
+/// |   cacheline 4             | producer_publication
+/// +---------------------------+
+/// | consumer hazard slots     | [ConsumerHazardSlot; 64]
 /// +---------------------------+
 /// | ring                      | [PayloadHandle; ring_capacity]
 /// +---------------------------+
@@ -509,7 +522,9 @@ struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
     /// Published values. Each entry contains a `PayloadHandle`.
     ring: NonNull<AtomicU64>,
-    /// Payload lifecycle management: reservation, pinning, and reclamation.
+    /// Fixed table of consumer-owned hazard ranges.
+    hazard_slots: NonNull<ConsumerHazardSlot>,
+    /// Payload lifecycle management: reservation, retirement, and reclamation.
     payload_pool: PayloadPool<T>,
     /// Ring index mask. The ring capacity is `buffer_mask + 1`.
     buffer_mask: usize,
@@ -538,11 +553,144 @@ impl core::ops::Deref for CacheAlignedAtomicU64 {
     }
 }
 
+const HAZARD_FREE: u64 = 0;
+const HAZARD_INACTIVE: u64 = 1;
+const HAZARD_ACTIVE: u64 = 2;
+
+#[repr(C, align(64))]
+struct ConsumerHazardSlot {
+    state: AtomicU64,
+    start: AtomicUsize,
+    end: AtomicUsize,
+}
+
+impl ConsumerHazardSlot {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU64::new(HAZARD_FREE),
+            start: AtomicUsize::new(0),
+            end: AtomicUsize::new(0),
+        }
+    }
+
+    fn acquire(&self) -> bool {
+        self.state
+            .compare_exchange(
+                HAZARD_FREE,
+                HAZARD_INACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn protect(&self, start: usize, end: usize) {
+        self.start.store(start, Ordering::Relaxed);
+        self.end.store(end, Ordering::Relaxed);
+        self.state.store(HAZARD_ACTIVE, Ordering::SeqCst);
+    }
+
+    fn clear(&self) {
+        self.state.store(HAZARD_INACTIVE, Ordering::SeqCst);
+    }
+
+    fn release_owner(&self) {
+        let _ = self.state.compare_exchange(
+            HAZARD_INACTIVE,
+            HAZARD_FREE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn reset(&self) {
+        self.start.store(0, Ordering::Relaxed);
+        self.end.store(0, Ordering::Relaxed);
+        self.state.store(HAZARD_FREE, Ordering::Release);
+    }
+
+    fn active_range(&self) -> Option<HazardRange> {
+        if self.state.load(Ordering::SeqCst) != HAZARD_ACTIVE {
+            return None;
+        }
+
+        let start = self.start.load(Ordering::Relaxed);
+        let end = self.end.load(Ordering::Relaxed);
+        if start == end {
+            None
+        } else {
+            Some(HazardRange { start, end })
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ConsumerHazard {
+    slot: NonNull<ConsumerHazardSlot>,
+}
+
+impl ConsumerHazard {
+    fn protect(self, start: usize, count: usize) {
+        // SAFETY: `slot` points into the live shared queue hazard table.
+        unsafe { self.slot.as_ref() }.protect(start, start.wrapping_add(count));
+    }
+
+    fn clear(self) {
+        // SAFETY: `slot` points into the live shared queue hazard table.
+        unsafe { self.slot.as_ref() }.clear();
+    }
+
+    fn release_owner(self) {
+        // SAFETY: `slot` points into the live shared queue hazard table.
+        unsafe { self.slot.as_ref() }.release_owner();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HazardRange {
+    start: usize,
+    end: usize,
+}
+
+impl HazardRange {
+    fn protects(self, sequence: usize) -> bool {
+        sequence.wrapping_sub(self.start) < self.end.wrapping_sub(self.start)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HazardSnapshot {
+    ranges: [HazardRange; MAX_CONSUMERS],
+    len: usize,
+}
+
+impl HazardSnapshot {
+    fn new() -> Self {
+        Self {
+            ranges: [HazardRange { start: 0, end: 0 }; MAX_CONSUMERS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, range: HazardRange) {
+        debug_assert!(self.len < MAX_CONSUMERS);
+        self.ranges[self.len] = range;
+        self.len += 1;
+    }
+
+    fn protects(&self, sequence: usize) -> bool {
+        self.ranges[..self.len]
+            .iter()
+            .any(|range| range.protects(sequence))
+    }
+}
+
 impl<T> Clone for SharedQueue<T> {
     fn clone(&self) -> Self {
         Self {
             header: self.header,
             ring: self.ring,
+            hazard_slots: self.hazard_slots,
             payload_pool: self.payload_pool.clone(),
             buffer_mask: self.buffer_mask,
             region: Arc::clone(&self.region),
@@ -591,7 +739,10 @@ impl<T> SharedQueue<T> {
             return None;
         }
 
-        self.payload_pool.reserve_payloads_exact(count)
+        self.payload_pool.reserve_payloads_exact(count).or_else(|| {
+            self.reclaim_retired_payloads();
+            self.payload_pool.reserve_payloads_exact(count)
+        })
     }
 
     fn reserve_ring_positions(&self, count: usize) -> usize {
@@ -630,7 +781,7 @@ impl<T> SharedQueue<T> {
         debug_assert!(count != 0 && count <= self.capacity());
 
         let start = self.reserve_ring_positions(count);
-        let mut release_batch = PayloadReleaseBatch::new();
+        let mut retire_batch = PayloadReleaseBatch::new();
         let mut cursor = self
             .payload_pool
             .payload_cursor(chain.first_payload_index());
@@ -638,15 +789,24 @@ impl<T> SharedQueue<T> {
         for index in 0..count {
             let payload_index = cursor.current();
             let handle = self.payload_pool.handle_for_payload(payload_index);
-            let old = self.install_reserved_handle(start.wrapping_add(index), handle);
-            self.payload_pool.release_to_batch(old, &mut release_batch);
+            let position = start.wrapping_add(index);
+            let old = self.install_reserved_handle(position, handle);
+            self.payload_pool.retire_to_batch(
+                old,
+                position.wrapping_sub(self.capacity()),
+                &mut retire_batch,
+            );
             if index != last_index {
                 cursor.advance();
             }
         }
 
         self.publish_reserved(start, count);
-        self.payload_pool.flush_release_batch(release_batch);
+        let hazards = self.hazard_snapshot();
+        self.payload_pool
+            .reclaim_retired_batch(retire_batch, |sequence| hazards.protects(sequence));
+        self.payload_pool
+            .reclaim_retired_payloads(|sequence| hazards.protects(sequence));
     }
 
     fn publish_reserved(&self, start: usize, count: usize) {
@@ -688,6 +848,37 @@ impl<T> SharedQueue<T> {
         Ok(())
     }
 
+    fn acquire_consumer_hazard(&self) -> Result<ConsumerHazard, Error> {
+        for index in 0..MAX_CONSUMERS {
+            // SAFETY: index is bounded by MAX_CONSUMERS.
+            let slot = unsafe { self.hazard_slots.add(index) };
+            // SAFETY: slot points into the live hazard table.
+            if unsafe { slot.as_ref() }.acquire() {
+                return Ok(ConsumerHazard { slot });
+            }
+        }
+
+        Err(Error::ConsumerSlotsExhausted)
+    }
+
+    fn hazard_snapshot(&self) -> HazardSnapshot {
+        let mut snapshot = HazardSnapshot::new();
+        for index in 0..MAX_CONSUMERS {
+            // SAFETY: index is bounded by MAX_CONSUMERS.
+            let slot = unsafe { self.hazard_slots.add(index).as_ref() };
+            if let Some(range) = slot.active_range() {
+                snapshot.push(range);
+            }
+        }
+        snapshot
+    }
+
+    fn reclaim_retired_payloads(&self) {
+        let hazards = self.hazard_snapshot();
+        self.payload_pool
+            .reclaim_retired_payloads(|sequence| hazards.protects(sequence));
+    }
+
     fn recover_as_exclusive(&self) {
         // SAFETY: Header is non-null and valid for the queue lifetime.
         let header = unsafe { self.header.as_ref() };
@@ -698,6 +889,10 @@ impl<T> SharedQueue<T> {
             // SAFETY: index is in bounds.
             unsafe { self.ring.add(index).as_ref() }
                 .store(PayloadHandle::EMPTY.0, Ordering::Release);
+        }
+        for index in 0..MAX_CONSUMERS {
+            // SAFETY: index is bounded by MAX_CONSUMERS.
+            unsafe { self.hazard_slots.add(index).as_ref() }.reset();
         }
         self.payload_pool.recover_as_exclusive();
     }
@@ -722,6 +917,8 @@ impl<T> SharedQueue<T> {
         let payload_capacity =
             SharedQueueHeader::payload_capacity_for_ring_capacity(buffer_size_in_items)?;
         // SAFETY: layout validation above proves these regions exist.
+        let hazard_slots = unsafe { SharedQueueHeader::hazard_slots_from_header(header) };
+        // SAFETY: layout validation above proves these regions exist.
         let ring = unsafe { SharedQueueHeader::ring_from_header(header) };
         // SAFETY: layout validation above proves these regions exist.
         let payload_headers =
@@ -735,12 +932,14 @@ impl<T> SharedQueue<T> {
             ring,
             payload_pool: PayloadPool::new(
                 NonNull::from(&header_ref.payload_pool_head.inner),
+                NonNull::from(&header_ref.payload_retired_head.inner),
                 payload_headers,
                 payloads,
                 payload_capacity,
             ),
             region,
             buffer_mask,
+            hazard_slots,
         })
     }
 }
@@ -754,11 +953,13 @@ struct SharedQueueHeader {
 
     /// Payload-pool free-list head.
     payload_pool_head: CacheAlignedAtomicU64,
+    /// Payload-pool retired-list head.
+    payload_retired_head: CacheAlignedAtomicU64,
 
     /// Producer reservation cursor.
     ///
     /// Producers atomically advance this with CAS to claim ring positions. A
-    /// claimed-but-unpublished overwrite may make older unpinned items
+    /// claimed-but-unpublished overwrite may make older unprotected items
     /// unavailable to consumers.
     producer_reservation: CacheAlignedAtomicSize,
     /// Producer publication cursor.
@@ -780,8 +981,13 @@ impl SharedQueueHeader {
         Ok((region, header))
     }
 
+    const fn hazard_slots_offset() -> usize {
+        core::mem::size_of::<Self>().next_multiple_of(core::mem::align_of::<ConsumerHazardSlot>())
+    }
+
     const fn ring_offset() -> usize {
-        core::mem::size_of::<Self>().next_multiple_of(core::mem::align_of::<AtomicU64>())
+        (Self::hazard_slots_offset() + MAX_CONSUMERS * core::mem::size_of::<ConsumerHazardSlot>())
+            .next_multiple_of(core::mem::align_of::<AtomicU64>())
     }
 
     const fn payload_headers_offset(ring_capacity: usize) -> usize {
@@ -921,8 +1127,23 @@ impl SharedQueueHeader {
             payload_pool::initial_free_head(payload_capacity),
             Ordering::Release,
         );
+        header
+            .payload_retired_head
+            .store(payload_pool::initial_retired_head(), Ordering::Release);
         header.buffer_mask = u32::try_from(ring_capacity - 1).unwrap();
         header.version = VERSION;
+
+        // SAFETY: The calculated layout reserves MAX_CONSUMERS hazard slots.
+        let hazard_slots = unsafe { Self::hazard_slots_from_header(header_ptr) };
+        for index in 0..MAX_CONSUMERS {
+            // SAFETY: index is in bounds for the hazard slot array.
+            unsafe {
+                hazard_slots
+                    .add(index)
+                    .as_ptr()
+                    .write(ConsumerHazardSlot::new())
+            };
+        }
 
         // SAFETY: The calculated layout reserves `ring_capacity` entries.
         let ring = unsafe { Self::ring_from_header(header_ptr) };
@@ -972,6 +1193,12 @@ impl SharedQueueHeader {
     unsafe fn ring_from_header(header: NonNull<Self>) -> NonNull<AtomicU64> {
         let offset = Self::ring_offset();
         // SAFETY: caller guarantees the allocation includes the ring layout.
+        unsafe { header.byte_add(offset).cast() }
+    }
+
+    unsafe fn hazard_slots_from_header(header: NonNull<Self>) -> NonNull<ConsumerHazardSlot> {
+        let offset = Self::hazard_slots_offset();
+        // SAFETY: caller guarantees the allocation includes the hazard-slot layout.
         unsafe { header.byte_add(offset).cast() }
     }
 
@@ -1121,31 +1348,32 @@ impl<'a, T> Drop for WriteBatch<'a, T> {
 pub struct DirectRead<'a, T> {
     next: &'a mut usize,
     queue: &'a SharedQueue<T>,
+    hazard: ConsumerHazard,
     start: usize,
-    pinned_payload: PinnedPayload,
+    payload: ProtectedPayload,
 }
 
 impl<'a, T> DirectRead<'a, T> {
-    /// Returns a raw pointer to the pinned payload.
+    /// Returns a raw pointer to the hazard-protected payload.
     pub fn as_ptr(&self) -> *const T {
         self.queue
             .payload_pool
-            .pinned_payload_ptr(self.pinned_payload)
+            .protected_payload_ptr(self.payload)
             .as_ptr()
     }
 
-    /// Duplicates the pinned payload with a typed read and advances the
+    /// Duplicates the hazard-protected payload with a typed read and advances the
     /// consumer cursor.
     ///
     /// The payload remains in shared memory; this returns a by-value duplicate.
     pub fn read(self) -> T {
-        // SAFETY: This guard pins an initialized payload.
+        // SAFETY: This guard protects an initialized payload.
         let value = unsafe { self.as_ptr().read() };
         self.commit();
         value
     }
 
-    /// Advances the consumer cursor and releases the payload when the guard is
+    /// Advances the consumer cursor and clears the hazard when the guard is
     /// dropped.
     pub fn commit(self) {
         *self.next = self.start.wrapping_add(1);
@@ -1153,13 +1381,13 @@ impl<'a, T> DirectRead<'a, T> {
 }
 
 impl<'a, T> AsRef<T> for DirectRead<'a, T> {
-    /// Returns a shared reference to the pinned payload.
+    /// Returns a shared reference to the hazard-protected payload.
     fn as_ref(&self) -> &T {
-        // SAFETY: This guard pins an initialized payload for its lifetime.
+        // SAFETY: This guard publishes a hazard for an initialized payload.
         unsafe {
             self.queue
                 .payload_pool
-                .pinned_payload_ptr(self.pinned_payload)
+                .protected_payload_ptr(self.payload)
                 .as_ref()
         }
     }
@@ -1167,9 +1395,7 @@ impl<'a, T> AsRef<T> for DirectRead<'a, T> {
 
 impl<'a, T> Drop for DirectRead<'a, T> {
     fn drop(&mut self) {
-        self.queue
-            .payload_pool
-            .release_handle(self.pinned_payload.handle());
+        self.hazard.clear();
     }
 }
 
@@ -1177,71 +1403,70 @@ impl<'a, T> Drop for DirectRead<'a, T> {
 pub struct DirectReadBatch<'a, T> {
     next: &'a mut usize,
     queue: &'a SharedQueue<T>,
+    hazard: ConsumerHazard,
     start: usize,
-    pinned_payloads: &'a mut Vec<PinnedPayload>,
+    payloads: &'a mut Vec<ProtectedPayload>,
 }
 
 impl<'a, T> DirectReadBatch<'a, T> {
     pub fn len(&self) -> usize {
-        self.pinned_payloads.len()
+        self.payloads.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pinned_payloads.is_empty()
+        self.payloads.is_empty()
     }
 
-    /// Returns a pointer to the pinned payload at `index`.
+    /// Returns a pointer to the hazard-protected payload at `index`.
     ///
     /// # Panics
     /// Panics if `index >= len`.
     pub fn as_ptr(&self, index: usize) -> *const T {
-        assert!(index < self.pinned_payloads.len());
+        assert!(index < self.payloads.len());
         self.queue
             .payload_pool
-            .pinned_payload_ptr(self.pinned_payloads[index])
+            .protected_payload_ptr(self.payloads[index])
             .as_ptr()
     }
 
-    /// Returns a shared reference to the pinned payload at `index`.
+    /// Returns a shared reference to the hazard-protected payload at `index`.
     ///
     /// # Panics
     /// Panics if `index >= len`.
     pub fn as_ref(&self, index: usize) -> &T {
-        assert!(index < self.pinned_payloads.len());
-        // SAFETY: The index was checked above and this guard pins the payload.
+        assert!(index < self.payloads.len());
+        // SAFETY: The index was checked above and this guard publishes a hazard.
         unsafe {
             self.queue
                 .payload_pool
-                .pinned_payload_ptr(self.pinned_payloads[index])
+                .protected_payload_ptr(self.payloads[index])
                 .as_ref()
         }
     }
 
-    /// Duplicates the pinned payload at `index` with a typed read.
+    /// Duplicates the hazard-protected payload at `index` with a typed read.
     ///
     /// The payload remains in shared memory; this returns a by-value duplicate.
     ///
     /// # Panics
     /// Panics if `index >= len`.
     pub fn read(&self, index: usize) -> T {
-        assert!(index < self.pinned_payloads.len());
-        // SAFETY: The index was checked above and this guard pins the payload.
+        assert!(index < self.payloads.len());
+        // SAFETY: The index was checked above and this guard publishes a hazard.
         unsafe { self.as_ptr(index).read() }
     }
 
-    /// Advances the consumer cursor and releases payloads when the guard is
+    /// Advances the consumer cursor and clears the hazard when the guard is
     /// dropped.
     pub fn commit(self) {
-        *self.next = self.start.wrapping_add(self.pinned_payloads.len());
+        *self.next = self.start.wrapping_add(self.payloads.len());
     }
 }
 
 impl<'a, T> Drop for DirectReadBatch<'a, T> {
     fn drop(&mut self) {
-        self.queue
-            .payload_pool
-            .release_pinned_payloads(self.pinned_payloads.as_slice());
-        self.pinned_payloads.clear();
+        self.hazard.clear();
+        self.payloads.clear();
     }
 }
 
@@ -1379,7 +1604,7 @@ mod tests {
     #[test]
     fn test_multiple_consumers_receive_all_values() {
         let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
-        let mut consumer2 = consumer.clone();
+        let mut consumer2 = consumer.try_clone().expect("clone consumer");
 
         for i in 0..4 {
             producer.try_write(i).unwrap();
@@ -1414,9 +1639,9 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_repositions_unpinned_consumer() {
+    fn test_publish_repositions_unprotected_consumer() {
         let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
-        let mut lagging_consumer = consumer.clone();
+        let mut lagging_consumer = consumer.try_clone().expect("clone consumer");
 
         producer.try_write(1).unwrap();
         let mut batch = producer
@@ -1518,7 +1743,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pinned_direct_read_survives_ring_overwrite() {
+    fn test_hazard_direct_read_survives_ring_overwrite() {
         let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         producer.try_write(1).unwrap();
@@ -1533,7 +1758,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pinned_direct_batch_survives_ring_overwrite() {
+    fn test_hazard_direct_batch_survives_ring_overwrite() {
         let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         for item in 0..4 {
@@ -1570,19 +1795,19 @@ mod tests {
     }
 
     #[test]
-    fn test_reservation_fails_when_all_payloads_are_pinned() {
+    fn test_reservation_fails_when_all_payloads_are_hazard_protected() {
         let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
 
         for i in 0..BUFFER_CAPACITY as u64 {
             producer.try_write(i).unwrap();
         }
-        let pinned = unsafe { consumer.try_read_direct_batch(BUFFER_CAPACITY) }.unwrap();
+        let guarded = unsafe { consumer.try_read_direct_batch(BUFFER_CAPACITY) }.unwrap();
         for i in 0..BUFFER_CAPACITY as u64 {
             producer.try_write(100 + i).unwrap();
         }
 
         assert!(producer.reserve_write_batch(1).is_none());
-        drop(pinned);
+        drop(guarded);
         assert!(producer.reserve_write_batch(1).is_some());
     }
 
@@ -1593,14 +1818,41 @@ mod tests {
         for i in 0..BUFFER_CAPACITY as u64 {
             producer.try_write(i).unwrap();
         }
-        let pinned = unsafe { consumer.try_read_direct_batch(BUFFER_CAPACITY) }.unwrap();
+        let guarded = unsafe { consumer.try_read_direct_batch(BUFFER_CAPACITY) }.unwrap();
         for i in 0..BUFFER_CAPACITY as u64 {
             producer.try_write(100 + i).unwrap();
         }
 
         assert!(producer.reserve_write_batch(BUFFER_CAPACITY).is_none());
-        drop(pinned);
+        drop(guarded);
         assert!(producer.reserve_write_batch(BUFFER_CAPACITY).is_some());
+    }
+
+    #[test]
+    fn test_recover_as_exclusive_clears_stale_hazard() {
+        let file = create_temp_shmem_file().unwrap();
+        let producer =
+            unsafe { Producer::<Item>::create(&file, BUFFER_SIZE) }.expect("create failed");
+        let mut consumer = unsafe { Consumer::<Item>::join(&file) }.expect("join failed");
+
+        for i in 0..BUFFER_CAPACITY as u64 {
+            producer.try_write(i).unwrap();
+        }
+        let guarded = unsafe { consumer.try_read_direct_batch(BUFFER_CAPACITY) }.unwrap();
+        for i in 0..BUFFER_CAPACITY as u64 {
+            producer.try_write(100 + i).unwrap();
+        }
+
+        assert!(producer.reserve_write_batch(1).is_none());
+        core::mem::forget(guarded);
+        drop(consumer);
+        assert!(producer.reserve_write_batch(1).is_none());
+
+        unsafe {
+            producer.recover_as_exclusive();
+        }
+
+        assert!(producer.reserve_write_batch(1).is_some());
     }
 
     #[test]
@@ -1682,6 +1934,43 @@ mod tests {
     }
 
     #[test]
+    fn test_consumer_slots_exhaustion_and_drop_releases_slot() {
+        let file = create_temp_shmem_file().unwrap();
+        let producer =
+            unsafe { Producer::<Item>::create(&file, BUFFER_SIZE) }.expect("create failed");
+        let mut consumers = Vec::new();
+
+        for _ in 0..MAX_CONSUMERS {
+            consumers.push(producer.join_as_consumer().expect("join consumer"));
+        }
+
+        match producer.join_as_consumer() {
+            Err(Error::ConsumerSlotsExhausted) => {}
+            Err(err) => panic!("unexpected consumer slot error: {err}"),
+            Ok(_) => panic!("consumer join unexpectedly succeeded"),
+        }
+
+        consumers.pop();
+        assert!(producer.join_as_consumer().is_ok());
+    }
+
+    #[test]
+    fn test_consumer_try_clone_reports_slot_exhaustion() {
+        let (_file, _producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let mut consumers = Vec::new();
+
+        for _ in 1..MAX_CONSUMERS {
+            consumers.push(consumer.try_clone().expect("clone consumer"));
+        }
+
+        match consumer.try_clone() {
+            Err(Error::ConsumerSlotsExhausted) => {}
+            Err(err) => panic!("unexpected clone error: {err}"),
+            Ok(_) => panic!("consumer clone unexpectedly succeeded"),
+        }
+    }
+
+    #[test]
     fn test_clone_producer() {
         let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
         let producer2 = producer.clone();
@@ -1700,7 +1989,7 @@ mod tests {
     #[test]
     fn test_cross_role_joins() {
         let (_file, producer1, mut consumer1) = create_test_queue::<Item>(BUFFER_SIZE);
-        let mut consumer2 = producer1.join_as_consumer();
+        let mut consumer2 = producer1.join_as_consumer().expect("join as consumer");
         let producer2 = consumer2.join_as_producer();
 
         producer1.try_write(100).unwrap();

@@ -5,6 +5,7 @@ pub enum Error {
     InvalidMagic,
     InvalidVersion { expected: u32, actual: u32 },
     InvalidBufferSize,
+    ConsumerSlotsExhausted,
     InvalidRegionAlignment { minimum: usize, actual: usize },
     Allocation(std::alloc::Layout),
     Io(std::io::Error),
@@ -26,6 +27,7 @@ impl Display for Error {
                 actual & 0xFFFF,
             ),
             Self::InvalidBufferSize => write!(f, "invalid buffer size"),
+            Self::ConsumerSlotsExhausted => write!(f, "consumer slots exhausted"),
             Self::InvalidRegionAlignment { minimum, actual } => write!(
                 f,
                 "invalid region alignment; minimum={minimum}; actual={actual}"
@@ -58,5 +60,13 @@ mod tests {
         let actual: u32 = (3u32 << 16) | 7; // 3.7
         let err = Error::InvalidVersion { expected, actual };
         assert_eq!(err.to_string(), "invalid version; expected=1.0; found=3.7");
+    }
+
+    #[test]
+    fn test_consumer_slots_exhausted_display() {
+        assert_eq!(
+            Error::ConsumerSlotsExhausted.to_string(),
+            "consumer slots exhausted"
+        );
     }
 }
