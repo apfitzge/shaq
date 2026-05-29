@@ -6,8 +6,9 @@
 //! publish the guarded sequence range, so producers can overwrite ring entries
 //! without racing the guarded payload bytes.
 //!
-//! Producer reservation first claims payload storage only. Ring positions are
-//! reserved during explicit publication, after payload bytes have been written.
+//! Producer reservation first claims payload storage and a publication
+//! descriptor. Ring positions are assigned when a ready descriptor reaches the
+//! publication frontier, after payload bytes have been written.
 //! A consumer that has not published a hazard before its ring position is
 //! reserved for overwrite may observe an overrun and skip forward. A consumer
 //! that already holds a direct read guard keeps the guarded payloads retired
@@ -25,16 +26,16 @@
 //! # Safety and failure model
 //!
 //! The `try_` APIs are fallible, but they are not guaranteed to be non-blocking:
-//! publication may spin behind an earlier producer that is publishing to the
-//! ring. If a producer process exits after reserving ring positions but before
-//! advancing the publication cursor, later producers may remain blocked until
-//! [`Producer::recover_as_exclusive`] is used.
+//! descriptor or payload exhaustion returns failure to producers instead of
+//! making them wait. If a producer process exits after reserving a descriptor
+//! but before publishing or dropping it, later producers may remain unable to
+//! reserve until [`Producer::recover_as_exclusive`] is used.
 //!
 //! Write batches reserve payload storage before reserving ring positions.
 //! Unpublished batches can therefore exhaust the fixed payload pool even though
-//! the broadcast ring is lossy. Old overwritten payloads are reclaimed only
-//! after the new publication is visible, keeping the serialized publication
-//! window as small as possible.
+//! the broadcast ring is lossy. Publishing a ready descriptor reserves ring
+//! positions for overwrite before handles are installed; hazard-protected
+//! payloads remain retired until a producer can reclaim them safely.
 //! Producer handles keep a process-local payload cache to reduce shared free-list
 //! traffic. Normal producer drop returns cached payloads to shared memory; an
 //! abandoned producer may strand cached payloads until
@@ -161,7 +162,7 @@ impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
     /// Writes `item` into the queue, or returns it if no payload can be
     /// reserved.
     ///
-    /// This may wait behind earlier producers that are publishing to the ring.
+    /// This can fail if payload or publication-descriptor storage is exhausted.
     /// The `try_` prefix means payload exhaustion returns `Err(item)`, not that
     /// the operation is guaranteed to be non-blocking.
     ///
@@ -178,16 +179,17 @@ impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
 
     /// Reserves exactly `count` payloads for writing.
     ///
-    /// The payloads are returned to the free list when the batch is dropped. Call
-    /// [`WriteBatch::publish`] after initializing them. Batch payload
-    /// reservation uses one pool reservation operation for the whole batch.
+    /// The payloads and publication descriptor are released when the batch is
+    /// dropped. Call [`WriteBatch::publish`] after initializing them. Batch
+    /// payload reservation uses one pool reservation operation for the whole
+    /// batch.
     #[must_use]
     pub fn reserve_write_batch(&self, count: usize) -> Option<WriteBatch<'_, T, CONSUMER_SLOTS>> {
-        let chain = self.with_local(|local| self.queue.reserve_write_batch(count, local))?;
+        let reservation = self.with_local(|local| self.queue.reserve_write_batch(count, local))?;
         Some(WriteBatch {
             producer: self,
-            chain,
-            next_write_payload_index: chain.first_payload_index(),
+            reservation,
+            next_write_payload_index: reservation.chain.first_payload_index(),
             written: 0,
             _marker: PhantomData,
         })
@@ -213,12 +215,15 @@ impl<T, const CONSUMER_SLOTS: usize> Producer<T, CONSUMER_SLOTS> {
         f(unsafe { &mut *self.local.get() })
     }
 
-    fn publish_reserved_payload_chain(&self, chain: ReservedPayloads) {
-        self.with_local(|local| self.queue.publish_reserved_payload_chain(chain, local));
+    fn publish_reserved_payload_chain(&self, reservation: ProducerReservation) {
+        self.with_local(|local| {
+            self.queue
+                .publish_reserved_payload_chain(reservation, local)
+        });
     }
 
-    fn cancel_reserved_payloads(&self, chain: ReservedPayloads) {
-        self.with_local(|local| self.queue.cancel_reserved_payloads(chain, local));
+    fn cancel_reserved_payloads(&self, reservation: ProducerReservation) {
+        self.with_local(|local| self.queue.cancel_reserved_payloads(reservation, local));
     }
 
     fn flush_local(&self) {
@@ -588,8 +593,12 @@ pub const fn minimum_region_size_for_consumer_slots<T, const CONSUMER_SLOTS: usi
 /// |   cacheline 2             | payload_retired_head
 /// |   cacheline 3             | producer_reservation
 /// |   cacheline 4             | producer_publication
+/// |   cacheline 5             | descriptor_reservation
+/// |   cacheline 6             | descriptor_publication
 /// +---------------------------+
 /// | consumer hazard slots     | [ConsumerHazardSlot; CONSUMER_SLOTS]
+/// +---------------------------+
+/// | publication descriptors   | [PublicationDescriptor; ring_capacity]
 /// +---------------------------+
 /// | ring                      | [PayloadHandle; ring_capacity]
 /// +---------------------------+
@@ -608,6 +617,8 @@ struct SharedQueue<T, const CONSUMER_SLOTS: usize> {
     ring: NonNull<AtomicU64>,
     /// Fixed table of consumer-owned hazard ranges.
     hazard_slots: NonNull<ConsumerHazardSlot>,
+    /// Producer batch descriptors, one descriptor slot per ring slot.
+    descriptors: NonNull<PublicationDescriptor>,
     /// Payload lifecycle management: reservation, retirement, and reclamation.
     payload_pool: PayloadPool<T>,
     /// Ring index mask. The ring capacity is `buffer_mask + 1`.
@@ -627,6 +638,12 @@ struct WindowOverrun {
 struct ProducerLocal {
     free: PayloadReleaseBatch,
     retired: PayloadReleaseBatch,
+}
+
+#[derive(Clone, Copy)]
+struct ProducerReservation {
+    chain: ReservedPayloads,
+    descriptor_position: usize,
 }
 
 impl ProducerLocal {
@@ -654,6 +671,49 @@ impl core::ops::Deref for CacheAlignedAtomicU64 {
 const HAZARD_FREE: u64 = 0;
 const HAZARD_INACTIVE: u64 = 1;
 const HAZARD_ACTIVE: u64 = 2;
+
+const DESCRIPTOR_PENDING: usize = 0;
+const DESCRIPTOR_READY: usize = 1;
+const DESCRIPTOR_CANCELLED: usize = 2;
+const DESCRIPTOR_PUBLISHING: usize = 3;
+
+#[repr(C)]
+struct PublicationDescriptor {
+    first_payload_index: AtomicUsize,
+    count: AtomicUsize,
+    state: AtomicUsize,
+}
+
+impl PublicationDescriptor {
+    const fn new() -> Self {
+        Self {
+            first_payload_index: AtomicUsize::new(0),
+            count: AtomicUsize::new(0),
+            state: AtomicUsize::new(DESCRIPTOR_PENDING),
+        }
+    }
+
+    fn initialize_reserved(&self, chain: ReservedPayloads) {
+        self.state.store(DESCRIPTOR_PENDING, Ordering::Release);
+        self.first_payload_index
+            .store(chain.first_payload_index() as usize, Ordering::Relaxed);
+        self.count.store(chain.len(), Ordering::Relaxed);
+    }
+
+    fn mark_ready(&self) {
+        self.state.store(DESCRIPTOR_READY, Ordering::Release);
+    }
+
+    fn cancel(&self) {
+        self.state.store(DESCRIPTOR_CANCELLED, Ordering::Release);
+    }
+
+    fn reset(&self) {
+        self.first_payload_index.store(0, Ordering::Relaxed);
+        self.count.store(0, Ordering::Relaxed);
+        self.state.store(DESCRIPTOR_PENDING, Ordering::Release);
+    }
+}
 
 #[repr(C, align(64))]
 struct ConsumerHazardSlot {
@@ -789,6 +849,7 @@ impl<T, const CONSUMER_SLOTS: usize> Clone for SharedQueue<T, CONSUMER_SLOTS> {
             header: self.header,
             ring: self.ring,
             hazard_slots: self.hazard_slots,
+            descriptors: self.descriptors,
             payload_pool: self.payload_pool.clone(),
             buffer_mask: self.buffer_mask,
             region: Arc::clone(&self.region),
@@ -836,11 +897,38 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
         &self,
         count: usize,
         local: &mut ProducerLocal,
-    ) -> Option<ReservedPayloads> {
+    ) -> Option<ProducerReservation> {
         if count == 0 || count > self.capacity() {
             return None;
         }
 
+        let chain = match self.reserve_payloads_for_write(count, local) {
+            Some(chain) => chain,
+            None => {
+                self.try_advance_publication(local);
+                self.reclaim_local_retired(local);
+                self.reserve_payloads_for_write(count, local)?
+            }
+        };
+        let Some(descriptor_position) = self.reserve_publication_descriptor(local) else {
+            self.payload_pool
+                .prepend_reserved_payloads_to_batch(chain, &mut local.free);
+            return None;
+        };
+
+        self.descriptor_at(descriptor_position)
+            .initialize_reserved(chain);
+        Some(ProducerReservation {
+            chain,
+            descriptor_position,
+        })
+    }
+
+    fn reserve_payloads_for_write(
+        &self,
+        count: usize,
+        local: &mut ProducerLocal,
+    ) -> Option<ReservedPayloads> {
         if let Some(chain) = self.reserve_from_local_free(count, local) {
             return Some(chain);
         }
@@ -872,45 +960,137 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
         self.reserve_from_local_free(count, local)
     }
 
-    fn reserve_ring_positions(&self, count: usize) -> usize {
-        let capacity = self.capacity();
-        debug_assert!(count != 0 && count <= capacity);
-        let max_pending = capacity.wrapping_sub(count);
+    fn reserve_publication_descriptor(&self, local: &mut ProducerLocal) -> Option<usize> {
+        self.try_advance_publication(local);
+        self.reclaim_local_retired_if_needed(local);
 
+        let capacity = self.capacity();
         // SAFETY: Header is non-null and valid for the queue lifetime.
         let header = unsafe { self.header.as_ref() };
-        let mut producer_reservation = header.producer_reservation.load(Ordering::Relaxed);
+        let descriptor_reservation = header
+            .producer_descriptor_reservation
+            .load(Ordering::Relaxed);
+        let descriptor_publication = header
+            .producer_descriptor_publication
+            .load(Ordering::Acquire);
+        if descriptor_reservation.wrapping_sub(descriptor_publication) >= capacity {
+            return None;
+        }
+
+        header
+            .producer_descriptor_reservation
+            .compare_exchange(
+                descriptor_reservation,
+                descriptor_reservation.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| descriptor_reservation)
+    }
+
+    fn publish_reserved_payload_chain(
+        &self,
+        reservation: ProducerReservation,
+        local: &mut ProducerLocal,
+    ) {
+        self.descriptor_at(reservation.descriptor_position)
+            .mark_ready();
+        self.try_advance_publication(local);
+        self.reclaim_local_retired_if_needed(local);
+    }
+
+    fn cancel_reserved_payloads(
+        &self,
+        reservation: ProducerReservation,
+        local: &mut ProducerLocal,
+    ) {
+        self.payload_pool
+            .prepend_reserved_payloads_to_batch(reservation.chain, &mut local.free);
+        self.descriptor_at(reservation.descriptor_position).cancel();
+        self.try_advance_publication(local);
+        self.reclaim_local_retired_if_needed(local);
+    }
+
+    fn flush_producer_local(&self, local: &mut ProducerLocal) {
+        self.reclaim_local_retired(local);
+
+        let free = local.free.take();
+        let retired = local.retired.take();
+        self.payload_pool.flush_release_batch(free);
+        self.payload_pool.flush_retired_batch(retired);
+    }
+
+    fn try_advance_publication(&self, local: &mut ProducerLocal) {
+        // SAFETY: Header is non-null and valid for the queue lifetime.
+        let header = unsafe { self.header.as_ref() };
 
         loop {
-            let producer_publication = header.producer_publication.load(Ordering::Acquire);
-            let pending = producer_reservation.wrapping_sub(producer_publication);
-            if pending > max_pending {
-                core::hint::spin_loop();
-                producer_reservation = header.producer_reservation.load(Ordering::Relaxed);
+            let descriptor_position = header
+                .producer_descriptor_publication
+                .load(Ordering::Acquire);
+            if header
+                .producer_descriptor_reservation
+                .load(Ordering::Acquire)
+                .wrapping_sub(descriptor_position)
+                == 0
+            {
+                return;
+            }
+
+            let descriptor = self.descriptor_at(descriptor_position);
+            let state = descriptor.state.load(Ordering::Acquire);
+            if state != DESCRIPTOR_READY && state != DESCRIPTOR_CANCELLED {
+                return;
+            }
+            if descriptor
+                .state
+                .compare_exchange(
+                    state,
+                    DESCRIPTOR_PUBLISHING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return;
+            }
+
+            if state == DESCRIPTOR_CANCELLED {
+                descriptor.reset();
+                header
+                    .producer_descriptor_publication
+                    .store(descriptor_position.wrapping_add(1), Ordering::Release);
                 continue;
             }
 
-            let new_reservation = producer_reservation.wrapping_add(count);
-            match header.producer_reservation.compare_exchange_weak(
-                producer_reservation,
-                new_reservation,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return producer_reservation,
-                Err(current) => producer_reservation = current,
+            let first_payload_index = descriptor.first_payload_index.load(Ordering::Acquire) as u32;
+            let count = descriptor.count.load(Ordering::Acquire);
+            if count == 0 || count > self.capacity() {
+                descriptor.state.store(DESCRIPTOR_READY, Ordering::Release);
+                return;
             }
+
+            let start = header.producer_publication.load(Ordering::Acquire);
+            let end = start.wrapping_add(count);
+            header.producer_reservation.store(end, Ordering::Release);
+            self.install_reserved_payload_chain(start, first_payload_index, count, local);
+            descriptor.reset();
+            header.producer_publication.store(end, Ordering::Release);
+            header
+                .producer_descriptor_publication
+                .store(descriptor_position.wrapping_add(1), Ordering::Release);
         }
     }
 
-    fn publish_reserved_payload_chain(&self, chain: ReservedPayloads, local: &mut ProducerLocal) {
-        let count = chain.len();
-        debug_assert!(count != 0 && count <= self.capacity());
-
-        let start = self.reserve_ring_positions(count);
-        let mut cursor = self
-            .payload_pool
-            .payload_cursor(chain.first_payload_index());
+    fn install_reserved_payload_chain(
+        &self,
+        start: usize,
+        first_payload_index: u32,
+        count: usize,
+        local: &mut ProducerLocal,
+    ) {
+        let mut cursor = self.payload_pool.payload_cursor(first_payload_index);
         let last_index = count.wrapping_sub(1);
         for index in 0..count {
             let payload_index = cursor.current();
@@ -926,37 +1106,18 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
                 cursor.advance();
             }
         }
+    }
 
-        self.publish_reserved(start, count);
+    fn reclaim_local_retired_if_needed(&self, local: &mut ProducerLocal) {
         if local.retired.len() >= PRODUCER_RETIRED_RECLAIM_THRESHOLD {
             self.reclaim_local_retired(local);
         }
     }
 
-    fn cancel_reserved_payloads(&self, chain: ReservedPayloads, local: &mut ProducerLocal) {
-        self.payload_pool
-            .prepend_reserved_payloads_to_batch(chain, &mut local.free);
-    }
-
-    fn flush_producer_local(&self, local: &mut ProducerLocal) {
-        self.reclaim_local_retired(local);
-
-        let free = local.free.take();
-        let retired = local.retired.take();
-        self.payload_pool.flush_release_batch(free);
-        self.payload_pool.flush_retired_batch(retired);
-    }
-
-    fn publish_reserved(&self, start: usize, count: usize) {
-        // SAFETY: Header is non-null and valid for the queue lifetime.
-        let header = unsafe { self.header.as_ref() };
-        while header.producer_publication.load(Ordering::Acquire) != start {
-            core::hint::spin_loop();
-        }
-
-        header
-            .producer_publication
-            .store(start.wrapping_add(count), Ordering::Release);
+    fn descriptor_at(&self, descriptor_position: usize) -> &PublicationDescriptor {
+        let index = descriptor_position & self.buffer_mask;
+        // SAFETY: Mask ensures index is in bounds.
+        unsafe { self.descriptors.add(index).as_ref() }
     }
 
     fn install_reserved_handle(&self, position: usize, handle: PayloadHandle) -> PayloadHandle {
@@ -1054,11 +1215,19 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
         let header = unsafe { self.header.as_ref() };
         header.producer_reservation.store(0, Ordering::Release);
         header.producer_publication.store(0, Ordering::Release);
+        header
+            .producer_descriptor_reservation
+            .store(0, Ordering::Release);
+        header
+            .producer_descriptor_publication
+            .store(0, Ordering::Release);
 
         for index in 0..self.capacity() {
             // SAFETY: index is in bounds.
             unsafe { self.ring.add(index).as_ref() }
                 .store(PayloadHandle::EMPTY.0, Ordering::Release);
+            // SAFETY: index is in bounds.
+            unsafe { self.descriptors.add(index).as_ref() }.reset();
         }
         for index in 0..CONSUMER_SLOTS {
             // SAFETY: index is bounded by CONSUMER_SLOTS.
@@ -1089,7 +1258,13 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
         // SAFETY: layout validation above proves these regions exist.
         let hazard_slots = unsafe { SharedQueueHeader::hazard_slots_from_header(header) };
         // SAFETY: layout validation above proves these regions exist.
-        let ring = unsafe { SharedQueueHeader::ring_from_header::<CONSUMER_SLOTS>(header) };
+        let descriptors = unsafe {
+            SharedQueueHeader::publication_descriptors_from_header::<CONSUMER_SLOTS>(header)
+        };
+        // SAFETY: layout validation above proves these regions exist.
+        let ring = unsafe {
+            SharedQueueHeader::ring_from_header::<CONSUMER_SLOTS>(header, buffer_size_in_items)
+        };
         // SAFETY: layout validation above proves these regions exist.
         let payload_headers = unsafe {
             SharedQueueHeader::payload_headers_from_header::<CONSUMER_SLOTS>(
@@ -1118,6 +1293,7 @@ impl<T, const CONSUMER_SLOTS: usize> SharedQueue<T, CONSUMER_SLOTS> {
             region,
             buffer_mask,
             hazard_slots,
+            descriptors,
         })
     }
 }
@@ -1135,17 +1311,21 @@ struct SharedQueueHeader {
     /// Payload-pool retired-list head.
     payload_retired_head: CacheAlignedAtomicU64,
 
-    /// Producer reservation cursor.
+    /// Ring overwrite reservation cursor.
     ///
-    /// Producers atomically advance this with CAS to claim ring positions. A
-    /// claimed-but-unpublished overwrite may make older unprotected items
+    /// The descriptor publisher advances this before installing handles. A
+    /// reserved-but-unpublished overwrite may make older unprotected items
     /// unavailable to consumers.
     producer_reservation: CacheAlignedAtomicSize,
     /// Producer publication cursor.
     ///
-    /// Producers advance this in-order after publishing payload handles into
-    /// the ring. Consumers use it to determine which sequence numbers exist.
+    /// Producers advance this over contiguous ready ring entries. Consumers use
+    /// it to determine which sequence numbers exist.
     producer_publication: CacheAlignedAtomicSize,
+    /// Producer descriptor reservation cursor.
+    producer_descriptor_reservation: CacheAlignedAtomicSize,
+    /// Producer descriptor publication cursor.
+    producer_descriptor_publication: CacheAlignedAtomicSize,
 }
 
 impl SharedQueueHeader {
@@ -1167,14 +1347,21 @@ impl SharedQueueHeader {
         core::mem::size_of::<Self>().next_multiple_of(core::mem::align_of::<ConsumerHazardSlot>())
     }
 
-    const fn ring_offset<const CONSUMER_SLOTS: usize>() -> usize {
+    const fn publication_descriptors_offset<const CONSUMER_SLOTS: usize>() -> usize {
         (Self::hazard_slots_offset() + CONSUMER_SLOTS * core::mem::size_of::<ConsumerHazardSlot>())
-            .next_multiple_of(core::mem::align_of::<AtomicU64>())
+            .next_multiple_of(core::mem::align_of::<PublicationDescriptor>())
+    }
+
+    const fn ring_offset<const CONSUMER_SLOTS: usize>(ring_capacity: usize) -> usize {
+        (Self::publication_descriptors_offset::<CONSUMER_SLOTS>()
+            + ring_capacity * core::mem::size_of::<PublicationDescriptor>())
+        .next_multiple_of(core::mem::align_of::<AtomicU64>())
     }
 
     const fn payload_headers_offset<const CONSUMER_SLOTS: usize>(ring_capacity: usize) -> usize {
-        (Self::ring_offset::<CONSUMER_SLOTS>() + ring_capacity * core::mem::size_of::<AtomicU64>())
-            .next_multiple_of(core::mem::align_of::<PayloadHeader>())
+        (Self::ring_offset::<CONSUMER_SLOTS>(ring_capacity)
+            + ring_capacity * core::mem::size_of::<AtomicU64>())
+        .next_multiple_of(core::mem::align_of::<PayloadHeader>())
     }
 
     const fn payloads_offset<T, const CONSUMER_SLOTS: usize>(ring_capacity: usize) -> usize {
@@ -1220,6 +1407,11 @@ impl SharedQueueHeader {
         let Some(ring_bytes) = ring_capacity.checked_mul(core::mem::size_of::<AtomicU64>()) else {
             return None;
         };
+        let Some(descriptor_bytes) =
+            ring_capacity.checked_mul(core::mem::size_of::<PublicationDescriptor>())
+        else {
+            return None;
+        };
         let Some(hazard_slots_bytes) =
             CONSUMER_SLOTS.checked_mul(core::mem::size_of::<ConsumerHazardSlot>())
         else {
@@ -1229,8 +1421,17 @@ impl SharedQueueHeader {
         else {
             return None;
         };
+        let Some(descriptors_offset) = checked_next_multiple_of(
+            hazard_slots_end,
+            core::mem::align_of::<PublicationDescriptor>(),
+        ) else {
+            return None;
+        };
+        let Some(descriptors_end) = descriptors_offset.checked_add(descriptor_bytes) else {
+            return None;
+        };
         let Some(ring_offset) =
-            checked_next_multiple_of(hazard_slots_end, core::mem::align_of::<AtomicU64>())
+            checked_next_multiple_of(descriptors_end, core::mem::align_of::<AtomicU64>())
         else {
             return None;
         };
@@ -1346,6 +1547,12 @@ impl SharedQueueHeader {
         let header = unsafe { header_ptr.as_mut() };
         header.producer_reservation.store(0, Ordering::Release);
         header.producer_publication.store(0, Ordering::Release);
+        header
+            .producer_descriptor_reservation
+            .store(0, Ordering::Release);
+        header
+            .producer_descriptor_publication
+            .store(0, Ordering::Release);
         header.payload_pool_head.store(
             payload_pool::initial_free_head(payload_capacity),
             Ordering::Release,
@@ -1369,8 +1576,21 @@ impl SharedQueueHeader {
             };
         }
 
+        // SAFETY: The calculated layout reserves `ring_capacity` descriptors.
+        let descriptors =
+            unsafe { Self::publication_descriptors_from_header::<CONSUMER_SLOTS>(header_ptr) };
+        for index in 0..ring_capacity {
+            // SAFETY: index is in bounds for the descriptor array.
+            unsafe {
+                descriptors
+                    .add(index)
+                    .as_ptr()
+                    .write(PublicationDescriptor::new())
+            };
+        }
+
         // SAFETY: The calculated layout reserves `ring_capacity` entries.
-        let ring = unsafe { Self::ring_from_header::<CONSUMER_SLOTS>(header_ptr) };
+        let ring = unsafe { Self::ring_from_header::<CONSUMER_SLOTS>(header_ptr, ring_capacity) };
         for index in 0..ring_capacity {
             // SAFETY: index is in bounds for the ring array.
             unsafe {
@@ -1425,8 +1645,9 @@ impl SharedQueueHeader {
 
     unsafe fn ring_from_header<const CONSUMER_SLOTS: usize>(
         header: NonNull<Self>,
+        ring_capacity: usize,
     ) -> NonNull<AtomicU64> {
-        let offset = Self::ring_offset::<CONSUMER_SLOTS>();
+        let offset = Self::ring_offset::<CONSUMER_SLOTS>(ring_capacity);
         // SAFETY: caller guarantees the allocation includes the ring layout.
         unsafe { header.byte_add(offset).cast() }
     }
@@ -1434,6 +1655,14 @@ impl SharedQueueHeader {
     unsafe fn hazard_slots_from_header(header: NonNull<Self>) -> NonNull<ConsumerHazardSlot> {
         let offset = Self::hazard_slots_offset();
         // SAFETY: caller guarantees the allocation includes the hazard-slot layout.
+        unsafe { header.byte_add(offset).cast() }
+    }
+
+    unsafe fn publication_descriptors_from_header<const CONSUMER_SLOTS: usize>(
+        header: NonNull<Self>,
+    ) -> NonNull<PublicationDescriptor> {
+        let offset = Self::publication_descriptors_offset::<CONSUMER_SLOTS>();
+        // SAFETY: caller guarantees the allocation includes the descriptor layout.
         unsafe { header.byte_add(offset).cast() }
     }
 
@@ -1502,7 +1731,7 @@ impl<I> WriteIterResult<I> {
 #[must_use]
 pub struct WriteBatch<'a, T, const CONSUMER_SLOTS: usize = DEFAULT_CONSUMER_SLOTS> {
     producer: &'a Producer<T, CONSUMER_SLOTS>,
-    chain: ReservedPayloads,
+    reservation: ProducerReservation,
     next_write_payload_index: u32,
     written: usize,
     _marker: PhantomData<&'a mut T>,
@@ -1510,7 +1739,7 @@ pub struct WriteBatch<'a, T, const CONSUMER_SLOTS: usize = DEFAULT_CONSUMER_SLOT
 
 impl<'a, T, const CONSUMER_SLOTS: usize> WriteBatch<'a, T, CONSUMER_SLOTS> {
     pub fn len(&self) -> usize {
-        self.chain.len()
+        self.reservation.chain.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1585,13 +1814,14 @@ impl<'a, T, const CONSUMER_SLOTS: usize> WriteBatch<'a, T, CONSUMER_SLOTS> {
     pub fn publish(self) {
         assert_eq!(self.written, self.len());
         let this = ManuallyDrop::new(self);
-        this.producer.publish_reserved_payload_chain(this.chain);
+        this.producer
+            .publish_reserved_payload_chain(this.reservation);
     }
 }
 
 impl<'a, T, const CONSUMER_SLOTS: usize> Drop for WriteBatch<'a, T, CONSUMER_SLOTS> {
     fn drop(&mut self) {
-        self.producer.cancel_reserved_payloads(self.chain);
+        self.producer.cancel_reserved_payloads(self.reservation);
     }
 }
 
@@ -1867,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn test_publication_order_follows_publish_not_reserve() {
+    fn test_publication_order_follows_reserve_not_publish() {
         let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
         let producer2 = producer.clone();
 
@@ -1879,8 +2109,86 @@ mod tests {
         first.write_next(1);
         first.publish();
 
-        assert_eq!(consumer.try_read().unwrap(), 2);
         assert_eq!(consumer.try_read().unwrap(), 1);
+        assert_eq!(consumer.try_read().unwrap(), 2);
+        assert_eq!(consumer.try_read(), Err(TryReadError::Empty));
+    }
+
+    #[test]
+    fn test_cooperative_publication_advances_ready_prefix() {
+        let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let producer2 = producer.clone();
+
+        let mut first = producer.reserve_write_batch(1).expect("reserve first");
+        let mut second = producer2.reserve_write_batch(1).expect("reserve second");
+        first.write_next(1);
+        second.write_next(2);
+
+        second.publish();
+        assert_eq!(producer.queue.published(), 0);
+        assert_eq!(consumer.try_read(), Err(TryReadError::Empty));
+
+        first.publish();
+        assert_eq!(producer.queue.published(), 2);
+
+        assert_eq!(consumer.try_read().unwrap(), 1);
+        assert_eq!(consumer.try_read().unwrap(), 2);
+        assert_eq!(consumer.try_read(), Err(TryReadError::Empty));
+    }
+
+    #[test]
+    fn test_cooperative_publication_does_not_publish_partial_batch() {
+        let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let producer2 = producer.clone();
+
+        let mut first = producer.reserve_write_batch(2).expect("reserve first");
+        let mut second = producer2.reserve_write_batch(1).expect("reserve second");
+        first.write_next(1);
+        first.write_next(2);
+        second.write_next(3);
+        second.publish();
+
+        assert_eq!(producer.queue.published(), 0);
+        assert_eq!(consumer.try_read(), Err(TryReadError::Empty));
+
+        first.publish();
+        assert_eq!(producer.queue.published(), 3);
+
+        assert_eq!(consumer.try_read().unwrap(), 1);
+        assert_eq!(consumer.try_read().unwrap(), 2);
+        assert_eq!(consumer.try_read().unwrap(), 3);
+        assert_eq!(consumer.try_read(), Err(TryReadError::Empty));
+    }
+
+    #[test]
+    fn test_descriptor_exhaustion_returns_none_until_frontier_publishes() {
+        let (_file, producer, mut consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+        let mut batches = Vec::new();
+
+        for index in 0..BUFFER_CAPACITY {
+            let mut batch = producer.reserve_write_batch(1).expect("reserve descriptor");
+            batch.write_next(index as u64);
+            batches.push(batch);
+        }
+        assert!(producer.reserve_write_batch(1).is_none());
+
+        let first = batches.remove(0);
+        first.publish();
+
+        let mut replacement = producer
+            .reserve_write_batch(1)
+            .expect("descriptor freed by frontier publication");
+        replacement.write_next(99);
+        replacement.publish();
+
+        assert_eq!(consumer.try_read().unwrap(), 0);
+        for batch in batches {
+            batch.publish();
+        }
+        for expected in 1..BUFFER_CAPACITY as u64 {
+            assert_eq!(consumer.try_read().unwrap(), expected);
+        }
+        assert_eq!(consumer.try_read().unwrap(), 99);
         assert_eq!(consumer.try_read(), Err(TryReadError::Empty));
     }
 
