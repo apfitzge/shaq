@@ -3,7 +3,8 @@ mod common;
 
 use common::{
     cleanup_queue_file, prepare_queue_file, run_consumer_loop, run_producer_loop,
-    run_total_throughput_loop, setup_exit_handler, Item, SYNC_CADENCE,
+    run_total_throughput_loop, setup_exit_handler, Item, CONSUMER_SYNC_CADENCE,
+    PRODUCER_SYNC_CADENCE,
 };
 use shaq::{
     broadcast::{self, Consumer as BroadcastConsumer, Producer as BroadcastProducer, TryReadError},
@@ -224,7 +225,7 @@ fn run_spsc_producer(
         move || {
             producer.sync();
             let mut produced = 0;
-            for _ in 0..SYNC_CADENCE {
+            for _ in 0..PRODUCER_SYNC_CADENCE {
                 // SAFETY: reserve() yields a valid write slot.
                 let Some(mut spot) = (unsafe { producer.reserve() }) else {
                     producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
@@ -249,7 +250,7 @@ fn run_spsc_consumer(
 ) {
     run_consumer_loop(exit, move || {
         consumer.sync();
-        for _ in 0..SYNC_CADENCE {
+        for _ in 0..CONSUMER_SYNC_CADENCE {
             let Some(_item) = consumer.try_read() else {
                 consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
                 break;
@@ -433,7 +434,8 @@ fn run_mpmc_producer(
 ) {
     run_producer_loop::<Item, _>(exit, report_prefix, total_items_produced, move || {
         // SAFETY: we write the batch below.
-        let Some(mut batch) = (unsafe { producer.reserve_write_batch(SYNC_CADENCE) }) else {
+        let Some(mut batch) = (unsafe { producer.reserve_write_batch(PRODUCER_SYNC_CADENCE) })
+        else {
             producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
             return None;
         };
@@ -453,7 +455,7 @@ fn run_mpmc_consumer(
     consumer_reserve_failures: Arc<AtomicU64>,
 ) {
     run_consumer_loop(exit, move || {
-        let Some(batch) = consumer.reserve_read_batch(SYNC_CADENCE) else {
+        let Some(batch) = consumer.reserve_read_batch(CONSUMER_SYNC_CADENCE) else {
             consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
             return;
         };
@@ -469,12 +471,12 @@ fn run_broadcast_producer(
     producer_reserve_failures: Arc<AtomicU64>,
 ) {
     run_producer_loop::<Item, _>(exit, report_prefix, total_items_produced, move || {
-        let Some(mut batch) = producer.reserve_write_batch(SYNC_CADENCE) else {
+        let Some(mut batch) = producer.reserve_write_batch(PRODUCER_SYNC_CADENCE) else {
             producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
             return None;
         };
         let len = batch.len();
-        let result = batch.write_iter((0..len).map(|_| Item { data: [42; 512] }));
+        let result = batch.write_iter((0..len).map(|_| Item { data: [42; _] }));
         debug_assert_eq!(result.written(), len);
         debug_assert!(result.batch_filled());
         batch.publish();
@@ -490,7 +492,7 @@ fn run_broadcast_consumer(
     run_consumer_loop(exit, move || {
         // SAFETY: the benchmark claims payload references but does not
         // dereference payload bytes.
-        match unsafe { consumer.try_read_direct_batch(SYNC_CADENCE) } {
+        match unsafe { consumer.try_read_direct_batch(CONSUMER_SYNC_CADENCE) } {
             Ok(batch) => batch.commit(),
             Err(TryReadError::Skipped(skipped)) => {
                 consumer_reserve_failures.fetch_add(skipped as u64, Ordering::Relaxed);

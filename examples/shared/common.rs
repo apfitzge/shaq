@@ -8,11 +8,14 @@ use std::{
 };
 
 pub struct Item {
-    pub data: [u8; 512],
+    pub data: [u8; 96],
 }
 
-// Synchronize/Batch size cadence.
-pub const SYNC_CADENCE: usize = 1024;
+// Producer publication cadence and consumer read cadence are intentionally split
+// so small-event producer synchronization can be measured independently from
+// consumer-side batching.
+pub const PRODUCER_SYNC_CADENCE: usize = 1;
+pub const CONSUMER_SYNC_CADENCE: usize = 1024;
 
 pub fn setup_exit_handler() -> Arc<AtomicBool> {
     let exit = Arc::new(AtomicBool::new(false));
