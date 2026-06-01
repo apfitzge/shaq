@@ -828,9 +828,9 @@ pub fn minimum_region_size_for_config<T>(config: BroadcastConfig) -> usize {
 /// |   cacheline 1             | consumer_wait_generation
 /// |   cacheline 2             | consumer_waiters
 /// +---------------------------+
-/// | payload free heads        | [AtomicU64; producer_slots], 64-byte stride
+/// | payload free heads        | [u32; producer_slots], 64-byte stride
 /// +---------------------------+
-/// | payload retired heads     | [AtomicU64; producer_slots], 64-byte stride
+/// | payload retired heads     | [u32; producer_slots], 64-byte stride
 /// +---------------------------+
 /// | producer lanes            | [ProducerSlot; producer_slots]
 /// +---------------------------+
@@ -2109,18 +2109,15 @@ impl SharedQueueHeader {
                 free_heads
                     .cast::<u8>()
                     .byte_add(lane * CACHELINE_SIZE)
-                    .cast::<AtomicU64>()
+                    .cast::<u32>()
                     .as_ptr()
-                    .write(AtomicU64::new(payload_pool::initial_free_head(
-                        lane,
-                        payload_lane_capacity,
-                    )));
+                    .write(payload_pool::initial_free_head(lane, payload_lane_capacity));
                 retired_heads
                     .cast::<u8>()
                     .byte_add(lane * CACHELINE_SIZE)
-                    .cast::<AtomicU64>()
+                    .cast::<u32>()
                     .as_ptr()
-                    .write(AtomicU64::new(payload_pool::initial_retired_head()));
+                    .write(payload_pool::initial_retired_head());
             }
         }
 
@@ -2244,13 +2241,13 @@ impl SharedQueueHeader {
         unsafe { header.byte_add(offset).cast() }
     }
 
-    unsafe fn payload_free_heads_from_header(header: NonNull<Self>) -> NonNull<AtomicU64> {
+    unsafe fn payload_free_heads_from_header(header: NonNull<Self>) -> NonNull<u32> {
         let offset = Self::payload_free_heads_offset();
         // SAFETY: caller guarantees the allocation includes the free-head layout.
         unsafe { header.byte_add(offset).cast() }
     }
 
-    unsafe fn payload_retired_heads_from_header(header: NonNull<Self>) -> NonNull<AtomicU64> {
+    unsafe fn payload_retired_heads_from_header(header: NonNull<Self>) -> NonNull<u32> {
         let producer_slots = unsafe { header.as_ref() }.producer_slots as usize;
         let offset = Self::payload_retired_heads_offset(producer_slots);
         // SAFETY: caller guarantees the allocation includes the retired-head layout.
