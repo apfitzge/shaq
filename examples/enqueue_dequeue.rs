@@ -15,8 +15,10 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 const QUEUE_CAPACITY: usize = 1024 * 1024;
+const BROADCAST_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
 
 enum Mode {
     Spsc,
@@ -86,13 +88,6 @@ fn parse_config_or_exit() -> Config {
         Some("broadcast") => {
             let producers = parse_usize_arg(positional.get(1).cloned(), 2, "producers");
             let consumers = parse_usize_arg(positional.get(2).cloned(), 2, "consumers");
-            if consumers > broadcast::DEFAULT_CONSUMER_SLOTS {
-                eprintln!(
-                    "Broadcast consumers cannot exceed {} in this example",
-                    broadcast::DEFAULT_CONSUMER_SLOTS
-                );
-                std::process::exit(2);
-            }
             if positional.len() > 3 {
                 eprintln!("Too many arguments for broadcast mode");
                 print_usage();
@@ -127,10 +122,6 @@ fn parse_usize_arg(value: Option<String>, default: usize, name: &str) -> usize {
 fn print_usage() {
     eprintln!(
         "Usage: cargo run --example enqueue_dequeue -- [-v|--verbose] [spsc|mpmc [producers] [consumers]|broadcast [producers] [consumers]]"
-    );
-    eprintln!(
-        "Broadcast consumers are capped at {} in this example",
-        broadcast::DEFAULT_CONSUMER_SLOTS
     );
 }
 
@@ -353,20 +344,21 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
 
     // SAFETY: This thread uniquely creates the queue.
     unsafe {
-        let queue_size = broadcast::minimum_file_size::<Item>(QUEUE_CAPACITY);
-        let _ = BroadcastProducer::<Item>::create(&queue_file, queue_size).unwrap();
+        let config = broadcast::BroadcastConfig::new(QUEUE_CAPACITY)
+            .with_producer_slots(producers)
+            .with_consumer_slots(consumers);
+        let initializer = BroadcastProducer::<Item>::create(&queue_file, config).unwrap();
+        drop(initializer);
     }
-    // SAFETY: Queue was created above; each cloned producer handle keeps its own
-    // local producer cache and can publish independently.
-    let producer = unsafe { BroadcastProducer::<Item>::join(&queue_file) }.unwrap();
 
-    let mut handles = Vec::new();
+    let mut consumer_handles = Vec::new();
+    let mut producer_handles = Vec::new();
 
     for (idx, core_id) in consumer_cores.into_iter().enumerate() {
         let exit = exit.clone();
         let queue_file = queue_file.try_clone().unwrap();
         let consumer_reserve_failures = consumer_reserve_failures.clone();
-        handles.push(
+        consumer_handles.push(
             std::thread::Builder::new()
                 .name(format!("shaqBroadcastConsumer{idx}"))
                 .spawn(move || {
@@ -386,9 +378,9 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
 
     for (idx, core_id) in producer_cores.into_iter().enumerate() {
         let exit = exit.clone();
-        let producer = producer.clone();
+        let queue_file = queue_file.try_clone().unwrap();
         let report_prefix = verbose.then(|| format!("Producer {idx}"));
-        handles.push(
+        producer_handles.push(
             std::thread::Builder::new()
                 .name(format!("shaqBroadcastProducer{idx}"))
                 .spawn({
@@ -400,6 +392,10 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
                             core_affinity::set_for_current(core_id);
                         }
 
+                        // SAFETY: Queue was created above; each producer joins
+                        // its own runtime lane.
+                        let producer =
+                            unsafe { BroadcastProducer::<Item>::join(&queue_file) }.unwrap();
                         run_broadcast_producer(
                             producer,
                             exit,
@@ -419,7 +415,10 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
         producer_reserve_failures,
         consumer_reserve_failures,
     );
-    for handle in handles {
+    for handle in producer_handles {
+        handle.join().unwrap();
+    }
+    for handle in consumer_handles {
         handle.join().unwrap();
     }
 
@@ -472,6 +471,16 @@ fn run_broadcast_producer(
     producer_reserve_failures: Arc<AtomicU64>,
 ) {
     run_producer_loop::<Item, _>(exit, report_prefix, total_items_produced, move || {
+        if PRODUCER_SYNC_CADENCE == 1 {
+            return match producer.try_write(Item { data: [42; _] }) {
+                Ok(()) => Some(1),
+                Err(_) => {
+                    producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            };
+        }
+
         let Some(mut batch) = producer.reserve_write_batch(PRODUCER_SYNC_CADENCE) else {
             producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -493,7 +502,14 @@ fn run_broadcast_consumer(
     run_consumer_loop(exit, move || {
         // SAFETY: the benchmark claims payload references but does not
         // dereference payload bytes.
-        match unsafe { consumer.try_read_direct_batch(CONSUMER_SYNC_CADENCE) } {
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            consumer.read_direct_batch_timeout(CONSUMER_SYNC_CADENCE, BROADCAST_WAIT_TIMEOUT)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let result = unsafe { consumer.try_read_direct_batch(CONSUMER_SYNC_CADENCE) };
+
+        match result {
             Ok(batch) => batch.commit(),
             Err(TryReadError::Skipped(skipped)) => {
                 consumer_reserve_failures.fetch_add(skipped as u64, Ordering::Relaxed);

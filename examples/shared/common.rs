@@ -16,6 +16,7 @@ pub struct Item {
 // consumer-side batching.
 pub const PRODUCER_SYNC_CADENCE: usize = 1;
 pub const CONSUMER_SYNC_CADENCE: usize = 1024;
+const PRODUCER_TOTAL_FLUSH_CADENCE: u64 = 4096;
 
 pub fn setup_exit_handler() -> Arc<AtomicBool> {
     let exit = Arc::new(AtomicBool::new(false));
@@ -119,16 +120,26 @@ pub fn run_producer_loop<T, F>(
 {
     let mut now = Instant::now();
     let mut items_produced = 0u64;
+    let mut pending_total_items = 0u64;
 
     while !exit.load(Ordering::Acquire) {
         let Some(produced) = produce_batch() else {
             continue;
         };
-        total_items_produced.fetch_add(produced as u64, Ordering::Relaxed);
-        items_produced += produced as u64;
+        let produced = produced as u64;
+        pending_total_items += produced;
+        if pending_total_items >= PRODUCER_TOTAL_FLUSH_CADENCE {
+            total_items_produced.fetch_add(pending_total_items, Ordering::Relaxed);
+            pending_total_items = 0;
+        }
+        items_produced += produced;
         if let Some(prefix) = report_prefix.as_deref() {
             report_throughput::<T>(&mut now, &mut items_produced, prefix);
         }
+    }
+
+    if pending_total_items != 0 {
+        total_items_produced.fetch_add(pending_total_items, Ordering::Relaxed);
     }
 }
 
