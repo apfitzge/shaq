@@ -6,6 +6,7 @@ pub enum Error {
     InvalidVersion { expected: u32, actual: u32 },
     InvalidBufferSize,
     InvalidConsumerSlots { expected: usize, actual: usize },
+    InvalidConsumerIndex { index: usize, slots: usize },
     ProducerSlotsExhausted,
     ConsumerSlotsExhausted,
     InvalidRegionAlignment { minimum: usize, actual: usize },
@@ -32,6 +33,10 @@ impl Display for Error {
             Self::InvalidConsumerSlots { expected, actual } => write!(
                 f,
                 "invalid consumer slot count; expected={expected}; found={actual}"
+            ),
+            Self::InvalidConsumerIndex { index, slots } => write!(
+                f,
+                "invalid consumer slot index; index={index}; slots={slots}"
             ),
             Self::ProducerSlotsExhausted => write!(f, "producer slots exhausted"),
             Self::ConsumerSlotsExhausted => write!(f, "consumer slots exhausted"),
@@ -94,6 +99,14 @@ mod tests {
             }
             .to_string(),
             "invalid consumer slot count; expected=8; found=4"
+        );
+    }
+
+    #[test]
+    fn test_invalid_consumer_index_display() {
+        assert_eq!(
+            Error::InvalidConsumerIndex { index: 3, slots: 2 }.to_string(),
+            "invalid consumer slot index; index=3; slots=2"
         );
     }
 }

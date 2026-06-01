@@ -199,6 +199,22 @@ impl<T> Producer<T> {
         Consumer::from_queue(self.queue.clone())
     }
 
+    /// Forcibly creates a Consumer at `index` using this producer's mapping.
+    ///
+    /// The claimed consumer starts at each producer lane's current publication
+    /// cursor and will only observe values published after it joins.
+    ///
+    /// # Safety
+    /// - The caller must guarantee no live [`Consumer`] handle owns `index`.
+    /// - The caller must guarantee no live direct-read guard from `index` can
+    ///   still access payloads.
+    /// - Racing with any live consumer that owns `index` may let producers
+    ///   reclaim payload storage still being read.
+    pub unsafe fn claim_consumer_slot(&self, index: usize) -> Result<Consumer<T>, Error> {
+        // SAFETY: forwarded from this function's safety contract.
+        unsafe { Consumer::from_queue_at_index(self.queue.clone(), index) }
+    }
+
     /// Calculates the minimum file size for a broadcast queue config.
     pub fn minimum_file_size(config: BroadcastConfig) -> usize {
         config.minimum_file_size::<T>()
@@ -388,6 +404,28 @@ impl<T> Consumer<T> {
         Self::from_queue(queue)
     }
 
+    /// Forcibly joins an existing queue by taking ownership of consumer slot
+    /// `index`.
+    ///
+    /// This clears all hazard ranges previously published by that consumer slot,
+    /// marks the slot owned by the returned consumer, and starts at each
+    /// producer lane's current publication cursor.
+    ///
+    /// # Safety
+    /// - `file` must satisfy the same requirements as [`Self::join`].
+    /// - The caller must guarantee no live [`Consumer`] handle owns `index`.
+    /// - The caller must guarantee no live direct-read guard from `index` can
+    ///   still access payloads.
+    /// - Racing with any live consumer that owns `index` may let producers
+    ///   reclaim payload storage still being read.
+    pub unsafe fn claim_slot(file: &File, index: usize) -> Result<Self, Error> {
+        let (region, header) = SharedQueueHeader::join::<T>(file)?;
+        // SAFETY: `header` belongs to `region` and was validated by join.
+        let queue = unsafe { SharedQueue::from_header(region, header) }?;
+        // SAFETY: forwarded from this function's safety contract.
+        unsafe { Self::from_queue_at_index(queue, index) }
+    }
+
     /// Creates a Producer that shares the same memory mapping.
     pub fn join_as_producer(&self) -> Result<Producer<T>, Error> {
         let queue = self.queue.clone();
@@ -409,8 +447,26 @@ impl<T> Consumer<T> {
         self.queue.capacity()
     }
 
+    /// Returns the runtime consumer slot owned by this handle.
+    pub fn slot_index(&self) -> usize {
+        self.hazard.index
+    }
+
     fn from_queue(queue: SharedQueue<T>) -> Result<Self, Error> {
         let hazard = queue.acquire_consumer_hazard()?;
+        Self::from_queue_with_hazard(queue, hazard)
+    }
+
+    unsafe fn from_queue_at_index(queue: SharedQueue<T>, index: usize) -> Result<Self, Error> {
+        // SAFETY: forwarded from this function's safety contract.
+        let hazard = unsafe { queue.claim_consumer_hazard(index) }?;
+        Self::from_queue_with_hazard(queue, hazard)
+    }
+
+    fn from_queue_with_hazard(
+        queue: SharedQueue<T>,
+        hazard: ConsumerHazard,
+    ) -> Result<Self, Error> {
         for lane in 0..queue.producer_slots() {
             queue
                 .consumer_cursor(hazard.index, lane)
@@ -968,6 +1024,12 @@ impl ConsumerHazardSlot {
         self.state.store(HAZARD_INACTIVE, Ordering::Release);
     }
 
+    fn force_claim(&self) {
+        self.start.store(0, Ordering::Relaxed);
+        self.end.store(0, Ordering::Relaxed);
+        self.state.store(HAZARD_INACTIVE, Ordering::Release);
+    }
+
     fn protect(&self, start: usize, end: usize) {
         self.start.store(start, Ordering::Relaxed);
         self.end.store(end, Ordering::Relaxed);
@@ -1452,6 +1514,25 @@ impl<T> SharedQueue<T> {
         }
 
         Err(Error::ConsumerSlotsExhausted)
+    }
+
+    unsafe fn claim_consumer_hazard(&self, index: usize) -> Result<ConsumerHazard, Error> {
+        if index >= self.consumer_slots {
+            return Err(Error::InvalidConsumerIndex {
+                index,
+                slots: self.consumer_slots,
+            });
+        }
+
+        for lane in 0..self.producer_slots {
+            self.consumer_hazard_slot(index, lane).force_claim();
+        }
+
+        Ok(ConsumerHazard {
+            slots: self.hazard_slots,
+            index,
+            producer_slots: self.producer_slots,
+        })
     }
 
     fn acquire_producer_lane(&self) -> Result<ProducerLane, Error> {
@@ -3056,6 +3137,63 @@ mod tests {
         }
 
         assert!(producer.reserve_write_batch(1).is_some());
+    }
+
+    #[test]
+    fn test_claim_consumer_slot_clears_stale_hazard() {
+        let file = create_temp_shmem_file().unwrap();
+        let producer = unsafe {
+            Producer::<Item>::create(
+                &file,
+                BroadcastConfig::new(BUFFER_SIZE)
+                    .with_producer_slots(1)
+                    .with_consumer_slots(1),
+            )
+        }
+        .expect("create failed");
+        let mut consumer = unsafe { Consumer::<Item>::join(&file) }.expect("join failed");
+        let slot = consumer.slot_index();
+
+        for i in 0..BUFFER_CAPACITY as u64 {
+            producer.try_write(i).unwrap();
+        }
+        let guarded = unsafe { consumer.try_read_direct_batch(BUFFER_CAPACITY) }.unwrap();
+        for i in 0..BUFFER_CAPACITY as u64 {
+            producer.try_write(100 + i).unwrap();
+        }
+
+        assert!(producer.reserve_write_batch(1).is_none());
+        core::mem::forget(guarded);
+        core::mem::forget(consumer);
+
+        let mut claimed =
+            unsafe { Consumer::<Item>::claim_slot(&file, slot) }.expect("claim consumer slot");
+        assert_eq!(claimed.slot_index(), slot);
+        assert_eq!(claimed.try_read(), Err(TryReadError::Empty));
+        assert!(producer.reserve_write_batch(1).is_some());
+    }
+
+    #[test]
+    fn test_claim_consumer_slot_rejects_out_of_range_index() {
+        let file = create_temp_shmem_file().unwrap();
+        let producer = unsafe {
+            Producer::<Item>::create(
+                &file,
+                BroadcastConfig::new(BUFFER_SIZE).with_consumer_slots(1),
+            )
+        }
+        .expect("create failed");
+
+        match unsafe { Consumer::<Item>::claim_slot(&file, 1) } {
+            Err(Error::InvalidConsumerIndex { index: 1, slots: 1 }) => {}
+            Err(err) => panic!("unexpected consumer claim error: {err}"),
+            Ok(_) => panic!("consumer claim unexpectedly succeeded"),
+        }
+        match unsafe { producer.claim_consumer_slot(1) } {
+            Err(Error::InvalidConsumerIndex { index: 1, slots: 1 }) => {}
+            Err(err) => panic!("unexpected producer-side claim error: {err}"),
+            Ok(_) => panic!("producer-side consumer claim unexpectedly succeeded"),
+        }
     }
 
     #[test]
