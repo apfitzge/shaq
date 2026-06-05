@@ -6,13 +6,12 @@ use core::{
 const CACHELINE_SIZE: usize = 64;
 pub(super) const PAYLOADS_PER_RING_ENTRY: usize = 2;
 
-const EMPTY_PAYLOAD: u32 = 0;
+const NO_PAYLOAD: u32 = 0;
 
-/// Payload descriptor. `generation` is copied into ring handles; `next_free`
-/// links payloads through the free and retired lists.
+/// Payload descriptor. `next_free` links payloads through the free and retired
+/// lists.
 #[repr(C)]
 pub(super) struct PayloadHeader {
-    generation: AtomicU32,
     next_free: AtomicU32,
     retired_lane: AtomicU32,
     retired_sequence: AtomicUsize,
@@ -21,7 +20,6 @@ pub(super) struct PayloadHeader {
 impl PayloadHeader {
     const fn new(next_free: u32) -> Self {
         Self {
-            generation: AtomicU32::new(0),
             next_free: AtomicU32::new(next_free),
             retired_lane: AtomicU32::new(0),
             retired_sequence: AtomicUsize::new(0),
@@ -29,8 +27,7 @@ impl PayloadHeader {
     }
 }
 
-/// Ring payload handle: high 32 bits are generation, low 32 bits are a nullable
-/// payload index.
+/// Ring payload handle: zero means no payload; otherwise `payload_index + 1`.
 #[derive(Clone, Copy, PartialEq)]
 #[repr(transparent)]
 pub(super) struct PayloadHandle(pub(super) u64);
@@ -39,18 +36,13 @@ impl PayloadHandle {
     pub(super) const EMPTY: Self = Self(0);
 
     #[inline]
-    fn new(payload_index: u32, generation: u32) -> Self {
-        Self(((generation as u64) << 32) | encode_payload_index(payload_index) as u64)
+    fn new(payload_index: u32) -> Self {
+        Self(stored_payload_index(payload_index) as u64)
     }
 
     #[inline]
     fn payload_index(self) -> Option<u32> {
-        decode_payload_index(self.0 as u32)
-    }
-
-    #[inline]
-    fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
+        payload_index_from_stored(self.0 as u32)
     }
 }
 
@@ -221,9 +213,7 @@ impl<T> PayloadPool<T> {
             return None;
         }
 
-        let chain = self.take_free_payloads_exact(0, count)?;
-        self.prepare_reserved_payloads(chain);
-        Some(chain)
+        self.take_free_payloads_exact(0, count)
     }
 
     pub(super) fn take_free_payloads_exact(
@@ -244,40 +234,9 @@ impl<T> PayloadPool<T> {
         self.push_free_payloads(0, chain.first_payload_index, chain.last_payload_index);
     }
 
-    #[cfg(test)]
-    pub(super) fn prepare_reserved_payloads(&self, chain: ReservedPayloads) {
-        self.prepare_reserved_payloads_in_lane(0, chain);
-    }
-
-    #[inline(always)]
-    pub(super) fn prepare_reserved_payloads_in_lane(&self, lane: usize, chain: ReservedPayloads) {
-        let mut cursor = self.payload_cursor(lane, chain.first_payload_index);
-        let last_index = chain.count.wrapping_sub(1);
-        for index in 0..chain.count {
-            self.prepare_reserved_payload_in_lane(lane, cursor.current());
-            if index != last_index {
-                cursor.advance();
-            }
-        }
-    }
-
-    #[inline]
-    #[cfg(test)]
     pub(super) fn handle_for_payload(&self, payload_index: u32) -> PayloadHandle {
-        self.handle_for_payload_in_lane(0, payload_index)
-    }
-
-    #[inline(always)]
-    pub(super) fn handle_for_payload_in_lane(
-        &self,
-        lane: usize,
-        payload_index: u32,
-    ) -> PayloadHandle {
-        let generation = self
-            .payload_header_at(lane, self.payload_offset(payload_index))
-            .generation
-            .load(Ordering::Relaxed);
-        PayloadHandle::new(payload_index, generation)
+        debug_assert!((payload_index as usize) < self.capacity);
+        PayloadHandle::new(payload_index)
     }
 
     pub(super) fn payload_for_protected_handle(
@@ -285,20 +244,6 @@ impl<T> PayloadPool<T> {
         handle: PayloadHandle,
     ) -> Option<ProtectedPayload> {
         self.valid_payload_index(handle).map(ProtectedPayload::new)
-    }
-
-    #[cfg(test)]
-    fn payload_for_handle(&self, handle: PayloadHandle) -> Option<ProtectedPayload> {
-        let payload_index = self.valid_payload_index(handle)?;
-        let generation = self
-            .payload_header(payload_index)
-            .generation
-            .load(Ordering::Acquire);
-        if generation == handle.generation() {
-            Some(ProtectedPayload::new(payload_index))
-        } else {
-            None
-        }
     }
 
     #[cfg(test)]
@@ -324,9 +269,6 @@ impl<T> PayloadPool<T> {
         };
         debug_assert_eq!(lane, retired.lane());
         let payload_header = self.payload_header_at(lane, self.payload_offset(payload_index));
-        if payload_header.generation.load(Ordering::Acquire) != handle.generation() {
-            return;
-        }
 
         payload_header
             .retired_lane
@@ -451,10 +393,10 @@ impl<T> PayloadPool<T> {
             .load(Ordering::Relaxed);
         self.payload_header_at(lane, self.payload_offset(last_payload_index))
             .next_free
-            .store(EMPTY_PAYLOAD, Ordering::Relaxed);
+            .store(NO_PAYLOAD, Ordering::Relaxed);
 
         batch.count -= count;
-        batch.first_payload_index = decode_payload_index(next);
+        batch.first_payload_index = payload_index_from_stored(next);
         if batch.count == 0 {
             batch.last_payload_index = None;
         }
@@ -501,7 +443,7 @@ impl<T> PayloadPool<T> {
 
     #[inline(always)]
     pub(super) fn next_payload_index_in_lane(&self, lane: usize, payload_index: u32) -> u32 {
-        decode_non_empty_payload_index(
+        payload_index_from_non_null_stored(
             self.payload_header_at(lane, self.payload_offset(payload_index))
                 .next_free
                 .load(Ordering::Relaxed),
@@ -519,21 +461,6 @@ impl<T> PayloadPool<T> {
         }
 
         self.reset_free_links();
-    }
-
-    #[inline(always)]
-    fn prepare_reserved_payload_in_lane(&self, lane: usize, payload_index: u32) {
-        let payload_header = self.payload_header_at(lane, self.payload_offset(payload_index));
-        let mut generation = payload_header
-            .generation
-            .load(Ordering::Relaxed)
-            .wrapping_add(1);
-        if generation == 0 {
-            generation = 1;
-        }
-        payload_header
-            .generation
-            .store(generation, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -565,10 +492,10 @@ impl<T> PayloadPool<T> {
     ) where
         F: FnMut(RetiredPayload) -> bool,
     {
-        let mut encoded = encode_payload_index(first_payload_index);
+        let mut stored = stored_payload_index(first_payload_index);
 
-        while encoded != EMPTY_PAYLOAD {
-            let payload_index = decode_non_empty_payload_index(encoded);
+        while stored != NO_PAYLOAD {
+            let payload_index = payload_index_from_non_null_stored(stored);
             let payload_header = self.payload_header_at(lane, self.payload_offset(payload_index));
             let next = payload_header.next_free.load(Ordering::Relaxed);
             let retired_lane = payload_header.retired_lane.load(Ordering::Relaxed) as usize;
@@ -580,7 +507,7 @@ impl<T> PayloadPool<T> {
                 self.prepend_payload(lane, payload_index, free_batch);
             }
 
-            encoded = next;
+            stored = next;
         }
     }
 
@@ -624,34 +551,34 @@ impl<T> PayloadPool<T> {
         let free_head = self.free_head(lane);
         // SAFETY: this producer owns `lane`; consumers never read pool heads.
         let first = unsafe { free_head.as_ptr().read() };
-        if first == EMPTY_PAYLOAD {
+        if first == NO_PAYLOAD {
             return None;
         }
 
-        let mut encoded = first;
+        let mut stored = first;
         let mut last_payload_index = 0;
         for _ in 0..count {
-            if encoded == EMPTY_PAYLOAD {
+            if stored == NO_PAYLOAD {
                 return None;
             }
-            let payload_index = decode_non_empty_payload_index(encoded);
+            let payload_index = payload_index_from_non_null_stored(stored);
             assert!(
                 (payload_index as usize) < self.capacity,
                 "corrupt free payload chain"
             );
             last_payload_index = payload_index;
-            encoded = self
+            stored = self
                 .payload_header_at(lane, self.payload_offset(payload_index))
                 .next_free
                 .load(Ordering::Relaxed);
         }
 
         // SAFETY: this producer owns `lane`; consumers never read pool heads.
-        unsafe { free_head.as_ptr().write(encoded) };
-        let first_payload_index = decode_non_empty_payload_index(first);
+        unsafe { free_head.as_ptr().write(stored) };
+        let first_payload_index = payload_index_from_non_null_stored(first);
         self.payload_header_at(lane, self.payload_offset(last_payload_index))
             .next_free
-            .store(EMPTY_PAYLOAD, Ordering::Relaxed);
+            .store(NO_PAYLOAD, Ordering::Relaxed);
         Some(ReservedPayloads {
             first_payload_index,
             last_payload_index,
@@ -663,12 +590,12 @@ impl<T> PayloadPool<T> {
         let retired_head = self.retired_head(lane);
         // SAFETY: this producer owns `lane`; consumers never read pool heads.
         let first = unsafe { retired_head.as_ptr().read() };
-        if first == EMPTY_PAYLOAD {
+        if first == NO_PAYLOAD {
             return None;
         }
         // SAFETY: this producer owns `lane`; consumers never read pool heads.
-        unsafe { retired_head.as_ptr().write(EMPTY_PAYLOAD) };
-        Some(decode_non_empty_payload_index(first))
+        unsafe { retired_head.as_ptr().write(NO_PAYLOAD) };
+        Some(payload_index_from_non_null_stored(first))
     }
 
     #[inline]
@@ -703,7 +630,7 @@ impl<T> PayloadPool<T> {
         first_payload_index: u32,
         last_payload_index: u32,
     ) {
-        let first = encode_payload_index(first_payload_index);
+        let first = stored_payload_index(first_payload_index);
         // SAFETY: this producer owns `lane`; consumers never read pool heads.
         let current = unsafe { head.as_ptr().read() };
         self.payload_header_at(lane, self.payload_offset(last_payload_index))
@@ -720,8 +647,8 @@ impl<T> PayloadPool<T> {
             .store(
                 batch
                     .first_payload_index
-                    .map(encode_payload_index)
-                    .unwrap_or(EMPTY_PAYLOAD),
+                    .map(stored_payload_index)
+                    .unwrap_or(NO_PAYLOAD),
                 Ordering::Relaxed,
             );
         if batch.last_payload_index.is_none() {
@@ -745,8 +672,8 @@ impl<T> PayloadPool<T> {
             .store(
                 batch
                     .first_payload_index
-                    .map(encode_payload_index)
-                    .unwrap_or(EMPTY_PAYLOAD),
+                    .map(stored_payload_index)
+                    .unwrap_or(NO_PAYLOAD),
                 Ordering::Relaxed,
             );
         if batch.last_payload_index.is_none() {
@@ -778,7 +705,7 @@ impl<T> PayloadPool<T> {
 
             let retired_head = self.retired_head(lane);
             // SAFETY: exclusive recovery owns all producer lanes.
-            unsafe { retired_head.as_ptr().write(EMPTY_PAYLOAD) };
+            unsafe { retired_head.as_ptr().write(NO_PAYLOAD) };
         }
     }
 
@@ -873,7 +800,7 @@ pub(super) fn initial_free_head(lane: usize, lane_capacity: usize) -> u32 {
 
 #[inline]
 pub(super) const fn initial_retired_head() -> u32 {
-    EMPTY_PAYLOAD
+    NO_PAYLOAD
 }
 
 pub(super) unsafe fn initialize_payload_headers(
@@ -904,44 +831,44 @@ pub(super) unsafe fn initialize_payload_headers(
     }
 }
 
-/// Nullable payload index stored in `PayloadHandle`, pool heads, and free-list links.
-/// Zero means empty; non-zero values are `payload_index + 1`.
+/// Payload references stored in `PayloadHandle`, pool heads, and free-list links.
+/// Zero means no payload; non-zero values are `payload_index + 1`.
 #[inline]
-fn encode_payload_index(payload_index: u32) -> u32 {
+fn stored_payload_index(payload_index: u32) -> u32 {
     debug_assert!(payload_index != u32::MAX, "payload index overflow");
     payload_index.wrapping_add(1)
 }
 
 #[inline]
-fn decode_payload_index(encoded: u32) -> Option<u32> {
-    if encoded == EMPTY_PAYLOAD {
+fn payload_index_from_stored(stored: u32) -> Option<u32> {
+    if stored == NO_PAYLOAD {
         None
     } else {
-        Some(decode_non_empty_payload_index(encoded))
+        Some(payload_index_from_non_null_stored(stored))
     }
 }
 
 #[inline]
-fn decode_non_empty_payload_index(encoded: u32) -> u32 {
-    debug_assert!(encoded != EMPTY_PAYLOAD, "empty encoded payload index");
-    encoded.wrapping_sub(1)
+fn payload_index_from_non_null_stored(stored: u32) -> u32 {
+    debug_assert!(stored != NO_PAYLOAD, "no payload");
+    stored.wrapping_sub(1)
 }
 
 #[inline]
 fn next_free_after_lane(lane: usize, offset: usize, lane_capacity: usize) -> u32 {
     if offset + 1 == lane_capacity {
-        EMPTY_PAYLOAD
+        NO_PAYLOAD
     } else {
-        encode_payload_index((lane * lane_capacity + offset + 1) as u32)
+        stored_payload_index((lane * lane_capacity + offset + 1) as u32)
     }
 }
 
 #[inline]
 fn first_for_lane(lane: usize, lane_capacity: usize) -> u32 {
     if lane_capacity == 0 {
-        EMPTY_PAYLOAD
+        NO_PAYLOAD
     } else {
-        encode_payload_index((lane * lane_capacity) as u32)
+        stored_payload_index((lane * lane_capacity) as u32)
     }
 }
 
@@ -1004,7 +931,7 @@ mod tests {
 
     #[test]
     fn payload_header_uses_compact_layout() {
-        assert_eq!(size_of::<PayloadHeader>(), 24);
+        assert_eq!(size_of::<PayloadHeader>(), 16);
     }
 
     #[test]
@@ -1114,7 +1041,9 @@ mod tests {
             &mut payloads,
         );
 
-        assert!(pool.payload_for_handle(PayloadHandle::EMPTY).is_none());
+        assert!(pool
+            .payload_for_protected_handle(PayloadHandle::EMPTY)
+            .is_none());
     }
 
     #[test]

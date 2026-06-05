@@ -7,8 +7,8 @@
 //! without racing the guarded payload bytes.
 //!
 //! Each producer owns one publication lane. Producers write payload bytes into a
-//! separated fixed payload pool, then publish generation-checked payload handles
-//! directly into that lane's ring. Consumers merge producer lanes
+//! separated fixed payload pool, then publish payload handles directly into
+//! that lane's ring. Consumers merge producer lanes
 //! opportunistically; publication order is preserved within one lane, not
 //! across different lanes.
 //! A consumer that has not published a hazard before its ring position is
@@ -1301,9 +1301,7 @@ impl<T> SharedQueue<T> {
         producer_lane
             .producer_reservation
             .store(end, Ordering::Release);
-        let handle = self
-            .payload_pool
-            .handle_for_payload_in_lane(lane, payload_index);
+        let handle = self.payload_pool.handle_for_payload(payload_index);
         let old = self.install_reserved_handle(lane, start, handle);
         self.payload_pool.retire_to_batch_in_lane(
             lane,
@@ -1430,9 +1428,7 @@ impl<T> SharedQueue<T> {
         let last_index = count.wrapping_sub(1);
         for index in 0..count {
             let payload_index = cursor.current();
-            let handle = self
-                .payload_pool
-                .handle_for_payload_in_lane(lane, payload_index);
+            let handle = self.payload_pool.handle_for_payload(payload_index);
             let position = start.wrapping_add(index);
             let old = self.install_reserved_handle(lane, position, handle);
             self.payload_pool.retire_to_batch_in_lane(
@@ -1569,8 +1565,6 @@ impl<T> SharedQueue<T> {
         let chain =
             self.payload_pool
                 .pop_batch_payloads_exact_in_lane(lane, &mut local.free, count)?;
-        self.payload_pool
-            .prepare_reserved_payloads_in_lane(lane, chain);
         Some(chain)
     }
 
