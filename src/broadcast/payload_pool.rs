@@ -3,7 +3,7 @@ use core::ptr::{addr_of, addr_of_mut, NonNull};
 const CACHELINE_SIZE: usize = 64;
 pub(super) const PAYLOADS_PER_RING_ENTRY: usize = 2;
 
-const NO_PAYLOAD: u32 = 0;
+pub(super) const EMPTY_PAYLOAD_HANDLE: u32 = u32::MAX;
 
 /// Per-payload metadata storage.
 ///
@@ -24,25 +24,6 @@ impl PayloadMetadata {
             retired_stack_slot: 0,
             retired_sequence: 0,
         }
-    }
-}
-
-/// Ring payload handle: zero means no payload; otherwise `payload_index + 1`.
-#[derive(Clone, Copy, PartialEq)]
-#[repr(transparent)]
-pub(super) struct PayloadHandle(pub(super) u64);
-
-impl PayloadHandle {
-    pub(super) const EMPTY: Self = Self(0);
-
-    #[inline]
-    fn new(payload_index: u32) -> Self {
-        Self(stored_payload_index(payload_index) as u64)
-    }
-
-    #[inline]
-    fn payload_index(self) -> Option<u32> {
-        payload_index_from_stored(self.0 as u32)
     }
 }
 
@@ -206,30 +187,23 @@ impl<T> PayloadPool<T> {
     }
 
     #[inline(always)]
-    pub(super) fn handle_for_payload(&self, payload_index: u32) -> PayloadHandle {
+    pub(super) fn handle_for_payload(&self, payload_index: u32) -> u32 {
         debug_assert!((payload_index as usize) < self.capacity);
-        PayloadHandle::new(payload_index)
+        debug_assert!(payload_index != EMPTY_PAYLOAD_HANDLE);
+        payload_index
     }
 
-    pub(super) fn payload_for_protected_handle(
-        &self,
-        handle: PayloadHandle,
-    ) -> Option<ProtectedPayload> {
+    pub(super) fn payload_for_protected_handle(&self, handle: u32) -> Option<ProtectedPayload> {
         self.valid_payload_index(handle).map(ProtectedPayload::new)
     }
 
     #[cfg(test)]
-    pub(super) fn retire(&self, handle: PayloadHandle, retired: RetiredPayload) {
+    pub(super) fn retire(&self, handle: u32, retired: RetiredPayload) {
         self.retire_in_lane(retired.lane(), handle, retired);
     }
 
     #[inline(always)]
-    pub(super) fn retire_in_lane(
-        &self,
-        lane: usize,
-        handle: PayloadHandle,
-        retired: RetiredPayload,
-    ) {
+    pub(super) fn retire_in_lane(&self, lane: usize, handle: u32, retired: RetiredPayload) {
         let Some(payload_index) = self.valid_payload_index(handle) else {
             return;
         };
@@ -334,8 +308,11 @@ impl<T> PayloadPool<T> {
         self.reset_stacks();
     }
 
-    fn valid_payload_index(&self, handle: PayloadHandle) -> Option<u32> {
-        let payload_index = handle.payload_index()?;
+    fn valid_payload_index(&self, handle: u32) -> Option<u32> {
+        if handle == EMPTY_PAYLOAD_HANDLE {
+            return None;
+        }
+        let payload_index = handle;
         if payload_index as usize >= self.capacity {
             None
         } else {
@@ -567,34 +544,11 @@ pub(super) unsafe fn initialize_payload_metadata(
     }
 }
 
-/// Payload references stored in `PayloadHandle`.
-/// Zero means no payload; non-zero values are `payload_index + 1`.
-#[inline]
-fn stored_payload_index(payload_index: u32) -> u32 {
-    debug_assert!(payload_index != u32::MAX, "payload index overflow");
-    payload_index.wrapping_add(1)
-}
-
-#[inline]
-fn payload_index_from_stored(stored: u32) -> Option<u32> {
-    if stored == NO_PAYLOAD {
-        None
-    } else {
-        Some(payload_index_from_non_null_stored(stored))
-    }
-}
-
-#[inline]
-fn payload_index_from_non_null_stored(stored: u32) -> u32 {
-    debug_assert!(stored != NO_PAYLOAD, "no payload");
-    stored.wrapping_sub(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_free_top, initial_retired_top, initialize_payload_metadata, PayloadHandle,
-        PayloadMetadata, PayloadPool, RetiredPayload,
+        initial_free_top, initial_retired_top, initialize_payload_metadata, PayloadMetadata,
+        PayloadPool, RetiredPayload, EMPTY_PAYLOAD_HANDLE,
     };
     use core::{
         mem::{size_of, MaybeUninit},
@@ -752,7 +706,7 @@ mod tests {
         );
 
         assert!(pool
-            .payload_for_protected_handle(PayloadHandle::EMPTY)
+            .payload_for_protected_handle(EMPTY_PAYLOAD_HANDLE)
             .is_none());
     }
 

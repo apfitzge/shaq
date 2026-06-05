@@ -56,7 +56,8 @@ use core::{
     sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use payload_pool::{
-    PayloadHandle, PayloadMetadata, PayloadPool, ProtectedPayload, ReservedPayloads, RetiredPayload,
+    PayloadMetadata, PayloadPool, ProtectedPayload, ReservedPayloads, RetiredPayload,
+    EMPTY_PAYLOAD_HANDLE,
 };
 use std::{fs::File, sync::Arc, time::Duration};
 
@@ -850,8 +851,8 @@ struct SharedQueue<T> {
     header: NonNull<SharedQueueHeader>,
     /// Runtime producer lanes.
     producer_lanes: NonNull<ProducerSlot>,
-    /// Published values. Each entry contains a `PayloadHandle`.
-    ring: NonNull<AtomicU64>,
+    /// Published values. Each entry contains a payload index or `u32::MAX`.
+    ring: NonNull<AtomicU32>,
     /// Fixed table of consumer-owned, per-lane hazard ranges.
     hazard_slots: NonNull<ConsumerHazardSlot>,
     /// Per-consumer, per-lane local cursors.
@@ -1358,31 +1359,26 @@ impl<T> SharedQueue<T> {
         }
     }
 
-    fn install_reserved_handle(
-        &self,
-        lane: usize,
-        position: usize,
-        handle: PayloadHandle,
-    ) -> PayloadHandle {
+    fn install_reserved_handle(&self, lane: usize, position: usize, handle: u32) -> u32 {
         let ring_index = position & self.buffer_mask;
         debug_assert!(lane < self.producer_slots);
         debug_assert!(ring_index < self.capacity());
         let cell_index = lane * self.ring_lane_stride + ring_index;
         // SAFETY: lane and mask ensure index is in bounds.
         let cell = unsafe { self.ring.add(cell_index).as_ref() };
-        let old = PayloadHandle(cell.load(Ordering::Acquire));
-        cell.store(handle.0, Ordering::Release);
+        let old = cell.load(Ordering::Acquire);
+        cell.store(handle, Ordering::Release);
         old
     }
 
     #[inline]
-    fn handle_at(&self, lane: usize, position: usize) -> PayloadHandle {
+    fn handle_at(&self, lane: usize, position: usize) -> u32 {
         let ring_index = position & self.buffer_mask;
         debug_assert!(lane < self.producer_slots);
         debug_assert!(ring_index < self.capacity());
         let cell_index = lane * self.ring_lane_stride + ring_index;
         // SAFETY: lane and mask ensure index is in bounds.
-        PayloadHandle(unsafe { self.ring.add(cell_index).as_ref() }.load(Ordering::Acquire))
+        unsafe { self.ring.add(cell_index).as_ref() }.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -1510,7 +1506,7 @@ impl<T> SharedQueue<T> {
                 let offset = lane * self.ring_lane_stride + index;
                 // SAFETY: offset is in bounds.
                 unsafe { self.ring.add(offset).as_ref() }
-                    .store(PayloadHandle::EMPTY.0, Ordering::Release);
+                    .store(EMPTY_PAYLOAD_HANDLE, Ordering::Release);
             }
         }
         for consumer in 0..self.consumer_slots {
@@ -1659,7 +1655,7 @@ impl SharedQueueHeader {
     }
 
     const fn ring_lane_stride(ring_capacity: usize) -> usize {
-        ring_capacity.next_multiple_of(CACHELINE_SIZE / core::mem::size_of::<AtomicU64>())
+        ring_capacity.next_multiple_of(CACHELINE_SIZE / core::mem::size_of::<AtomicU32>())
     }
 
     const fn payload_lane_capacity_for_ring_capacity(ring_capacity: usize) -> usize {
@@ -1720,7 +1716,7 @@ impl SharedQueueHeader {
         (Self::ring_offset(ring_capacity, producer_slots, consumer_slots)
             + Self::ring_lane_stride(ring_capacity)
                 * producer_slots
-                * core::mem::size_of::<AtomicU64>())
+                * core::mem::size_of::<AtomicU32>())
         .next_multiple_of(CACHELINE_SIZE)
     }
 
@@ -1762,7 +1758,7 @@ impl SharedQueueHeader {
 
         let Some(ring_lane_stride) = checked_next_multiple_of(
             ring_capacity,
-            CACHELINE_SIZE / core::mem::size_of::<AtomicU64>(),
+            CACHELINE_SIZE / core::mem::size_of::<AtomicU32>(),
         ) else {
             return None;
         };
@@ -1780,7 +1776,7 @@ impl SharedQueueHeader {
         if payload_capacity == 0 || payload_capacity > u32::MAX as usize {
             return None;
         }
-        let Some(ring_bytes) = total_ring_entries.checked_mul(core::mem::size_of::<AtomicU64>())
+        let Some(ring_bytes) = total_ring_entries.checked_mul(core::mem::size_of::<AtomicU32>())
         else {
             return None;
         };
@@ -2053,7 +2049,7 @@ impl SharedQueueHeader {
             unsafe {
                 ring.add(index)
                     .as_ptr()
-                    .write(AtomicU64::new(PayloadHandle::EMPTY.0))
+                    .write(AtomicU32::new(EMPTY_PAYLOAD_HANDLE))
             };
         }
 
@@ -2134,7 +2130,7 @@ impl SharedQueueHeader {
         ring_capacity: usize,
         producer_slots: usize,
         consumer_slots: usize,
-    ) -> NonNull<AtomicU64> {
+    ) -> NonNull<AtomicU32> {
         let offset = Self::ring_offset(ring_capacity, producer_slots, consumer_slots);
         // SAFETY: caller guarantees the allocation includes the ring layout.
         unsafe { header.byte_add(offset).cast() }
@@ -3372,9 +3368,9 @@ mod tests {
             SharedQueueHeader::payload_lane_stride_bytes::<Item>(payload_lane_capacity);
 
         assert_eq!(ring_capacity, 4);
-        assert_eq!(producer.queue.ring_lane_stride, 8);
+        assert_eq!(producer.queue.ring_lane_stride, 16);
         assert_eq!(
-            producer.queue.ring_lane_stride * core::mem::size_of::<AtomicU64>() % CACHELINE_SIZE,
+            producer.queue.ring_lane_stride * core::mem::size_of::<AtomicU32>() % CACHELINE_SIZE,
             0
         );
         assert_eq!(metadata_lane_stride % CACHELINE_SIZE, 0);
@@ -3417,7 +3413,7 @@ mod tests {
                     .as_ptr()
             } as usize;
             let ring_lane = ring_base
-                + lane * producer.queue.ring_lane_stride * core::mem::size_of::<AtomicU64>();
+                + lane * producer.queue.ring_lane_stride * core::mem::size_of::<AtomicU32>();
             let payload_metadata_lane = payload_metadata_base + lane * metadata_lane_stride;
             let payload_lane = payload_base + lane * payload_lane_stride;
 
