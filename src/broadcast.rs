@@ -30,16 +30,16 @@
 //! The `try_` APIs are fallible, but they are not guaranteed to be non-blocking:
 //! payload exhaustion returns failure to producers instead of making them wait.
 //! If a producer process exits while holding a producer lane, that lane and any
-//! cached payloads remain unavailable until [`Producer::recover_as_exclusive`]
-//! is used.
+//! outstanding unpublished reservation remain unavailable until
+//! [`Producer::recover_as_exclusive`] is used.
 //!
 //! Write batches reserve payload storage but do not reserve ring positions until
 //! publish. Publishing reserves ring positions for overwrite before handles are
 //! installed; hazard-protected payloads remain retired until a producer can
 //! reclaim them safely.
-//! Producer handles keep a process-local payload cache to reduce shared free-list
-//! traffic. Normal producer drop returns cached payloads and releases the
-//! producer lane; an abandoned producer may strand a lane and cached payloads until
+//! Producer lanes keep per-lane payload stacks in shared memory. Normal producer
+//! drop releases the producer lane; an abandoned producer may strand its lane
+//! and any outstanding unpublished reservation until
 //! [`Producer::recover_as_exclusive`] is used.
 //!
 //! Zero-sized payload types and payload types whose alignment exceeds the shared
@@ -56,8 +56,7 @@ use core::{
     sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use payload_pool::{
-    PayloadHandle, PayloadHeader, PayloadPool, PayloadReleaseBatch, ProtectedPayload,
-    ReservedPayloads, RetiredPayload,
+    PayloadHandle, PayloadMetadata, PayloadPool, ProtectedPayload, ReservedPayloads, RetiredPayload,
 };
 use std::{fs::File, sync::Arc, time::Duration};
 
@@ -65,7 +64,6 @@ use std::{fs::File, sync::Arc, time::Duration};
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
 const CACHELINE_SIZE: usize = 64;
 const MAX_RING_CAPACITY: usize = 1usize << 30;
-const PRODUCER_PAYLOAD_CACHE_REFILL: usize = 64;
 const PRODUCER_RETIRED_RECLAIM_THRESHOLD: usize = 64;
 const CONSUMER_WAIT_SPINS: usize = 256;
 /// Maximum number of payload handles a direct batch read can guard at once.
@@ -157,8 +155,8 @@ impl<T> Producer<T> {
     ///   payloads may also be overwritten, cancelled, or recovered without
     ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
     ///   make those operations valid.
-    /// - If a producer exits without dropping its handle, its lane and payloads
-    ///   in that producer's local cache remain unavailable until exclusive
+    /// - If a producer exits without dropping its handle, its lane and any
+    ///   outstanding unpublished reservation remain unavailable until exclusive
     ///   recovery.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
         // SAFETY: caller guarantees this process or thread is the externally
@@ -182,8 +180,8 @@ impl<T> Producer<T> {
     ///   payloads may also be overwritten, cancelled, or recovered without
     ///   running `T`'s destructor on the shared-memory copy. The chosen `T` must
     ///   make those operations valid.
-    /// - If a producer exits without dropping its handle, its lane and payloads
-    ///   in that producer's local cache remain unavailable until exclusive
+    /// - If a producer exits without dropping its handle, its lane and any
+    ///   outstanding unpublished reservation remain unavailable until exclusive
     ///   recovery.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         let (region, header) = SharedQueueHeader::join::<T>(file)?;
@@ -282,7 +280,6 @@ impl<T> Producer<T> {
         Some(WriteBatch {
             producer: self,
             reservation,
-            next_write_payload_index: reservation.chain.first_payload_index(),
             written: 0,
             _marker: PhantomData,
         })
@@ -828,9 +825,9 @@ pub fn minimum_region_size_for_config<T>(config: BroadcastConfig) -> usize {
 /// |   cacheline 1             | consumer_wait_generation
 /// |   cacheline 2             | consumer_waiters
 /// +---------------------------+
-/// | payload free heads        | [u32; producer_slots], 64-byte stride
+/// | payload free tops         | [u32; producer_slots], 64-byte stride
 /// +---------------------------+
-/// | payload retired heads     | [u32; producer_slots], 64-byte stride
+/// | payload retired tops      | [u32; producer_slots], 64-byte stride
 /// +---------------------------+
 /// | producer lanes            | [ProducerSlot; producer_slots]
 /// +---------------------------+
@@ -840,7 +837,7 @@ pub fn minimum_region_size_for_config<T>(config: BroadcastConfig) -> usize {
 /// +---------------------------+
 /// | ring                      | producer_slots lanes, 64-byte rounded stride
 /// +---------------------------+
-/// | payload headers           | producer_slots lanes, 64-byte rounded stride
+/// | payload metadata          | producer_slots lanes, 64-byte rounded stride
 /// +---------------------------+
 /// | payload storage           | producer_slots lanes, 64-byte rounded stride
 /// +---------------------------+
@@ -880,8 +877,6 @@ struct WindowOverrun {
 }
 
 struct ProducerLocal {
-    free: PayloadReleaseBatch,
-    retired: PayloadReleaseBatch,
     batch_reserved: bool,
 }
 
@@ -899,8 +894,6 @@ enum DirectWriteResult<T> {
 impl ProducerLocal {
     const fn new() -> Self {
         Self {
-            free: PayloadReleaseBatch::new(),
-            retired: PayloadReleaseBatch::new(),
             batch_reserved: false,
         }
     }
@@ -1241,13 +1234,7 @@ impl<T> SharedQueue<T> {
             return None;
         }
 
-        let chain = match self.reserve_payloads_for_write(lane, count, local) {
-            Some(chain) => chain,
-            None => {
-                self.reclaim_local_retired(lane, local);
-                self.reserve_payloads_for_write(lane, count, local)?
-            }
-        };
+        let chain = self.reserve_payloads_for_write(lane, count)?;
 
         local.batch_reserved = true;
         Some(ProducerReservation { chain, lane })
@@ -1263,26 +1250,15 @@ impl<T> SharedQueue<T> {
             return DirectWriteResult::NoPayload(item);
         }
 
-        let Some(chain) = self.reserve_payloads_for_write(lane, 1, local) else {
-            self.reclaim_local_retired(lane, local);
-            let Some(chain) = self.reserve_payloads_for_write(lane, 1, local) else {
-                return DirectWriteResult::NoPayload(item);
-            };
-            self.write_and_publish_one(lane, chain, item, local);
-            return DirectWriteResult::Published;
+        let Some(chain) = self.reserve_payloads_for_write(lane, 1) else {
+            return DirectWriteResult::NoPayload(item);
         };
 
-        self.write_and_publish_one(lane, chain, item, local);
+        self.write_and_publish_one(lane, chain, item);
         DirectWriteResult::Published
     }
 
-    fn write_and_publish_one(
-        &self,
-        lane: usize,
-        chain: ReservedPayloads,
-        item: T,
-        local: &mut ProducerLocal,
-    ) {
+    fn write_and_publish_one(&self, lane: usize, chain: ReservedPayloads, item: T) {
         debug_assert_eq!(chain.len(), 1);
         // SAFETY: this producer owns the reserved payload.
         unsafe {
@@ -1291,10 +1267,10 @@ impl<T> SharedQueue<T> {
                 .as_ptr()
                 .write(item)
         };
-        self.publish_one_payload(lane, chain.first_payload_index(), local);
+        self.publish_one_payload(lane, chain.first_payload_index());
     }
 
-    fn publish_one_payload(&self, lane: usize, payload_index: u32, local: &mut ProducerLocal) {
+    fn publish_one_payload(&self, lane: usize, payload_index: u32) {
         let producer_lane = self.producer_lane(lane);
         let start = producer_lane.producer_publication.load(Ordering::Acquire);
         let end = start.wrapping_add(1);
@@ -1303,83 +1279,40 @@ impl<T> SharedQueue<T> {
             .store(end, Ordering::Release);
         let handle = self.payload_pool.handle_for_payload(payload_index);
         let old = self.install_reserved_handle(lane, start, handle);
-        self.payload_pool.retire_to_batch_in_lane(
+        self.payload_pool.retire_in_lane(
             lane,
             old,
             RetiredPayload::new(lane, start.wrapping_sub(self.capacity())),
-            &mut local.retired,
         );
         producer_lane
             .producer_publication
             .store(end, Ordering::Release);
         self.wake_waiting_consumers();
-        self.reclaim_local_retired_if_needed(lane, local);
+        self.reclaim_retired_if_needed(lane);
     }
 
-    fn publish_payload_chain(
-        &self,
-        lane: usize,
-        chain: ReservedPayloads,
-        local: &mut ProducerLocal,
-    ) {
+    fn publish_payload_chain(&self, lane: usize, chain: ReservedPayloads) {
         let producer_lane = self.producer_lane(lane);
         let start = producer_lane.producer_publication.load(Ordering::Acquire);
         let end = start.wrapping_add(chain.len());
         producer_lane
             .producer_reservation
             .store(end, Ordering::Release);
-        self.install_reserved_payload_chain(
-            lane,
-            start,
-            chain.first_payload_index(),
-            chain.len(),
-            local,
-        );
+        self.install_reserved_payload_chain(lane, start, chain);
         producer_lane
             .producer_publication
             .store(end, Ordering::Release);
         self.wake_waiting_consumers();
-        self.reclaim_local_retired_if_needed(lane, local);
+        self.reclaim_retired_if_needed(lane);
     }
 
-    fn reserve_payloads_for_write(
-        &self,
-        lane: usize,
-        count: usize,
-        local: &mut ProducerLocal,
-    ) -> Option<ReservedPayloads> {
-        if let Some(chain) = self.reserve_from_local_free(lane, count, local) {
+    fn reserve_payloads_for_write(&self, lane: usize, count: usize) -> Option<ReservedPayloads> {
+        if let Some(chain) = self.payload_pool.take_free_payloads_exact(lane, count) {
             return Some(chain);
         }
 
-        self.reclaim_local_retired(lane, local);
-        if let Some(chain) = self.reserve_from_local_free(lane, count, local) {
-            return Some(chain);
-        }
-
-        self.reclaim_shared_retired(lane, local);
-        if let Some(chain) = self.reserve_from_local_free(lane, count, local) {
-            return Some(chain);
-        }
-
-        let refill_count = count
-            .max(PRODUCER_PAYLOAD_CACHE_REFILL)
-            .min(self.capacity());
-        if let Some(refill) = self
-            .payload_pool
-            .take_free_payloads_exact(lane, refill_count)
-        {
-            self.payload_pool
-                .prepend_reserved_payloads_to_batch_in_lane(lane, refill, &mut local.free);
-        } else if refill_count != count {
-            let refill = self.payload_pool.take_free_payloads_exact(lane, count)?;
-            self.payload_pool
-                .prepend_reserved_payloads_to_batch_in_lane(lane, refill, &mut local.free);
-        } else {
-            return None;
-        }
-
-        self.reserve_from_local_free(lane, count, local)
+        self.reclaim_retired(lane);
+        self.payload_pool.take_free_payloads_exact(lane, count)
     }
 
     fn publish_reserved_payload_chain(
@@ -1387,9 +1320,8 @@ impl<T> SharedQueue<T> {
         reservation: ProducerReservation,
         local: &mut ProducerLocal,
     ) {
-        self.publish_payload_chain(reservation.lane, reservation.chain, local);
+        self.publish_payload_chain(reservation.lane, reservation.chain);
         local.batch_reserved = false;
-        self.reclaim_local_retired_if_needed(reservation.lane, local);
     }
 
     fn cancel_reserved_payloads(
@@ -1398,54 +1330,31 @@ impl<T> SharedQueue<T> {
         local: &mut ProducerLocal,
     ) {
         self.payload_pool
-            .prepend_reserved_payloads_to_batch_in_lane(
-                reservation.lane,
-                reservation.chain,
-                &mut local.free,
-            );
+            .restore_reserved_payloads(reservation.lane, reservation.chain);
         local.batch_reserved = false;
-        self.reclaim_local_retired_if_needed(reservation.lane, local);
     }
 
-    fn flush_producer_local(&self, lane: usize, local: &mut ProducerLocal) {
-        self.reclaim_local_retired(lane, local);
-
-        let free = local.free.take();
-        let retired = local.retired.take();
-        self.payload_pool.flush_release_batch(lane, free);
-        self.payload_pool.flush_retired_batch(lane, retired);
+    fn flush_producer_local(&self, lane: usize, _local: &mut ProducerLocal) {
+        self.reclaim_retired(lane);
     }
 
-    fn install_reserved_payload_chain(
-        &self,
-        lane: usize,
-        start: usize,
-        first_payload_index: u32,
-        count: usize,
-        local: &mut ProducerLocal,
-    ) {
-        let mut cursor = self.payload_pool.payload_cursor(lane, first_payload_index);
-        let last_index = count.wrapping_sub(1);
-        for index in 0..count {
-            let payload_index = cursor.current();
+    fn install_reserved_payload_chain(&self, lane: usize, start: usize, chain: ReservedPayloads) {
+        for index in 0..chain.len() {
+            let payload_index = self.payload_pool.reserved_payload_at(lane, chain, index);
             let handle = self.payload_pool.handle_for_payload(payload_index);
             let position = start.wrapping_add(index);
             let old = self.install_reserved_handle(lane, position, handle);
-            self.payload_pool.retire_to_batch_in_lane(
+            self.payload_pool.retire_in_lane(
                 lane,
                 old,
                 RetiredPayload::new(lane, position.wrapping_sub(self.capacity())),
-                &mut local.retired,
             );
-            if index != last_index {
-                cursor.advance();
-            }
         }
     }
 
-    fn reclaim_local_retired_if_needed(&self, lane: usize, local: &mut ProducerLocal) {
-        if local.retired.len() >= PRODUCER_RETIRED_RECLAIM_THRESHOLD {
-            self.reclaim_local_retired(lane, local);
+    fn reclaim_retired_if_needed(&self, lane: usize) {
+        if self.payload_pool.retired_payload_count(lane) >= PRODUCER_RETIRED_RECLAIM_THRESHOLD {
+            self.reclaim_retired(lane);
         }
     }
 
@@ -1556,40 +1465,11 @@ impl<T> SharedQueue<T> {
         false
     }
 
-    fn reserve_from_local_free(
-        &self,
-        lane: usize,
-        count: usize,
-        local: &mut ProducerLocal,
-    ) -> Option<ReservedPayloads> {
-        let chain =
-            self.payload_pool
-                .pop_batch_payloads_exact_in_lane(lane, &mut local.free, count)?;
-        Some(chain)
-    }
-
-    fn reclaim_local_retired(&self, lane: usize, local: &mut ProducerLocal) {
-        if local.retired.is_empty() {
-            return;
-        }
-
-        let retired = local.retired.take();
-        self.payload_pool.reclaim_retired_batch_to_batches_in_lane(
-            lane,
-            retired,
-            |retired| self.retired_payload_is_protected(retired),
-            &mut local.free,
-            &mut local.retired,
-        );
-    }
-
-    fn reclaim_shared_retired(&self, lane: usize, local: &mut ProducerLocal) {
-        self.payload_pool.reclaim_retired_payloads_to_batches(
-            lane,
-            |retired| self.retired_payload_is_protected(retired),
-            &mut local.free,
-            &mut local.retired,
-        );
+    fn reclaim_retired(&self, lane: usize) {
+        self.payload_pool
+            .reclaim_retired_payloads_in_lane(lane, |retired| {
+                self.retired_payload_is_protected(retired)
+            });
     }
 
     fn wake_waiting_consumers(&self) {
@@ -1671,14 +1551,14 @@ impl<T> SharedQueue<T> {
         let payload_lane_capacity = payload_pool::capacity_for_ring_capacity(buffer_size_in_items)
             .ok_or(Error::InvalidBufferSize)?;
         let ring_lane_stride = SharedQueueHeader::ring_lane_stride(buffer_size_in_items);
-        let header_lane_stride_bytes =
-            SharedQueueHeader::payload_header_lane_stride_bytes(payload_lane_capacity);
+        let metadata_lane_stride_bytes =
+            SharedQueueHeader::payload_metadata_lane_stride_bytes(payload_lane_capacity);
         let payload_lane_stride_bytes =
             SharedQueueHeader::payload_lane_stride_bytes::<T>(payload_lane_capacity);
         // SAFETY: layout validation above proves these regions exist.
-        let free_heads = unsafe { SharedQueueHeader::payload_free_heads_from_header(header) };
+        let free_tops = unsafe { SharedQueueHeader::payload_free_tops_from_header(header) };
         // SAFETY: layout validation above proves these regions exist.
-        let retired_heads = unsafe { SharedQueueHeader::payload_retired_heads_from_header(header) };
+        let retired_tops = unsafe { SharedQueueHeader::payload_retired_tops_from_header(header) };
         // SAFETY: layout validation above proves these regions exist.
         let producer_lanes = unsafe { SharedQueueHeader::producer_slots_from_header(header) };
         // SAFETY: layout validation above proves these regions exist.
@@ -1698,8 +1578,8 @@ impl<T> SharedQueue<T> {
             )
         };
         // SAFETY: layout validation above proves these regions exist.
-        let payload_headers = unsafe {
-            SharedQueueHeader::payload_headers_from_header(
+        let payload_metadata = unsafe {
+            SharedQueueHeader::payload_metadata_from_header(
                 header,
                 buffer_size_in_items,
                 producer_slots,
@@ -1721,12 +1601,12 @@ impl<T> SharedQueue<T> {
             producer_lanes,
             ring,
             payload_pool: PayloadPool::new(
-                free_heads,
-                retired_heads,
-                payload_headers,
+                free_tops,
+                retired_tops,
+                payload_metadata,
                 payloads,
                 payload_lane_capacity,
-                header_lane_stride_bytes,
+                metadata_lane_stride_bytes,
                 payload_lane_stride_bytes,
                 producer_slots,
             ),
@@ -1786,25 +1666,25 @@ impl SharedQueueHeader {
         ring_capacity * payload_pool::PAYLOADS_PER_RING_ENTRY
     }
 
-    const fn payload_header_lane_stride_bytes(lane_capacity: usize) -> usize {
-        (lane_capacity * core::mem::size_of::<PayloadHeader>()).next_multiple_of(CACHELINE_SIZE)
+    const fn payload_metadata_lane_stride_bytes(lane_capacity: usize) -> usize {
+        (lane_capacity * core::mem::size_of::<PayloadMetadata>()).next_multiple_of(CACHELINE_SIZE)
     }
 
     const fn payload_lane_stride_bytes<T>(lane_capacity: usize) -> usize {
         (lane_capacity * core::mem::size_of::<T>()).next_multiple_of(CACHELINE_SIZE)
     }
 
-    const fn payload_free_heads_offset() -> usize {
+    const fn payload_free_tops_offset() -> usize {
         core::mem::size_of::<Self>().next_multiple_of(CACHELINE_SIZE)
     }
 
-    const fn payload_retired_heads_offset(producer_slots: usize) -> usize {
-        (Self::payload_free_heads_offset() + producer_slots * CACHELINE_SIZE)
+    const fn payload_retired_tops_offset(producer_slots: usize) -> usize {
+        (Self::payload_free_tops_offset() + producer_slots * CACHELINE_SIZE)
             .next_multiple_of(CACHELINE_SIZE)
     }
 
     const fn producer_slots_offset(producer_slots: usize) -> usize {
-        (Self::payload_retired_heads_offset(producer_slots) + producer_slots * CACHELINE_SIZE)
+        (Self::payload_retired_tops_offset(producer_slots) + producer_slots * CACHELINE_SIZE)
             .next_multiple_of(core::mem::align_of::<ProducerSlot>())
     }
 
@@ -1832,7 +1712,7 @@ impl SharedQueueHeader {
         .next_multiple_of(CACHELINE_SIZE)
     }
 
-    const fn payload_headers_offset(
+    const fn payload_metadata_offset(
         ring_capacity: usize,
         producer_slots: usize,
         consumer_slots: usize,
@@ -1850,8 +1730,8 @@ impl SharedQueueHeader {
         consumer_slots: usize,
     ) -> usize {
         let payload_lane_capacity = Self::payload_lane_capacity_for_ring_capacity(ring_capacity);
-        (Self::payload_headers_offset(ring_capacity, producer_slots, consumer_slots)
-            + Self::payload_header_lane_stride_bytes(payload_lane_capacity) * producer_slots)
+        (Self::payload_metadata_offset(ring_capacity, producer_slots, consumer_slots)
+            + Self::payload_metadata_lane_stride_bytes(payload_lane_capacity) * producer_slots)
             .next_multiple_of(max_usize(CACHELINE_SIZE, core::mem::align_of::<T>()))
     }
 
@@ -1904,25 +1784,25 @@ impl SharedQueueHeader {
         else {
             return None;
         };
-        let Some(free_heads_bytes) = producer_slots.checked_mul(CACHELINE_SIZE) else {
+        let Some(free_tops_bytes) = producer_slots.checked_mul(CACHELINE_SIZE) else {
             return None;
         };
-        let Some(free_heads_end) = Self::payload_free_heads_offset().checked_add(free_heads_bytes)
+        let Some(free_tops_end) = Self::payload_free_tops_offset().checked_add(free_tops_bytes)
         else {
             return None;
         };
-        let Some(retired_heads_offset) = checked_next_multiple_of(free_heads_end, CACHELINE_SIZE)
+        let Some(retired_tops_offset) = checked_next_multiple_of(free_tops_end, CACHELINE_SIZE)
         else {
             return None;
         };
-        let Some(retired_heads_bytes) = producer_slots.checked_mul(CACHELINE_SIZE) else {
+        let Some(retired_tops_bytes) = producer_slots.checked_mul(CACHELINE_SIZE) else {
             return None;
         };
-        let Some(retired_heads_end) = retired_heads_offset.checked_add(retired_heads_bytes) else {
+        let Some(retired_tops_end) = retired_tops_offset.checked_add(retired_tops_bytes) else {
             return None;
         };
         let Some(producer_slots_offset) =
-            checked_next_multiple_of(retired_heads_end, core::mem::align_of::<ProducerSlot>())
+            checked_next_multiple_of(retired_tops_end, core::mem::align_of::<ProducerSlot>())
         else {
             return None;
         };
@@ -1970,31 +1850,32 @@ impl SharedQueueHeader {
         let Some(ring_end) = ring_offset.checked_add(ring_bytes) else {
             return None;
         };
-        let Some(payload_headers_offset) = checked_next_multiple_of(ring_end, CACHELINE_SIZE)
+        let Some(payload_metadata_offset) = checked_next_multiple_of(ring_end, CACHELINE_SIZE)
         else {
             return None;
         };
-        let Some(payload_header_lane_bytes) =
-            payload_lane_capacity.checked_mul(core::mem::size_of::<PayloadHeader>())
+        let Some(payload_metadata_lane_bytes) =
+            payload_lane_capacity.checked_mul(core::mem::size_of::<PayloadMetadata>())
         else {
             return None;
         };
-        let Some(payload_header_lane_stride_bytes) =
-            checked_next_multiple_of(payload_header_lane_bytes, CACHELINE_SIZE)
+        let Some(payload_metadata_lane_stride_bytes) =
+            checked_next_multiple_of(payload_metadata_lane_bytes, CACHELINE_SIZE)
         else {
             return None;
         };
-        let Some(payload_header_bytes) =
-            payload_header_lane_stride_bytes.checked_mul(producer_slots)
+        let Some(payload_metadata_bytes) =
+            payload_metadata_lane_stride_bytes.checked_mul(producer_slots)
         else {
             return None;
         };
-        let Some(payload_headers_end) = payload_headers_offset.checked_add(payload_header_bytes)
+        let Some(payload_metadata_end) =
+            payload_metadata_offset.checked_add(payload_metadata_bytes)
         else {
             return None;
         };
         let Some(payloads_offset) = checked_next_multiple_of(
-            payload_headers_end,
+            payload_metadata_end,
             max_usize(CACHELINE_SIZE, core::mem::align_of::<T>()),
         ) else {
             return None;
@@ -2081,8 +1962,8 @@ impl SharedQueueHeader {
     ) {
         let payload_lane_capacity = payload_pool::capacity_for_ring_capacity(ring_capacity)
             .expect("validated payload lane capacity");
-        let header_lane_stride_bytes =
-            Self::payload_header_lane_stride_bytes(payload_lane_capacity);
+        let metadata_lane_stride_bytes =
+            Self::payload_metadata_lane_stride_bytes(payload_lane_capacity);
 
         // SAFETY: caller guarantees unique access during initialization.
         let header = unsafe { header_ptr.as_mut() };
@@ -2095,23 +1976,23 @@ impl SharedQueueHeader {
             u32::try_from(config.consumer_slots).expect("validated consumer slots");
         header.version = VERSION;
 
-        let free_heads = unsafe { Self::payload_free_heads_from_header(header_ptr) };
-        let retired_heads = unsafe { Self::payload_retired_heads_from_header(header_ptr) };
+        let free_tops = unsafe { Self::payload_free_tops_from_header(header_ptr) };
+        let retired_tops = unsafe { Self::payload_retired_tops_from_header(header_ptr) };
         for lane in 0..config.producer_slots {
-            // SAFETY: lane is in bounds for the per-lane head tables.
+            // SAFETY: lane is in bounds for the per-lane stack-top tables.
             unsafe {
-                free_heads
+                free_tops
                     .cast::<u8>()
                     .byte_add(lane * CACHELINE_SIZE)
                     .cast::<u32>()
                     .as_ptr()
-                    .write(payload_pool::initial_free_head(lane, payload_lane_capacity));
-                retired_heads
+                    .write(payload_pool::initial_free_top(payload_lane_capacity));
+                retired_tops
                     .cast::<u8>()
                     .byte_add(lane * CACHELINE_SIZE)
                     .cast::<u32>()
                     .as_ptr()
-                    .write(payload_pool::initial_retired_head());
+                    .write(payload_pool::initial_retired_top());
             }
         }
 
@@ -2176,20 +2057,20 @@ impl SharedQueueHeader {
             };
         }
 
-        let payload_headers = unsafe {
-            Self::payload_headers_from_header(
+        let payload_metadata = unsafe {
+            Self::payload_metadata_from_header(
                 header_ptr,
                 ring_capacity,
                 config.producer_slots,
                 config.consumer_slots,
             )
         };
-        // SAFETY: The calculated layout reserves the padded per-lane payload headers.
+        // SAFETY: The calculated layout reserves the padded per-lane payload metadata.
         unsafe {
-            payload_pool::initialize_payload_headers(
-                payload_headers,
+            payload_pool::initialize_payload_metadata(
+                payload_metadata,
                 payload_lane_capacity,
-                header_lane_stride_bytes,
+                metadata_lane_stride_bytes,
                 config.producer_slots,
             )
         };
@@ -2235,16 +2116,16 @@ impl SharedQueueHeader {
         unsafe { header.byte_add(offset).cast() }
     }
 
-    unsafe fn payload_free_heads_from_header(header: NonNull<Self>) -> NonNull<u32> {
-        let offset = Self::payload_free_heads_offset();
-        // SAFETY: caller guarantees the allocation includes the free-head layout.
+    unsafe fn payload_free_tops_from_header(header: NonNull<Self>) -> NonNull<u32> {
+        let offset = Self::payload_free_tops_offset();
+        // SAFETY: caller guarantees the allocation includes the free-top layout.
         unsafe { header.byte_add(offset).cast() }
     }
 
-    unsafe fn payload_retired_heads_from_header(header: NonNull<Self>) -> NonNull<u32> {
+    unsafe fn payload_retired_tops_from_header(header: NonNull<Self>) -> NonNull<u32> {
         let producer_slots = unsafe { header.as_ref() }.producer_slots as usize;
-        let offset = Self::payload_retired_heads_offset(producer_slots);
-        // SAFETY: caller guarantees the allocation includes the retired-head layout.
+        let offset = Self::payload_retired_tops_offset(producer_slots);
+        // SAFETY: caller guarantees the allocation includes the retired-top layout.
         unsafe { header.byte_add(offset).cast() }
     }
 
@@ -2278,14 +2159,14 @@ impl SharedQueueHeader {
         unsafe { header.byte_add(offset).cast() }
     }
 
-    unsafe fn payload_headers_from_header(
+    unsafe fn payload_metadata_from_header(
         header: NonNull<Self>,
         ring_capacity: usize,
         producer_slots: usize,
         consumer_slots: usize,
-    ) -> NonNull<PayloadHeader> {
-        let offset = Self::payload_headers_offset(ring_capacity, producer_slots, consumer_slots);
-        // SAFETY: caller guarantees the allocation includes the payload-header layout.
+    ) -> NonNull<PayloadMetadata> {
+        let offset = Self::payload_metadata_offset(ring_capacity, producer_slots, consumer_slots);
+        // SAFETY: caller guarantees the allocation includes the payload-metadata layout.
         unsafe { header.byte_add(offset).cast() }
     }
 
@@ -2398,7 +2279,6 @@ impl<I> WriteIterResult<I> {
 pub struct WriteBatch<'a, T> {
     producer: &'a Producer<T>,
     reservation: ProducerReservation,
-    next_write_payload_index: u32,
     written: usize,
     _marker: PhantomData<&'a mut T>,
 }
@@ -2414,15 +2294,12 @@ impl<'a, T> WriteBatch<'a, T> {
 
     fn advance_payload(&mut self) -> u32 {
         assert!(self.written < self.len());
-        let payload_index = self.next_write_payload_index;
+        let payload_index = self.producer.queue.payload_pool.reserved_payload_at(
+            self.reservation.lane,
+            self.reservation.chain,
+            self.written,
+        );
         self.written += 1;
-        if self.written != self.len() {
-            self.next_write_payload_index = self
-                .producer
-                .queue
-                .payload_pool
-                .next_payload_index_in_lane(self.reservation.lane, payload_index);
-        }
         payload_index
     }
 
@@ -2759,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn test_producer_drop_flushes_local_payload_cache() {
+    fn test_dropped_reservation_restores_payload_stack() {
         let file = create_temp_shmem_file().unwrap();
         let producer1 = unsafe {
             Producer::<Item>::create(
@@ -2770,7 +2647,7 @@ mod tests {
         .expect("create failed");
         let producer2 = unsafe { Producer::<Item>::join(&file) }.expect("join failed");
 
-        let batch = producer1.reserve_write_batch(1).expect("reserve cached");
+        let batch = producer1.reserve_write_batch(1).expect("reserve payload");
         drop(batch);
 
         drop(producer1);
@@ -3489,8 +3366,8 @@ mod tests {
         let ring_capacity = producer.capacity();
         let payload_lane_capacity =
             payload_pool::capacity_for_ring_capacity(ring_capacity).expect("payload capacity");
-        let header_lane_stride =
-            SharedQueueHeader::payload_header_lane_stride_bytes(payload_lane_capacity);
+        let metadata_lane_stride =
+            SharedQueueHeader::payload_metadata_lane_stride_bytes(payload_lane_capacity);
         let payload_lane_stride =
             SharedQueueHeader::payload_lane_stride_bytes::<Item>(payload_lane_capacity);
 
@@ -3500,15 +3377,15 @@ mod tests {
             producer.queue.ring_lane_stride * core::mem::size_of::<AtomicU64>() % CACHELINE_SIZE,
             0
         );
-        assert_eq!(header_lane_stride % CACHELINE_SIZE, 0);
+        assert_eq!(metadata_lane_stride % CACHELINE_SIZE, 0);
         assert_eq!(payload_lane_stride % CACHELINE_SIZE, 0);
 
         let header = producer.queue.header;
-        let free_heads = unsafe { SharedQueueHeader::payload_free_heads_from_header(header) };
-        let retired_heads = unsafe { SharedQueueHeader::payload_retired_heads_from_header(header) };
+        let free_tops = unsafe { SharedQueueHeader::payload_free_tops_from_header(header) };
+        let retired_tops = unsafe { SharedQueueHeader::payload_retired_tops_from_header(header) };
         let ring_base = producer.queue.ring.as_ptr() as usize;
-        let payload_headers = unsafe {
-            SharedQueueHeader::payload_headers_from_header(
+        let payload_metadata = unsafe {
+            SharedQueueHeader::payload_metadata_from_header(
                 header,
                 ring_capacity,
                 producer.queue.producer_slots(),
@@ -3523,31 +3400,31 @@ mod tests {
                 producer.queue.consumer_slots,
             )
         };
-        let payload_header_base = payload_headers.as_ptr() as usize;
+        let payload_metadata_base = payload_metadata.as_ptr() as usize;
         let payload_base = payloads.as_ptr() as usize;
 
         for lane in 0..producer.queue.producer_slots() {
-            let free_head = unsafe {
-                free_heads
+            let free_top = unsafe {
+                free_tops
                     .cast::<u8>()
                     .byte_add(lane * CACHELINE_SIZE)
                     .as_ptr()
             } as usize;
-            let retired_head = unsafe {
-                retired_heads
+            let retired_top = unsafe {
+                retired_tops
                     .cast::<u8>()
                     .byte_add(lane * CACHELINE_SIZE)
                     .as_ptr()
             } as usize;
             let ring_lane = ring_base
                 + lane * producer.queue.ring_lane_stride * core::mem::size_of::<AtomicU64>();
-            let payload_header_lane = payload_header_base + lane * header_lane_stride;
+            let payload_metadata_lane = payload_metadata_base + lane * metadata_lane_stride;
             let payload_lane = payload_base + lane * payload_lane_stride;
 
-            assert_eq!(free_head % CACHELINE_SIZE, 0);
-            assert_eq!(retired_head % CACHELINE_SIZE, 0);
+            assert_eq!(free_top % CACHELINE_SIZE, 0);
+            assert_eq!(retired_top % CACHELINE_SIZE, 0);
             assert_eq!(ring_lane % CACHELINE_SIZE, 0);
-            assert_eq!(payload_header_lane % CACHELINE_SIZE, 0);
+            assert_eq!(payload_metadata_lane % CACHELINE_SIZE, 0);
             assert_eq!(payload_lane % CACHELINE_SIZE, 0);
         }
     }

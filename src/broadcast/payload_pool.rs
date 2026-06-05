@@ -1,28 +1,28 @@
-use core::{
-    ptr::NonNull,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
-};
+use core::ptr::{addr_of, addr_of_mut, NonNull};
 
 const CACHELINE_SIZE: usize = 64;
 pub(super) const PAYLOADS_PER_RING_ENTRY: usize = 2;
 
 const NO_PAYLOAD: u32 = 0;
 
-/// Payload descriptor. `next_free` links payloads through the free and retired
-/// lists.
+/// Per-payload metadata storage.
+///
+/// The two stack fields are addressed by stack offset, while
+/// `retired_sequence` is addressed by payload offset. Keeping them together
+/// preserves the old 16-byte-per-payload metadata budget.
 #[repr(C)]
-pub(super) struct PayloadHeader {
-    next_free: AtomicU32,
-    retired_lane: AtomicU32,
-    retired_sequence: AtomicUsize,
+pub(super) struct PayloadMetadata {
+    free_stack_slot: u32,
+    retired_stack_slot: u32,
+    retired_sequence: usize,
 }
 
-impl PayloadHeader {
-    const fn new(next_free: u32) -> Self {
+impl PayloadMetadata {
+    const fn new(free_stack_slot: u32) -> Self {
         Self {
-            next_free: AtomicU32::new(next_free),
-            retired_lane: AtomicU32::new(0),
-            retired_sequence: AtomicUsize::new(0),
+            free_stack_slot,
+            retired_stack_slot: 0,
+            retired_sequence: 0,
         }
     }
 }
@@ -48,8 +48,8 @@ impl PayloadHandle {
 
 #[derive(Clone, Copy)]
 pub(super) struct ReservedPayloads {
+    first_stack_offset: usize,
     first_payload_index: u32,
-    last_payload_index: u32,
     count: usize,
 }
 
@@ -107,47 +107,15 @@ impl RetiredPayload {
     }
 }
 
-pub(super) struct PayloadReleaseBatch {
-    first_payload_index: Option<u32>,
-    last_payload_index: Option<u32>,
-    count: usize,
-}
-
-impl PayloadReleaseBatch {
-    #[inline]
-    pub(super) const fn new() -> Self {
-        Self {
-            first_payload_index: None,
-            last_payload_index: None,
-            count: 0,
-        }
-    }
-
-    #[inline]
-    pub(super) fn len(&self) -> usize {
-        self.count
-    }
-
-    #[inline]
-    pub(super) fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    #[inline]
-    pub(super) fn take(&mut self) -> Self {
-        core::mem::replace(self, Self::new())
-    }
-}
-
 pub(super) struct PayloadPool<T> {
-    free_heads: NonNull<u32>,
-    retired_heads: NonNull<u32>,
-    payload_headers: NonNull<PayloadHeader>,
+    free_tops: NonNull<u32>,
+    retired_tops: NonNull<u32>,
+    payload_metadata: NonNull<PayloadMetadata>,
     payloads: NonNull<T>,
     lane_capacity: usize,
     lane_mask: usize,
     lane_shift: u32,
-    header_lane_stride_bytes: usize,
+    metadata_lane_stride_bytes: usize,
     payload_lane_stride_bytes: usize,
     producer_slots: usize,
     capacity: usize,
@@ -156,14 +124,14 @@ pub(super) struct PayloadPool<T> {
 impl<T> Clone for PayloadPool<T> {
     fn clone(&self) -> Self {
         Self {
-            free_heads: self.free_heads,
-            retired_heads: self.retired_heads,
-            payload_headers: self.payload_headers,
+            free_tops: self.free_tops,
+            retired_tops: self.retired_tops,
+            payload_metadata: self.payload_metadata,
             payloads: self.payloads,
             lane_capacity: self.lane_capacity,
             lane_mask: self.lane_mask,
             lane_shift: self.lane_shift,
-            header_lane_stride_bytes: self.header_lane_stride_bytes,
+            metadata_lane_stride_bytes: self.metadata_lane_stride_bytes,
             payload_lane_stride_bytes: self.payload_lane_stride_bytes,
             producer_slots: self.producer_slots,
             capacity: self.capacity,
@@ -174,12 +142,12 @@ impl<T> Clone for PayloadPool<T> {
 impl<T> PayloadPool<T> {
     #[inline]
     pub(super) fn new(
-        free_heads: NonNull<u32>,
-        retired_heads: NonNull<u32>,
-        payload_headers: NonNull<PayloadHeader>,
+        free_tops: NonNull<u32>,
+        retired_tops: NonNull<u32>,
+        payload_metadata: NonNull<PayloadMetadata>,
         payloads: NonNull<T>,
         lane_capacity: usize,
-        header_lane_stride_bytes: usize,
+        metadata_lane_stride_bytes: usize,
         payload_lane_stride_bytes: usize,
         producer_slots: usize,
     ) -> Self {
@@ -188,14 +156,14 @@ impl<T> PayloadPool<T> {
             .checked_mul(producer_slots)
             .expect("payload capacity overflow");
         Self {
-            free_heads,
-            retired_heads,
-            payload_headers,
+            free_tops,
+            retired_tops,
+            payload_metadata,
             payloads,
             lane_capacity,
             lane_mask: lane_capacity - 1,
             lane_shift: lane_capacity.trailing_zeros(),
-            header_lane_stride_bytes,
+            metadata_lane_stride_bytes,
             payload_lane_stride_bytes,
             producer_slots,
             capacity,
@@ -209,13 +177,10 @@ impl<T> PayloadPool<T> {
 
     #[cfg(test)]
     pub(super) fn reserve_payloads_exact(&self, count: usize) -> Option<ReservedPayloads> {
-        if count == 0 {
-            return None;
-        }
-
         self.take_free_payloads_exact(0, count)
     }
 
+    #[inline(always)]
     pub(super) fn take_free_payloads_exact(
         &self,
         lane: usize,
@@ -230,10 +195,17 @@ impl<T> PayloadPool<T> {
 
     #[cfg(test)]
     pub(super) fn cancel_reserved_payloads(&self, chain: ReservedPayloads) {
-        debug_assert!(chain.count != 0);
-        self.push_free_payloads(0, chain.first_payload_index, chain.last_payload_index);
+        self.restore_reserved_payloads(0, chain);
     }
 
+    #[inline(always)]
+    pub(super) fn restore_reserved_payloads(&self, lane: usize, chain: ReservedPayloads) {
+        debug_assert!(chain.count != 0);
+        debug_assert_eq!(self.read_free_top(lane), chain.first_stack_offset);
+        self.write_free_top(lane, chain.first_stack_offset + chain.count);
+    }
+
+    #[inline(always)]
     pub(super) fn handle_for_payload(&self, payload_index: u32) -> PayloadHandle {
         debug_assert!((payload_index as usize) < self.capacity);
         PayloadHandle::new(payload_index)
@@ -247,67 +219,33 @@ impl<T> PayloadPool<T> {
     }
 
     #[cfg(test)]
-    pub(super) fn retire_to_batch(
-        &self,
-        handle: PayloadHandle,
-        retired: RetiredPayload,
-        batch: &mut PayloadReleaseBatch,
-    ) {
-        self.retire_to_batch_in_lane(retired.lane(), handle, retired, batch);
+    pub(super) fn retire(&self, handle: PayloadHandle, retired: RetiredPayload) {
+        self.retire_in_lane(retired.lane(), handle, retired);
     }
 
     #[inline(always)]
-    pub(super) fn retire_to_batch_in_lane(
+    pub(super) fn retire_in_lane(
         &self,
         lane: usize,
         handle: PayloadHandle,
         retired: RetiredPayload,
-        batch: &mut PayloadReleaseBatch,
     ) {
         let Some(payload_index) = self.valid_payload_index(handle) else {
             return;
         };
         debug_assert_eq!(lane, retired.lane());
-        let payload_header = self.payload_header_at(lane, self.payload_offset(payload_index));
+        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
 
-        payload_header
-            .retired_lane
-            .store(retired.lane as u32, Ordering::Relaxed);
-        payload_header
-            .retired_sequence
-            .store(retired.sequence, Ordering::Relaxed);
-        self.prepend_payload(lane, payload_index, batch);
+        let retired_top = self.read_retired_top(lane);
+        debug_assert!(retired_top < self.lane_capacity);
+        self.write_retired_sequence(lane, payload_index, retired.sequence);
+        self.write_retired_stack_slot(lane, retired_top, payload_index);
+        self.write_retired_top(lane, retired_top + 1);
     }
 
-    #[cfg(test)]
-    pub(super) fn reclaim_retired_batch<F>(&self, batch: PayloadReleaseBatch, is_protected: F)
-    where
-        F: FnMut(RetiredPayload) -> bool,
-    {
-        if let Some(first) = batch.first_payload_index {
-            self.reclaim_payload_chain(first, is_protected);
-        }
-    }
-
-    pub(super) fn reclaim_retired_batch_to_batches_in_lane<F>(
-        &self,
-        lane: usize,
-        batch: PayloadReleaseBatch,
-        is_protected: F,
-        free_batch: &mut PayloadReleaseBatch,
-        retired_batch: &mut PayloadReleaseBatch,
-    ) where
-        F: FnMut(RetiredPayload) -> bool,
-    {
-        if let Some(first) = batch.first_payload_index {
-            self.partition_retired_payload_chain(
-                lane,
-                first,
-                is_protected,
-                free_batch,
-                retired_batch,
-            );
-        }
+    #[inline]
+    pub(super) fn retired_payload_count(&self, lane: usize) -> usize {
+        self.read_retired_top(lane)
     }
 
     #[cfg(test)]
@@ -315,97 +253,38 @@ impl<T> PayloadPool<T> {
     where
         F: FnMut(RetiredPayload) -> bool,
     {
-        if let Some(first) = self.take_retired_payloads(0) {
-            self.reclaim_payload_chain(first, is_protected);
-        }
+        self.reclaim_retired_payloads_in_lane(0, is_protected);
     }
 
-    pub(super) fn reclaim_retired_payloads_to_batches<F>(
-        &self,
-        lane: usize,
-        is_protected: F,
-        free_batch: &mut PayloadReleaseBatch,
-        retired_batch: &mut PayloadReleaseBatch,
-    ) where
+    pub(super) fn reclaim_retired_payloads_in_lane<F>(&self, lane: usize, mut is_protected: F)
+    where
         F: FnMut(RetiredPayload) -> bool,
     {
-        if let Some(first) = self.take_retired_payloads(lane) {
-            self.partition_retired_payload_chain(
-                lane,
-                first,
-                is_protected,
-                free_batch,
-                retired_batch,
-            );
-        }
-    }
-
-    pub(super) fn flush_retired_batch(&self, lane: usize, batch: PayloadReleaseBatch) {
-        if let (Some(first), Some(last)) = (batch.first_payload_index, batch.last_payload_index) {
-            self.push_retired_payloads(lane, first, last);
-        }
-    }
-
-    pub(super) fn flush_release_batch(&self, lane: usize, batch: PayloadReleaseBatch) {
-        if let (Some(first), Some(last)) = (batch.first_payload_index, batch.last_payload_index) {
-            self.push_free_payloads(lane, first, last);
-        }
-    }
-
-    pub(super) fn prepend_reserved_payloads_to_batch_in_lane(
-        &self,
-        lane: usize,
-        chain: ReservedPayloads,
-        batch: &mut PayloadReleaseBatch,
-    ) {
-        self.prepend_payload_chain(
-            lane,
-            chain.first_payload_index,
-            chain.last_payload_index,
-            chain.count,
-            batch,
-        );
-    }
-
-    #[inline(always)]
-    pub(super) fn pop_batch_payloads_exact_in_lane(
-        &self,
-        lane: usize,
-        batch: &mut PayloadReleaseBatch,
-        count: usize,
-    ) -> Option<ReservedPayloads> {
-        if count == 0 || count > batch.count {
-            return None;
+        let retired_top = self.read_retired_top(lane);
+        if retired_top == 0 {
+            return;
         }
 
-        let first_payload_index = batch.first_payload_index?;
-        let mut last_payload_index = first_payload_index;
-        let last_index = count.wrapping_sub(1);
-        for index in 0..count {
-            if index != last_index {
-                last_payload_index = self.next_payload_index_in_lane(lane, last_payload_index);
+        let mut kept = 0usize;
+        let mut free_top = self.read_free_top(lane);
+        for offset in 0..retired_top {
+            let payload_index = self.read_retired_stack_slot(lane, offset);
+            let sequence = self.read_retired_sequence(lane, payload_index);
+
+            if is_protected(RetiredPayload::new(lane, sequence)) {
+                if kept != offset {
+                    self.write_retired_stack_slot(lane, kept, payload_index);
+                }
+                kept += 1;
+            } else {
+                debug_assert!(free_top < self.lane_capacity);
+                self.write_free_stack_slot(lane, free_top, payload_index);
+                free_top += 1;
             }
         }
 
-        let next = self
-            .payload_header_at(lane, self.payload_offset(last_payload_index))
-            .next_free
-            .load(Ordering::Relaxed);
-        self.payload_header_at(lane, self.payload_offset(last_payload_index))
-            .next_free
-            .store(NO_PAYLOAD, Ordering::Relaxed);
-
-        batch.count -= count;
-        batch.first_payload_index = payload_index_from_stored(next);
-        if batch.count == 0 {
-            batch.last_payload_index = None;
-        }
-
-        Some(ReservedPayloads {
-            first_payload_index,
-            last_payload_index,
-            count,
-        })
+        self.write_free_top(lane, free_top);
+        self.write_retired_top(lane, kept);
     }
 
     #[inline]
@@ -423,7 +302,22 @@ impl<T> PayloadPool<T> {
     #[inline(always)]
     pub(super) fn payload_at_in_lane(&self, lane: usize, payload_index: u32) -> NonNull<T> {
         debug_assert!((payload_index as usize) < self.capacity);
+        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
         self.payload_at_offset(lane, self.payload_offset(payload_index))
+    }
+
+    #[inline(always)]
+    pub(super) fn reserved_payload_at(
+        &self,
+        lane: usize,
+        chain: ReservedPayloads,
+        index: usize,
+    ) -> u32 {
+        debug_assert!(index < chain.count);
+        let stack_offset = chain.first_stack_offset + chain.count - 1 - index;
+        let payload_index = self.read_free_stack_slot(lane, stack_offset);
+        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
+        payload_index
     }
 
     #[inline(always)]
@@ -436,79 +330,8 @@ impl<T> PayloadPool<T> {
         unsafe { self.payloads.cast::<u8>().byte_add(byte_offset).cast() }
     }
 
-    #[inline]
-    pub(super) fn payload_cursor(&self, lane: usize, first: u32) -> PayloadChainCursor<'_, T> {
-        PayloadChainCursor::new(self, lane, first)
-    }
-
-    #[inline(always)]
-    pub(super) fn next_payload_index_in_lane(&self, lane: usize, payload_index: u32) -> u32 {
-        payload_index_from_non_null_stored(
-            self.payload_header_at(lane, self.payload_offset(payload_index))
-                .next_free
-                .load(Ordering::Relaxed),
-        )
-    }
-
     pub(super) fn recover_as_exclusive(&self) {
-        for index in 0..self.capacity {
-            self.payload_header(index as u32)
-                .retired_lane
-                .store(0, Ordering::Relaxed);
-            self.payload_header(index as u32)
-                .retired_sequence
-                .store(0, Ordering::Relaxed);
-        }
-
-        self.reset_free_links();
-    }
-
-    #[cfg(test)]
-    fn reclaim_payload_chain<F>(&self, first_payload_index: u32, mut is_protected: F)
-    where
-        F: FnMut(RetiredPayload) -> bool,
-    {
-        let mut free_batch = PayloadReleaseBatch::new();
-        let mut retired_batch = PayloadReleaseBatch::new();
-        self.partition_retired_payload_chain(
-            0,
-            first_payload_index,
-            &mut is_protected,
-            &mut free_batch,
-            &mut retired_batch,
-        );
-
-        self.flush_release_batch(0, free_batch);
-        self.flush_retired_batch(0, retired_batch);
-    }
-
-    fn partition_retired_payload_chain<F>(
-        &self,
-        lane: usize,
-        first_payload_index: u32,
-        mut is_protected: F,
-        free_batch: &mut PayloadReleaseBatch,
-        retired_batch: &mut PayloadReleaseBatch,
-    ) where
-        F: FnMut(RetiredPayload) -> bool,
-    {
-        let mut stored = stored_payload_index(first_payload_index);
-
-        while stored != NO_PAYLOAD {
-            let payload_index = payload_index_from_non_null_stored(stored);
-            let payload_header = self.payload_header_at(lane, self.payload_offset(payload_index));
-            let next = payload_header.next_free.load(Ordering::Relaxed);
-            let retired_lane = payload_header.retired_lane.load(Ordering::Relaxed) as usize;
-            let sequence = payload_header.retired_sequence.load(Ordering::Relaxed);
-
-            if is_protected(RetiredPayload::new(retired_lane, sequence)) {
-                self.prepend_payload(lane, payload_index, retired_batch);
-            } else {
-                self.prepend_payload(lane, payload_index, free_batch);
-            }
-
-            stored = next;
-        }
+        self.reset_stacks();
     }
 
     fn valid_payload_index(&self, handle: PayloadHandle) -> Option<u32> {
@@ -521,11 +344,11 @@ impl<T> PayloadPool<T> {
     }
 
     #[inline]
-    fn free_head(&self, lane: usize) -> NonNull<u32> {
+    fn free_top(&self, lane: usize) -> NonNull<u32> {
         debug_assert!(lane < self.producer_slots);
-        // SAFETY: `free_heads` points into the live per-lane free-head table.
+        // SAFETY: `free_tops` points into the live per-lane free-top table.
         unsafe {
-            self.free_heads
+            self.free_tops
                 .cast::<u8>()
                 .byte_add(lane * CACHELINE_SIZE)
                 .cast::<u32>()
@@ -533,202 +356,141 @@ impl<T> PayloadPool<T> {
     }
 
     #[inline]
-    fn retired_head(&self, lane: usize) -> NonNull<u32> {
+    fn retired_top(&self, lane: usize) -> NonNull<u32> {
         debug_assert!(lane < self.producer_slots);
-        // SAFETY: `retired_heads` points into the live per-lane retired-head table.
+        // SAFETY: `retired_tops` points into the live per-lane retired-top table.
         unsafe {
-            self.retired_heads
+            self.retired_tops
                 .cast::<u8>()
                 .byte_add(lane * CACHELINE_SIZE)
                 .cast::<u32>()
         }
+    }
+
+    #[inline]
+    fn read_free_top(&self, lane: usize) -> usize {
+        // SAFETY: this producer owns `lane`; consumers never read pool stack tops.
+        unsafe { self.free_top(lane).as_ptr().read() as usize }
+    }
+
+    #[inline]
+    fn write_free_top(&self, lane: usize, top: usize) {
+        debug_assert!(top <= self.lane_capacity);
+        // SAFETY: this producer owns `lane`; consumers never read pool stack tops.
+        unsafe {
+            self.free_top(lane)
+                .as_ptr()
+                .write(u32::try_from(top).expect("payload stack top fits u32"))
+        };
+    }
+
+    #[inline]
+    fn read_retired_top(&self, lane: usize) -> usize {
+        // SAFETY: this producer owns `lane`; consumers never read pool stack tops.
+        unsafe { self.retired_top(lane).as_ptr().read() as usize }
+    }
+
+    #[inline]
+    fn write_retired_top(&self, lane: usize, top: usize) {
+        debug_assert!(top <= self.lane_capacity);
+        // SAFETY: this producer owns `lane`; consumers never read pool stack tops.
+        unsafe {
+            self.retired_top(lane)
+                .as_ptr()
+                .write(u32::try_from(top).expect("payload stack top fits u32"))
+        };
     }
 
     #[inline]
     fn pop_free_payloads_exact(&self, lane: usize, count: usize) -> Option<ReservedPayloads> {
         debug_assert!(count != 0);
+        debug_assert!(count <= self.lane_capacity);
 
-        let free_head = self.free_head(lane);
-        // SAFETY: this producer owns `lane`; consumers never read pool heads.
-        let first = unsafe { free_head.as_ptr().read() };
-        if first == NO_PAYLOAD {
+        let top = self.read_free_top(lane);
+        if top < count {
             return None;
         }
 
-        let mut stored = first;
-        let mut last_payload_index = 0;
-        for _ in 0..count {
-            if stored == NO_PAYLOAD {
-                return None;
-            }
-            let payload_index = payload_index_from_non_null_stored(stored);
-            assert!(
-                (payload_index as usize) < self.capacity,
-                "corrupt free payload chain"
-            );
-            last_payload_index = payload_index;
-            stored = self
-                .payload_header_at(lane, self.payload_offset(payload_index))
-                .next_free
-                .load(Ordering::Relaxed);
-        }
-
-        // SAFETY: this producer owns `lane`; consumers never read pool heads.
-        unsafe { free_head.as_ptr().write(stored) };
-        let first_payload_index = payload_index_from_non_null_stored(first);
-        self.payload_header_at(lane, self.payload_offset(last_payload_index))
-            .next_free
-            .store(NO_PAYLOAD, Ordering::Relaxed);
+        let first_stack_offset = top - count;
+        let first_payload_index = self.read_free_stack_slot(lane, top - 1);
+        self.write_free_top(lane, first_stack_offset);
         Some(ReservedPayloads {
+            first_stack_offset,
             first_payload_index,
-            last_payload_index,
             count,
         })
     }
 
-    fn take_retired_payloads(&self, lane: usize) -> Option<u32> {
-        let retired_head = self.retired_head(lane);
-        // SAFETY: this producer owns `lane`; consumers never read pool heads.
-        let first = unsafe { retired_head.as_ptr().read() };
-        if first == NO_PAYLOAD {
-            return None;
-        }
-        // SAFETY: this producer owns `lane`; consumers never read pool heads.
-        unsafe { retired_head.as_ptr().write(NO_PAYLOAD) };
-        Some(payload_index_from_non_null_stored(first))
-    }
-
-    #[inline]
-    fn push_free_payloads(&self, lane: usize, first_payload_index: u32, last_payload_index: u32) {
-        self.push_payloads(
-            lane,
-            self.free_head(lane),
-            first_payload_index,
-            last_payload_index,
-        );
-    }
-
-    #[inline]
-    fn push_retired_payloads(
-        &self,
-        lane: usize,
-        first_payload_index: u32,
-        last_payload_index: u32,
-    ) {
-        self.push_payloads(
-            lane,
-            self.retired_head(lane),
-            first_payload_index,
-            last_payload_index,
-        );
-    }
-
-    fn push_payloads(
-        &self,
-        lane: usize,
-        head: NonNull<u32>,
-        first_payload_index: u32,
-        last_payload_index: u32,
-    ) {
-        let first = stored_payload_index(first_payload_index);
-        // SAFETY: this producer owns `lane`; consumers never read pool heads.
-        let current = unsafe { head.as_ptr().read() };
-        self.payload_header_at(lane, self.payload_offset(last_payload_index))
-            .next_free
-            .store(current, Ordering::Relaxed);
-        // SAFETY: this producer owns `lane`; consumers never read pool heads.
-        unsafe { head.as_ptr().write(first) };
-    }
-
-    #[inline]
-    fn prepend_payload(&self, lane: usize, payload_index: u32, batch: &mut PayloadReleaseBatch) {
-        self.payload_header_at(lane, self.payload_offset(payload_index))
-            .next_free
-            .store(
-                batch
-                    .first_payload_index
-                    .map(stored_payload_index)
-                    .unwrap_or(NO_PAYLOAD),
-                Ordering::Relaxed,
-            );
-        if batch.last_payload_index.is_none() {
-            batch.last_payload_index = Some(payload_index);
-        }
-        batch.first_payload_index = Some(payload_index);
-        batch.count += 1;
-    }
-
-    fn prepend_payload_chain(
-        &self,
-        lane: usize,
-        first_payload_index: u32,
-        last_payload_index: u32,
-        count: usize,
-        batch: &mut PayloadReleaseBatch,
-    ) {
-        debug_assert!(count != 0);
-        self.payload_header_at(lane, self.payload_offset(last_payload_index))
-            .next_free
-            .store(
-                batch
-                    .first_payload_index
-                    .map(stored_payload_index)
-                    .unwrap_or(NO_PAYLOAD),
-                Ordering::Relaxed,
-            );
-        if batch.last_payload_index.is_none() {
-            batch.last_payload_index = Some(last_payload_index);
-        }
-        batch.first_payload_index = Some(first_payload_index);
-        batch.count += count;
-    }
-
-    fn reset_free_links(&self) {
-        for lane in 0..self.producer_slots {
-            for offset in 0..self.lane_capacity {
-                let payload_index = self.payload_index(lane, offset);
-                self.payload_header(payload_index).next_free.store(
-                    next_free_after_lane(lane, offset, self.lane_capacity),
-                    Ordering::Relaxed,
-                );
-            }
-        }
-
-        for lane in 0..self.producer_slots {
-            let free_head = self.free_head(lane);
-            // SAFETY: exclusive recovery owns all producer lanes.
-            unsafe {
-                free_head
-                    .as_ptr()
-                    .write(first_for_lane(lane, self.lane_capacity))
-            };
-
-            let retired_head = self.retired_head(lane);
-            // SAFETY: exclusive recovery owns all producer lanes.
-            unsafe { retired_head.as_ptr().write(NO_PAYLOAD) };
-        }
-    }
-
-    #[inline]
-    fn payload_header(&self, payload_index: u32) -> &PayloadHeader {
-        debug_assert!((payload_index as usize) < self.capacity);
-        let (lane, offset) = self.lane_and_offset(payload_index);
-        self.payload_header_at(lane, offset)
+    #[inline(always)]
+    fn read_free_stack_slot(&self, lane: usize, stack_offset: usize) -> u32 {
+        let metadata = self.metadata_at(lane, stack_offset);
+        // SAFETY: this producer owns `lane`; consumers never read pool stacks.
+        unsafe { addr_of!((*metadata.as_ptr()).free_stack_slot).read() }
     }
 
     #[inline(always)]
-    fn payload_header_at(&self, lane: usize, offset: usize) -> &PayloadHeader {
+    fn write_free_stack_slot(&self, lane: usize, stack_offset: usize, payload_index: u32) {
+        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
+        let metadata = self.metadata_at(lane, stack_offset);
+        // SAFETY: this producer owns `lane`; consumers never read pool stacks.
+        unsafe { addr_of_mut!((*metadata.as_ptr()).free_stack_slot).write(payload_index) };
+    }
+
+    #[inline(always)]
+    fn read_retired_stack_slot(&self, lane: usize, stack_offset: usize) -> u32 {
+        let metadata = self.metadata_at(lane, stack_offset);
+        // SAFETY: this producer owns `lane`; consumers never read pool stacks.
+        unsafe { addr_of!((*metadata.as_ptr()).retired_stack_slot).read() }
+    }
+
+    #[inline(always)]
+    fn write_retired_stack_slot(&self, lane: usize, stack_offset: usize, payload_index: u32) {
+        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
+        let metadata = self.metadata_at(lane, stack_offset);
+        // SAFETY: this producer owns `lane`; consumers never read pool stacks.
+        unsafe { addr_of_mut!((*metadata.as_ptr()).retired_stack_slot).write(payload_index) };
+    }
+
+    #[inline(always)]
+    fn read_retired_sequence(&self, lane: usize, payload_index: u32) -> usize {
+        let metadata = self.metadata_at(lane, self.payload_offset(payload_index));
+        // SAFETY: this producer owns `lane`; consumers never read retired metadata.
+        unsafe { addr_of!((*metadata.as_ptr()).retired_sequence).read() }
+    }
+
+    #[inline(always)]
+    fn write_retired_sequence(&self, lane: usize, payload_index: u32, sequence: usize) {
+        let metadata = self.metadata_at(lane, self.payload_offset(payload_index));
+        // SAFETY: this producer owns `lane`; consumers never read retired metadata.
+        unsafe { addr_of_mut!((*metadata.as_ptr()).retired_sequence).write(sequence) };
+    }
+
+    fn reset_stacks(&self) {
+        for lane in 0..self.producer_slots {
+            for stack_offset in 0..self.lane_capacity {
+                let payload_index = self.payload_index(lane, self.lane_capacity - 1 - stack_offset);
+                self.write_free_stack_slot(lane, stack_offset, payload_index);
+                self.write_retired_stack_slot(lane, stack_offset, self.payload_index(lane, 0));
+                self.write_retired_sequence(lane, self.payload_index(lane, stack_offset), 0);
+            }
+
+            self.write_free_top(lane, self.lane_capacity);
+            self.write_retired_top(lane, 0);
+        }
+    }
+
+    #[inline(always)]
+    fn metadata_at(&self, lane: usize, offset: usize) -> NonNull<PayloadMetadata> {
         debug_assert!(lane < self.producer_slots);
         debug_assert!(offset < self.lane_capacity);
-        let byte_offset =
-            lane * self.header_lane_stride_bytes + offset * core::mem::size_of::<PayloadHeader>();
-        // SAFETY: callers only pass validated payload indices.
+        let byte_offset = lane * self.metadata_lane_stride_bytes
+            + offset * core::mem::size_of::<PayloadMetadata>();
+        // SAFETY: callers only pass validated stack or payload offsets.
         unsafe {
-            self.payload_headers
+            self.payload_metadata
                 .cast::<u8>()
                 .byte_add(byte_offset)
-                .cast::<PayloadHeader>()
-                .as_ref()
+                .cast::<PayloadMetadata>()
         }
     }
 
@@ -739,6 +501,11 @@ impl<T> PayloadPool<T> {
             payload_index >> self.lane_shift,
             payload_index & self.lane_mask,
         )
+    }
+
+    #[inline]
+    fn lane_for_payload(&self, payload_index: u32) -> usize {
+        (payload_index as usize) >> self.lane_shift
     }
 
     #[inline(always)]
@@ -754,35 +521,6 @@ impl<T> PayloadPool<T> {
     }
 }
 
-pub(super) struct PayloadChainCursor<'a, T> {
-    pool: &'a PayloadPool<T>,
-    lane: usize,
-    current: u32,
-}
-
-impl<'a, T> PayloadChainCursor<'a, T> {
-    #[inline(always)]
-    fn new(pool: &'a PayloadPool<T>, lane: usize, first: u32) -> Self {
-        Self {
-            pool,
-            lane,
-            current: first,
-        }
-    }
-
-    #[inline(always)]
-    pub(super) fn current(&self) -> u32 {
-        self.current
-    }
-
-    #[inline(always)]
-    pub(super) fn advance(&mut self) {
-        self.current = self
-            .pool
-            .next_payload_index_in_lane(self.lane, self.current);
-    }
-}
-
 #[inline]
 pub(super) fn capacity_for_ring_capacity(ring_capacity: usize) -> Option<usize> {
     let capacity = ring_capacity.checked_mul(PAYLOADS_PER_RING_ENTRY)?;
@@ -794,44 +532,42 @@ pub(super) fn capacity_for_ring_capacity(ring_capacity: usize) -> Option<usize> 
 }
 
 #[inline]
-pub(super) fn initial_free_head(lane: usize, lane_capacity: usize) -> u32 {
-    first_for_lane(lane, lane_capacity)
+pub(super) fn initial_free_top(lane_capacity: usize) -> u32 {
+    u32::try_from(lane_capacity).expect("payload stack top fits u32")
 }
 
 #[inline]
-pub(super) const fn initial_retired_head() -> u32 {
-    NO_PAYLOAD
+pub(super) const fn initial_retired_top() -> u32 {
+    0
 }
 
-pub(super) unsafe fn initialize_payload_headers(
-    payload_headers: NonNull<PayloadHeader>,
+pub(super) unsafe fn initialize_payload_metadata(
+    payload_metadata: NonNull<PayloadMetadata>,
     lane_capacity: usize,
-    header_lane_stride_bytes: usize,
+    metadata_lane_stride_bytes: usize,
     producer_slots: usize,
 ) {
     for lane in 0..producer_slots {
-        for offset in 0..lane_capacity {
-            let byte_offset =
-                lane * header_lane_stride_bytes + offset * core::mem::size_of::<PayloadHeader>();
-            // SAFETY: caller guarantees `payload_headers` points at the padded
-            // per-lane header layout.
+        for stack_offset in 0..lane_capacity {
+            let payload_index =
+                ((lane * lane_capacity) + (lane_capacity - 1 - stack_offset)) as u32;
+            let byte_offset = lane * metadata_lane_stride_bytes
+                + stack_offset * core::mem::size_of::<PayloadMetadata>();
+            // SAFETY: caller guarantees `payload_metadata` points at the padded
+            // per-lane metadata layout.
             unsafe {
-                payload_headers
+                payload_metadata
                     .cast::<u8>()
                     .byte_add(byte_offset)
-                    .cast::<PayloadHeader>()
+                    .cast::<PayloadMetadata>()
                     .as_ptr()
-                    .write(PayloadHeader::new(next_free_after_lane(
-                        lane,
-                        offset,
-                        lane_capacity,
-                    )))
+                    .write(PayloadMetadata::new(payload_index))
             };
         }
     }
 }
 
-/// Payload references stored in `PayloadHandle`, pool heads, and free-list links.
+/// Payload references stored in `PayloadHandle`.
 /// Zero means no payload; non-zero values are `payload_index + 1`.
 #[inline]
 fn stored_payload_index(payload_index: u32) -> u32 {
@@ -854,101 +590,85 @@ fn payload_index_from_non_null_stored(stored: u32) -> u32 {
     stored.wrapping_sub(1)
 }
 
-#[inline]
-fn next_free_after_lane(lane: usize, offset: usize, lane_capacity: usize) -> u32 {
-    if offset + 1 == lane_capacity {
-        NO_PAYLOAD
-    } else {
-        stored_payload_index((lane * lane_capacity + offset + 1) as u32)
-    }
-}
-
-#[inline]
-fn first_for_lane(lane: usize, lane_capacity: usize) -> u32 {
-    if lane_capacity == 0 {
-        NO_PAYLOAD
-    } else {
-        stored_payload_index((lane * lane_capacity) as u32)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        initial_free_head, initial_retired_head, initialize_payload_headers, PayloadHandle,
-        PayloadHeader, PayloadPool, PayloadReleaseBatch, RetiredPayload,
+        initial_free_top, initial_retired_top, initialize_payload_metadata, PayloadHandle,
+        PayloadMetadata, PayloadPool, RetiredPayload,
     };
     use core::{
         mem::{size_of, MaybeUninit},
         ptr::NonNull,
-        sync::atomic::Ordering,
     };
 
-    fn initialized_pool(capacity: usize) -> (u32, u32, Vec<PayloadHeader>, Vec<MaybeUninit<u64>>) {
-        let free_head = initial_free_head(0, capacity);
-        let retired_head = initial_retired_head();
-        let mut payload_headers = Vec::with_capacity(capacity);
+    fn initialized_pool(
+        capacity: usize,
+    ) -> (u32, u32, Vec<PayloadMetadata>, Vec<MaybeUninit<u64>>) {
+        let free_top = initial_free_top(capacity);
+        let retired_top = initial_retired_top();
+        let mut payload_metadata = Vec::with_capacity(capacity);
         let mut payloads = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             payloads.push(MaybeUninit::uninit());
         }
 
-        let payload_header_ptr =
-            NonNull::new(payload_headers.as_mut_ptr()).expect("non-empty payload header slice");
-        // SAFETY: `payload_headers` has capacity for `capacity` headers and we set
-        // its length immediately after initialization.
+        let payload_metadata_ptr =
+            NonNull::new(payload_metadata.as_mut_ptr()).expect("non-empty payload metadata slice");
+        // SAFETY: `payload_metadata` has capacity for `capacity` entries and we
+        // set its length immediately after initialization.
         unsafe {
-            initialize_payload_headers(
-                payload_header_ptr,
+            initialize_payload_metadata(
+                payload_metadata_ptr,
                 capacity,
-                capacity * size_of::<PayloadHeader>(),
+                capacity * size_of::<PayloadMetadata>(),
                 1,
             );
-            payload_headers.set_len(capacity);
+            payload_metadata.set_len(capacity);
         }
 
-        (free_head, retired_head, payload_headers, payloads)
+        (free_top, retired_top, payload_metadata, payloads)
     }
 
     fn pool<'a>(
-        free_head: &'a mut u32,
-        retired_head: &'a mut u32,
-        payload_headers: &'a [PayloadHeader],
+        free_top: &'a mut u32,
+        retired_top: &'a mut u32,
+        payload_metadata: &'a [PayloadMetadata],
         payloads: &'a mut [MaybeUninit<u64>],
     ) -> PayloadPool<u64> {
         PayloadPool::new(
-            NonNull::from(&mut *free_head),
-            NonNull::from(&mut *retired_head),
-            NonNull::new(payload_headers.as_ptr().cast_mut())
-                .expect("non-empty payload header slice"),
+            NonNull::from(&mut *free_top),
+            NonNull::from(&mut *retired_top),
+            NonNull::new(payload_metadata.as_ptr().cast_mut())
+                .expect("non-empty payload metadata slice"),
             NonNull::new(payloads.as_mut_ptr().cast()).expect("non-empty payload slice"),
-            payload_headers.len(),
-            payload_headers.len() * size_of::<PayloadHeader>(),
-            payload_headers.len() * size_of::<u64>(),
+            payload_metadata.len(),
+            payload_metadata.len() * size_of::<PayloadMetadata>(),
+            payload_metadata.len() * size_of::<u64>(),
             1,
         )
     }
 
     #[test]
-    fn payload_header_uses_compact_layout() {
-        assert_eq!(size_of::<PayloadHeader>(), 16);
+    fn payload_metadata_uses_compact_layout() {
+        assert_eq!(size_of::<PayloadMetadata>(), 16);
     }
 
     #[test]
     fn reserve_payloads_exact_removes_requested_prefix() {
-        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(4);
-        let mut free_head = free_head;
-        let mut retired_head = retired_head;
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(4);
+        let mut free_top = free_top;
+        let mut retired_top = retired_top;
         let pool = pool(
-            &mut free_head,
-            &mut retired_head,
-            &payload_headers,
+            &mut free_top,
+            &mut retired_top,
+            &payload_metadata,
             &mut payloads,
         );
 
         let first = pool.reserve_payloads_exact(2).expect("first reserve");
         assert_eq!(first.first_payload_index(), 0);
-        assert_eq!(payload_headers[1].next_free.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.reserved_payload_at(0, first, 1), 1);
+        assert_eq!(free_top, 2);
 
         let second = pool.reserve_payloads_exact(2).expect("second reserve");
         assert_eq!(second.first_payload_index(), 2);
@@ -956,14 +676,14 @@ mod tests {
     }
 
     #[test]
-    fn cancel_reserved_payloads_restores_chain_to_pool() {
-        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(4);
-        let mut free_head = free_head;
-        let mut retired_head = retired_head;
+    fn cancel_reserved_payloads_restores_stack_to_pool() {
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(4);
+        let mut free_top = free_top;
+        let mut retired_top = retired_top;
         let pool = pool(
-            &mut free_head,
-            &mut retired_head,
-            &payload_headers,
+            &mut free_top,
+            &mut retired_top,
+            &payload_metadata,
             &mut payloads,
         );
 
@@ -977,29 +697,20 @@ mod tests {
 
     #[test]
     fn reclaim_retired_payloads_restores_reusable_payloads() {
-        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(4);
-        let mut free_head = free_head;
-        let mut retired_head = retired_head;
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(4);
+        let mut free_top = free_top;
+        let mut retired_top = retired_top;
         let pool = pool(
-            &mut free_head,
-            &mut retired_head,
-            &payload_headers,
+            &mut free_top,
+            &mut retired_top,
+            &payload_metadata,
             &mut payloads,
         );
         let _reserved = pool.reserve_payloads_exact(4).expect("reserve all");
 
-        let mut batch = PayloadReleaseBatch::new();
-        pool.retire_to_batch(
-            pool.handle_for_payload(2),
-            RetiredPayload::new(0, 12),
-            &mut batch,
-        );
-        pool.retire_to_batch(
-            pool.handle_for_payload(0),
-            RetiredPayload::new(0, 10),
-            &mut batch,
-        );
-        pool.reclaim_retired_batch(batch, |_| false);
+        pool.retire(pool.handle_for_payload(2), RetiredPayload::new(0, 12));
+        pool.retire(pool.handle_for_payload(0), RetiredPayload::new(0, 10));
+        pool.reclaim_retired_payloads(|_| false);
 
         let chain = pool.reserve_payloads_exact(2).expect("reserve released");
         assert_eq!(chain.len(), 2);
@@ -1008,21 +719,20 @@ mod tests {
 
     #[test]
     fn protected_retired_payload_blocks_reuse_until_unprotected() {
-        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(1);
-        let mut free_head = free_head;
-        let mut retired_head = retired_head;
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(1);
+        let mut free_top = free_top;
+        let mut retired_top = retired_top;
         let pool = pool(
-            &mut free_head,
-            &mut retired_head,
-            &payload_headers,
+            &mut free_top,
+            &mut retired_top,
+            &payload_metadata,
             &mut payloads,
         );
 
         let reserved = pool.reserve_payloads_exact(1).expect("reserve");
         let handle = pool.handle_for_payload(reserved.first_payload_index());
-        let mut batch = PayloadReleaseBatch::new();
-        pool.retire_to_batch(handle, RetiredPayload::new(0, 5), &mut batch);
-        pool.reclaim_retired_batch(batch, |retired| retired.sequence() == 5);
+        pool.retire(handle, RetiredPayload::new(0, 5));
+        pool.reclaim_retired_payloads(|retired| retired.sequence() == 5);
         assert!(pool.reserve_payloads_exact(1).is_none());
 
         pool.reclaim_retired_payloads(|_| false);
@@ -1031,13 +741,13 @@ mod tests {
 
     #[test]
     fn invalid_handle_does_not_resolve_to_payload() {
-        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(1);
-        let mut free_head = free_head;
-        let mut retired_head = retired_head;
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(1);
+        let mut free_top = free_top;
+        let mut retired_top = retired_top;
         let pool = pool(
-            &mut free_head,
-            &mut retired_head,
-            &payload_headers,
+            &mut free_top,
+            &mut retired_top,
+            &payload_metadata,
             &mut payloads,
         );
 
@@ -1048,13 +758,13 @@ mod tests {
 
     #[test]
     fn recover_as_exclusive_restores_all_payloads() {
-        let (free_head, retired_head, payload_headers, mut payloads) = initialized_pool(4);
-        let mut free_head = free_head;
-        let mut retired_head = retired_head;
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(4);
+        let mut free_top = free_top;
+        let mut retired_top = retired_top;
         let pool = pool(
-            &mut free_head,
-            &mut retired_head,
-            &payload_headers,
+            &mut free_top,
+            &mut retired_top,
+            &payload_metadata,
             &mut payloads,
         );
         assert!(pool.reserve_payloads_exact(4).is_some());
