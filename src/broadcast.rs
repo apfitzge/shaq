@@ -133,6 +133,7 @@ impl BroadcastConfig {
 pub struct Producer<T> {
     queue: SharedQueue<T>,
     lane: ProducerLane,
+    payload_pool: PayloadPool<T>,
     local: UnsafeCell<ProducerLocal>,
 }
 
@@ -229,9 +230,11 @@ impl<T> Producer<T> {
         // SAFETY: forwarded from this function's safety contract.
         let queue = unsafe { SharedQueue::from_header(region, header) }?;
         let lane = queue.acquire_producer_lane()?;
+        let payload_pool = queue.payload_pool(lane.index());
         Ok(Self {
             queue,
             lane,
+            payload_pool,
             local: UnsafeCell::new(ProducerLocal::new()),
         })
     }
@@ -244,9 +247,11 @@ impl<T> Producer<T> {
     /// Creates another producer with its own lane.
     pub fn try_clone(&self) -> Result<Self, Error> {
         let lane = self.queue.acquire_producer_lane()?;
+        let payload_pool = self.queue.payload_pool(lane.index());
         Ok(Self {
             queue: self.queue.clone(),
             lane,
+            payload_pool,
             local: UnsafeCell::new(ProducerLocal::new()),
         })
     }
@@ -260,9 +265,12 @@ impl<T> Producer<T> {
     /// the operation is guaranteed to be non-blocking.
     ///
     /// Queue publication uses the queue's internal release ordering.
+    #[inline(always)]
     pub fn try_write(&self, item: T) -> Result<(), T> {
         let lane = self.lane.index();
-        match self.with_local(|local| self.queue.try_write_direct(lane, item, local)) {
+        let payload_pool = &self.payload_pool;
+        match self.with_local(|local| self.queue.try_write_direct(lane, payload_pool, item, local))
+        {
             DirectWriteResult::Published => return Ok(()),
             DirectWriteResult::NoPayload(item) => return Err(item),
         }
@@ -276,8 +284,11 @@ impl<T> Producer<T> {
     #[must_use]
     pub fn reserve_write_batch(&self, count: usize) -> Option<WriteBatch<'_, T>> {
         let lane = self.lane.index();
-        let reservation =
-            self.with_local(|local| self.queue.reserve_write_batch(lane, count, local))?;
+        let payload_pool = &self.payload_pool;
+        let reservation = self.with_local(|local| {
+            self.queue
+                .reserve_write_batch(lane, payload_pool, count, local)
+        })?;
         Some(WriteBatch {
             producer: self,
             reservation,
@@ -300,7 +311,7 @@ impl<T> Producer<T> {
         self.lane.mark_active();
     }
 
-    #[inline]
+    #[inline(always)]
     fn with_local<R>(&self, f: impl FnOnce(&mut ProducerLocal) -> R) -> R {
         // SAFETY: `Producer` is not `Sync`, so this handle cannot be used
         // concurrently from multiple threads without external synchronization.
@@ -308,19 +319,25 @@ impl<T> Producer<T> {
     }
 
     fn publish_reserved_payload_chain(&self, reservation: ProducerReservation) {
+        let payload_pool = &self.payload_pool;
         self.with_local(|local| {
             self.queue
-                .publish_reserved_payload_chain(reservation, local)
+                .publish_reserved_payload_chain(payload_pool, reservation, local)
         });
     }
 
     fn cancel_reserved_payloads(&self, reservation: ProducerReservation) {
-        self.with_local(|local| self.queue.cancel_reserved_payloads(reservation, local));
+        let payload_pool = &self.payload_pool;
+        self.with_local(|local| {
+            self.queue
+                .cancel_reserved_payloads(payload_pool, reservation, local)
+        });
     }
 
     fn flush_local(&self) {
         let lane = self.lane.index();
-        self.with_local(|local| self.queue.flush_producer_local(lane, local));
+        let payload_pool = &self.payload_pool;
+        self.with_local(|local| self.queue.flush_producer_local(lane, payload_pool, local));
     }
 }
 
@@ -428,9 +445,11 @@ impl<T> Consumer<T> {
     pub fn join_as_producer(&self) -> Result<Producer<T>, Error> {
         let queue = self.queue.clone();
         let lane = queue.acquire_producer_lane()?;
+        let payload_pool = queue.payload_pool(lane.index());
         Ok(Producer {
             queue,
             lane,
+            payload_pool,
             local: UnsafeCell::new(ProducerLocal::new()),
         })
     }
@@ -657,6 +676,7 @@ impl<T> Consumer<T> {
     /// Callers must only access returned payloads in ways valid for
     /// shared-memory bytes of `T` in this process.
     #[cfg(target_os = "linux")]
+    #[inline(always)]
     pub unsafe fn read_direct_batch_timeout(
         &mut self,
         max: usize,
@@ -696,7 +716,8 @@ impl<T> Consumer<T> {
 
         self.hazard.protect(lane, start, 1);
         let handle = self.queue.handle_at(lane, start);
-        let Some(payload) = self.queue.payload_pool.payload_for_protected_handle(handle) else {
+        let payload_pool = self.queue.payload_pool(lane);
+        let Some(payload) = payload_pool.payload_for_protected_handle(handle) else {
             self.hazard.clear(lane);
             return Err(self.record_current_overrun(lane, start, 1));
         };
@@ -727,6 +748,7 @@ impl<T> Consumer<T> {
     /// # Safety
     /// Callers must only access returned payloads in ways valid for
     /// shared-memory bytes of `T` in this process.
+    #[inline(always)]
     pub unsafe fn try_read_direct_batch(
         &mut self,
         max: usize,
@@ -736,10 +758,11 @@ impl<T> Consumer<T> {
         debug_assert!(count <= MAX_DIRECT_READ_BATCH);
 
         self.hazard.protect(lane, start, count);
+        let payload_pool = self.queue.payload_pool(lane);
         for index in 0..count {
             let position = start.wrapping_add(index);
             let handle = self.queue.handle_at(lane, position);
-            let Some(payload) = self.queue.payload_pool.payload_for_protected_handle(handle) else {
+            let Some(payload) = payload_pool.payload_for_protected_handle(handle) else {
                 self.hazard.clear(lane);
                 return Err(self.record_current_overrun(lane, start, 1));
             };
@@ -857,8 +880,11 @@ struct SharedQueue<T> {
     hazard_slots: NonNull<ConsumerHazardSlot>,
     /// Per-consumer, per-lane local cursors.
     consumer_cursors: NonNull<AtomicUsize>,
-    /// Payload lifecycle management: reservation, retirement, and reclamation.
-    payload_pool: PayloadPool<T>,
+    payload_free_tops: NonNull<u32>,
+    payload_retired_tops: NonNull<u32>,
+    payload_metadata: NonNull<PayloadMetadata>,
+    payloads: NonNull<T>,
+    payload_lane_capacity: usize,
     /// Ring index mask. The ring capacity is `buffer_mask + 1`.
     buffer_mask: usize,
     /// Number of ring cells allocated per producer lane, including padding.
@@ -866,7 +892,7 @@ struct SharedQueue<T> {
     producer_slots: usize,
     consumer_slots: usize,
 
-    // NB: Region must be declared last so header/ring/payload_pool stay valid.
+    // NB: Region must be declared last so header/ring/payload pointers stay valid.
     /// Memory mapping that owns the header, ring, payload headers, and payload data.
     region: Arc<Region>,
 }
@@ -1112,8 +1138,8 @@ struct HazardRange {
 
 impl HazardRange {
     fn protects(self, retired: RetiredPayload) -> bool {
-        retired.lane() == self.lane
-            && retired.sequence().wrapping_sub(self.start) < self.end.wrapping_sub(self.start)
+        retired.lane == self.lane
+            && retired.sequence.wrapping_sub(self.start) < self.end.wrapping_sub(self.start)
     }
 }
 
@@ -1145,7 +1171,11 @@ impl<T> Clone for SharedQueue<T> {
             ring: self.ring,
             hazard_slots: self.hazard_slots,
             consumer_cursors: self.consumer_cursors,
-            payload_pool: self.payload_pool.clone(),
+            payload_free_tops: self.payload_free_tops,
+            payload_retired_tops: self.payload_retired_tops,
+            payload_metadata: self.payload_metadata,
+            payloads: self.payloads,
+            payload_lane_capacity: self.payload_lane_capacity,
             buffer_mask: self.buffer_mask,
             ring_lane_stride: self.ring_lane_stride,
             producer_slots: self.producer_slots,
@@ -1161,12 +1191,25 @@ impl<T> SharedQueue<T> {
         self.buffer_mask.wrapping_add(1)
     }
 
+    #[inline(always)]
+    fn payload_pool(&self, lane: usize) -> PayloadPool<T> {
+        PayloadPool::new(
+            lane,
+            self.payload_free_tops,
+            self.payload_retired_tops,
+            self.payload_metadata,
+            self.payloads,
+            self.payload_lane_capacity,
+            self.producer_slots,
+        )
+    }
+
     #[inline]
     fn producer_slots(&self) -> usize {
         self.producer_slots
     }
 
-    #[inline]
+    #[inline(always)]
     fn producer_lane(&self, lane: usize) -> &ProducerSlot {
         debug_assert!(lane < self.producer_slots);
         // SAFETY: lane is bounded by producer_slots.
@@ -1204,7 +1247,7 @@ impl<T> SharedQueue<T> {
             .load(Ordering::Acquire)
     }
 
-    #[inline]
+    #[inline(always)]
     fn reserved(&self, lane: usize) -> usize {
         self.producer_lane(lane)
             .producer_reservation
@@ -1228,6 +1271,7 @@ impl<T> SharedQueue<T> {
     fn reserve_write_batch(
         &self,
         lane: usize,
+        payload_pool: &PayloadPool<T>,
         count: usize,
         local: &mut ProducerLocal,
     ) -> Option<ProducerReservation> {
@@ -1235,15 +1279,17 @@ impl<T> SharedQueue<T> {
             return None;
         }
 
-        let chain = self.reserve_payloads_for_write(lane, count)?;
+        let chain = self.reserve_payloads_for_write(lane, payload_pool, count)?;
 
         local.batch_reserved = true;
         Some(ProducerReservation { chain, lane })
     }
 
+    #[inline(always)]
     fn try_write_direct(
         &self,
         lane: usize,
+        payload_pool: &PayloadPool<T>,
         item: T,
         local: &mut ProducerLocal,
     ) -> DirectWriteResult<T> {
@@ -1251,37 +1297,44 @@ impl<T> SharedQueue<T> {
             return DirectWriteResult::NoPayload(item);
         }
 
-        let Some(chain) = self.reserve_payloads_for_write(lane, 1) else {
+        let Some(chain) = self.reserve_payloads_for_write(lane, payload_pool, 1) else {
             return DirectWriteResult::NoPayload(item);
         };
 
-        self.write_and_publish_one(lane, chain, item);
+        self.write_and_publish_one(lane, payload_pool, chain, item);
         DirectWriteResult::Published
     }
 
-    fn write_and_publish_one(&self, lane: usize, chain: ReservedPayloads, item: T) {
+    #[inline(always)]
+    fn write_and_publish_one(
+        &self,
+        lane: usize,
+        payload_pool: &PayloadPool<T>,
+        chain: ReservedPayloads,
+        item: T,
+    ) {
         debug_assert_eq!(chain.len(), 1);
         // SAFETY: this producer owns the reserved payload.
         unsafe {
-            self.payload_pool
-                .payload_at_in_lane(lane, chain.first_payload_index())
+            payload_pool
+                .payload_at(chain.first_payload_index())
                 .as_ptr()
                 .write(item)
         };
-        self.publish_one_payload(lane, chain.first_payload_index());
+        self.publish_one_payload(lane, payload_pool, chain.first_payload_index());
     }
 
-    fn publish_one_payload(&self, lane: usize, payload_index: u32) {
+    #[inline(always)]
+    fn publish_one_payload(&self, lane: usize, payload_pool: &PayloadPool<T>, payload_index: u32) {
         let producer_lane = self.producer_lane(lane);
         let start = producer_lane.producer_publication.load(Ordering::Acquire);
         let end = start.wrapping_add(1);
         producer_lane
             .producer_reservation
             .store(end, Ordering::Release);
-        let handle = self.payload_pool.handle_for_payload(payload_index);
+        let handle = payload_pool.handle_for_payload(payload_index);
         let old = self.install_reserved_handle(lane, start, handle);
-        self.payload_pool.retire_in_lane(
-            lane,
+        payload_pool.retire_payload(
             old,
             RetiredPayload::new(lane, start.wrapping_sub(self.capacity())),
         );
@@ -1289,76 +1342,100 @@ impl<T> SharedQueue<T> {
             .producer_publication
             .store(end, Ordering::Release);
         self.wake_waiting_consumers();
-        self.reclaim_retired_if_needed(lane);
+        self.reclaim_retired_if_needed(lane, payload_pool);
     }
 
-    fn publish_payload_chain(&self, lane: usize, chain: ReservedPayloads) {
+    fn publish_payload_chain(
+        &self,
+        lane: usize,
+        payload_pool: &PayloadPool<T>,
+        chain: ReservedPayloads,
+    ) {
         let producer_lane = self.producer_lane(lane);
         let start = producer_lane.producer_publication.load(Ordering::Acquire);
         let end = start.wrapping_add(chain.len());
         producer_lane
             .producer_reservation
             .store(end, Ordering::Release);
-        self.install_reserved_payload_chain(lane, start, chain);
+        self.install_reserved_payload_chain(lane, payload_pool, start, chain);
         producer_lane
             .producer_publication
             .store(end, Ordering::Release);
         self.wake_waiting_consumers();
-        self.reclaim_retired_if_needed(lane);
+        self.reclaim_retired_if_needed(lane, payload_pool);
     }
 
-    fn reserve_payloads_for_write(&self, lane: usize, count: usize) -> Option<ReservedPayloads> {
-        if let Some(chain) = self.payload_pool.take_free_payloads_exact(lane, count) {
+    #[inline(always)]
+    fn reserve_payloads_for_write(
+        &self,
+        lane: usize,
+        payload_pool: &PayloadPool<T>,
+        count: usize,
+    ) -> Option<ReservedPayloads> {
+        if let Some(chain) = payload_pool.take_free_payloads_exact(count) {
             return Some(chain);
         }
 
-        self.reclaim_retired(lane);
-        self.payload_pool.take_free_payloads_exact(lane, count)
+        self.reclaim_retired(lane, payload_pool);
+        payload_pool.take_free_payloads_exact(count)
     }
 
     fn publish_reserved_payload_chain(
         &self,
+        payload_pool: &PayloadPool<T>,
         reservation: ProducerReservation,
         local: &mut ProducerLocal,
     ) {
-        self.publish_payload_chain(reservation.lane, reservation.chain);
+        self.publish_payload_chain(reservation.lane, payload_pool, reservation.chain);
         local.batch_reserved = false;
     }
 
     fn cancel_reserved_payloads(
         &self,
+        payload_pool: &PayloadPool<T>,
         reservation: ProducerReservation,
         local: &mut ProducerLocal,
     ) {
-        self.payload_pool
-            .restore_reserved_payloads(reservation.lane, reservation.chain);
+        payload_pool.restore_reserved_payloads(reservation.chain);
         local.batch_reserved = false;
     }
 
-    fn flush_producer_local(&self, lane: usize, _local: &mut ProducerLocal) {
-        self.reclaim_retired(lane);
+    fn flush_producer_local(
+        &self,
+        lane: usize,
+        payload_pool: &PayloadPool<T>,
+        _local: &mut ProducerLocal,
+    ) {
+        self.reclaim_retired(lane, payload_pool);
     }
 
-    fn install_reserved_payload_chain(&self, lane: usize, start: usize, chain: ReservedPayloads) {
+    fn install_reserved_payload_chain(
+        &self,
+        lane: usize,
+        payload_pool: &PayloadPool<T>,
+        start: usize,
+        chain: ReservedPayloads,
+    ) {
         for index in 0..chain.len() {
-            let payload_index = self.payload_pool.reserved_payload_at(lane, chain, index);
-            let handle = self.payload_pool.handle_for_payload(payload_index);
+            let payload_index = payload_pool.reserved_payload_at(chain, index);
+            let handle = payload_pool.handle_for_payload(payload_index);
             let position = start.wrapping_add(index);
             let old = self.install_reserved_handle(lane, position, handle);
-            self.payload_pool.retire_in_lane(
-                lane,
+            payload_pool.retire_payload(
                 old,
                 RetiredPayload::new(lane, position.wrapping_sub(self.capacity())),
             );
         }
     }
 
-    fn reclaim_retired_if_needed(&self, lane: usize) {
-        if self.payload_pool.retired_payload_count(lane) >= PRODUCER_RETIRED_RECLAIM_THRESHOLD {
-            self.reclaim_retired(lane);
+    #[inline(always)]
+    fn reclaim_retired_if_needed(&self, lane: usize, payload_pool: &PayloadPool<T>) {
+        if payload_pool.retired_payload_count() >= PRODUCER_RETIRED_RECLAIM_THRESHOLD {
+            self.reclaim_retired(lane, payload_pool);
         }
     }
 
+    #[inline(always)]
     fn install_reserved_handle(&self, lane: usize, position: usize, handle: u32) -> u32 {
         let ring_index = position & self.buffer_mask;
         debug_assert!(lane < self.producer_slots);
@@ -1371,7 +1448,7 @@ impl<T> SharedQueue<T> {
         old
     }
 
-    #[inline]
+    #[inline(always)]
     fn handle_at(&self, lane: usize, position: usize) -> u32 {
         let ring_index = position & self.buffer_mask;
         debug_assert!(lane < self.producer_slots);
@@ -1381,7 +1458,7 @@ impl<T> SharedQueue<T> {
         unsafe { self.ring.add(cell_index).as_ref() }.load(Ordering::Acquire)
     }
 
-    #[inline]
+    #[inline(always)]
     fn validate_window(
         &self,
         lane: usize,
@@ -1451,8 +1528,8 @@ impl<T> SharedQueue<T> {
 
     fn retired_payload_is_protected(&self, retired: RetiredPayload) -> bool {
         for index in 0..self.consumer_slots {
-            let slot = self.consumer_hazard_slot(index, retired.lane());
-            if let Some(range) = slot.active_range(retired.lane()) {
+            let slot = self.consumer_hazard_slot(index, retired.lane);
+            if let Some(range) = slot.active_range(retired.lane) {
                 if range.protects(retired) {
                     return true;
                 }
@@ -1461,11 +1538,8 @@ impl<T> SharedQueue<T> {
         false
     }
 
-    fn reclaim_retired(&self, lane: usize) {
-        self.payload_pool
-            .reclaim_retired_payloads_in_lane(lane, |retired| {
-                self.retired_payload_is_protected(retired)
-            });
+    fn reclaim_retired(&self, _lane: usize, payload_pool: &PayloadPool<T>) {
+        payload_pool.reclaim_retired(|retired| self.retired_payload_is_protected(retired));
     }
 
     fn wake_waiting_consumers(&self) {
@@ -1520,7 +1594,9 @@ impl<T> SharedQueue<T> {
                     .store(0, Ordering::Relaxed);
             }
         }
-        self.payload_pool.recover_as_exclusive();
+        for lane in 0..self.producer_slots {
+            self.payload_pool(lane).recover_as_exclusive();
+        }
     }
 
     /// Creates a new shared queue from a header pointer and region.
@@ -1547,10 +1623,6 @@ impl<T> SharedQueue<T> {
         let payload_lane_capacity = payload_pool::capacity_for_ring_capacity(buffer_size_in_items)
             .ok_or(Error::InvalidBufferSize)?;
         let ring_lane_stride = SharedQueueHeader::ring_lane_stride(buffer_size_in_items);
-        let metadata_lane_stride_bytes =
-            SharedQueueHeader::payload_metadata_lane_stride_bytes(payload_lane_capacity);
-        let payload_lane_stride_bytes =
-            SharedQueueHeader::payload_lane_stride_bytes::<T>(payload_lane_capacity);
         // SAFETY: layout validation above proves these regions exist.
         let free_tops = unsafe { SharedQueueHeader::payload_free_tops_from_header(header) };
         // SAFETY: layout validation above proves these regions exist.
@@ -1596,16 +1668,11 @@ impl<T> SharedQueue<T> {
             header,
             producer_lanes,
             ring,
-            payload_pool: PayloadPool::new(
-                free_tops,
-                retired_tops,
-                payload_metadata,
-                payloads,
-                payload_lane_capacity,
-                metadata_lane_stride_bytes,
-                payload_lane_stride_bytes,
-                producer_slots,
-            ),
+            payload_free_tops: free_tops,
+            payload_retired_tops: retired_tops,
+            payload_metadata,
+            payloads,
+            payload_lane_capacity,
             region,
             buffer_mask,
             ring_lane_stride,
@@ -1666,6 +1733,7 @@ impl SharedQueueHeader {
         (lane_capacity * core::mem::size_of::<PayloadMetadata>()).next_multiple_of(CACHELINE_SIZE)
     }
 
+    #[cfg(test)]
     const fn payload_lane_stride_bytes<T>(lane_capacity: usize) -> usize {
         (lane_capacity * core::mem::size_of::<T>()).next_multiple_of(CACHELINE_SIZE)
     }
@@ -2290,11 +2358,10 @@ impl<'a, T> WriteBatch<'a, T> {
 
     fn advance_payload(&mut self) -> u32 {
         assert!(self.written < self.len());
-        let payload_index = self.producer.queue.payload_pool.reserved_payload_at(
-            self.reservation.lane,
-            self.reservation.chain,
-            self.written,
-        );
+        let payload_index = self
+            .producer
+            .payload_pool
+            .reserved_payload_at(self.reservation.chain, self.written);
         self.written += 1;
         payload_index
     }
@@ -2312,9 +2379,8 @@ impl<'a, T> WriteBatch<'a, T> {
         // SAFETY: This batch owns the reserved payload.
         unsafe {
             self.producer
-                .queue
                 .payload_pool
-                .payload_at_in_lane(self.reservation.lane, payload_index)
+                .payload_at(payload_index)
                 .as_ptr()
                 .write(value)
         };
@@ -2380,7 +2446,7 @@ impl<'a, T> DirectRead<'a, T> {
     /// Returns a raw pointer to the hazard-protected payload.
     pub fn as_ptr(&self) -> *const T {
         self.queue
-            .payload_pool
+            .payload_pool(self.lane)
             .protected_payload_ptr(self.payload)
             .as_ptr()
     }
@@ -2411,7 +2477,7 @@ impl<'a, T> AsRef<T> for DirectRead<'a, T> {
         // SAFETY: This guard publishes a hazard for an initialized payload.
         unsafe {
             self.queue
-                .payload_pool
+                .payload_pool(self.lane)
                 .protected_payload_ptr(self.payload)
                 .as_ref()
         }
@@ -2460,7 +2526,7 @@ impl<'a, T> DirectReadBatch<'a, T> {
     /// Panics if `index >= len`.
     pub fn as_ptr(&self, index: usize) -> *const T {
         self.queue
-            .payload_pool
+            .payload_pool(self.lane)
             .protected_payload_ptr(self.payload(index))
             .as_ptr()
     }
@@ -2473,7 +2539,7 @@ impl<'a, T> DirectReadBatch<'a, T> {
         // SAFETY: The index was checked above and this guard publishes a hazard.
         unsafe {
             self.queue
-                .payload_pool
+                .payload_pool(self.lane)
                 .protected_payload_ptr(self.payload(index))
                 .as_ref()
         }
@@ -3352,7 +3418,10 @@ mod tests {
 
         assert_eq!(producer.capacity(), 4);
         assert_eq!(consumer.capacity(), 4);
-        assert_eq!(producer.queue.payload_pool.capacity(), 64);
+        assert_eq!(
+            producer.queue.payload_lane_capacity * producer.queue.producer_slots,
+            64
+        );
     }
 
     #[test]

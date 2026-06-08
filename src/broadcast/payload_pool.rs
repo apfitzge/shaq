@@ -9,7 +9,7 @@ pub(super) const EMPTY_PAYLOAD_HANDLE: u32 = u32::MAX;
 ///
 /// The two stack fields are addressed by stack offset, while
 /// `retired_sequence` is addressed by payload offset. Keeping them together
-/// preserves the old 16-byte-per-payload metadata budget.
+/// preserves the 16-byte-per-payload metadata budget.
 #[repr(C)]
 pub(super) struct PayloadMetadata {
     free_stack_slot: u32,
@@ -48,7 +48,7 @@ impl ReservedPayloads {
 
 #[derive(Clone, Copy)]
 pub(super) struct ProtectedPayload {
-    payload_index: u32,
+    pub(super) payload_index: u32,
 }
 
 impl ProtectedPayload {
@@ -58,17 +58,12 @@ impl ProtectedPayload {
     fn new(payload_index: u32) -> Self {
         Self { payload_index }
     }
-
-    #[inline]
-    fn payload_index(self) -> u32 {
-        self.payload_index
-    }
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct RetiredPayload {
-    lane: usize,
-    sequence: usize,
+    pub(super) lane: usize,
+    pub(super) sequence: usize,
 }
 
 impl RetiredPayload {
@@ -76,119 +71,111 @@ impl RetiredPayload {
     pub(super) fn new(lane: usize, sequence: usize) -> Self {
         Self { lane, sequence }
     }
-
-    #[inline]
-    pub(super) fn lane(self) -> usize {
-        self.lane
-    }
-
-    #[inline]
-    pub(super) fn sequence(self) -> usize {
-        self.sequence
-    }
 }
 
 pub(super) struct PayloadPool<T> {
-    free_tops: NonNull<u32>,
-    retired_tops: NonNull<u32>,
-    payload_metadata: NonNull<PayloadMetadata>,
+    lane: usize,
+    free_top: NonNull<u32>,
+    retired_top: NonNull<u32>,
+    metadata: NonNull<PayloadMetadata>,
     payloads: NonNull<T>,
     lane_capacity: usize,
-    lane_mask: usize,
-    lane_shift: u32,
-    metadata_lane_stride_bytes: usize,
-    payload_lane_stride_bytes: usize,
-    producer_slots: usize,
-    capacity: usize,
-}
-
-impl<T> Clone for PayloadPool<T> {
-    fn clone(&self) -> Self {
-        Self {
-            free_tops: self.free_tops,
-            retired_tops: self.retired_tops,
-            payload_metadata: self.payload_metadata,
-            payloads: self.payloads,
-            lane_capacity: self.lane_capacity,
-            lane_mask: self.lane_mask,
-            lane_shift: self.lane_shift,
-            metadata_lane_stride_bytes: self.metadata_lane_stride_bytes,
-            payload_lane_stride_bytes: self.payload_lane_stride_bytes,
-            producer_slots: self.producer_slots,
-            capacity: self.capacity,
-        }
-    }
+    base_payload_index: u32,
 }
 
 impl<T> PayloadPool<T> {
     #[inline]
     pub(super) fn new(
+        lane: usize,
         free_tops: NonNull<u32>,
         retired_tops: NonNull<u32>,
         payload_metadata: NonNull<PayloadMetadata>,
         payloads: NonNull<T>,
         lane_capacity: usize,
-        metadata_lane_stride_bytes: usize,
-        payload_lane_stride_bytes: usize,
         producer_slots: usize,
     ) -> Self {
+        debug_assert!(lane < producer_slots);
         debug_assert!(lane_capacity.is_power_of_two());
-        let capacity = lane_capacity
-            .checked_mul(producer_slots)
-            .expect("payload capacity overflow");
+        debug_assert!(lane_capacity.checked_mul(producer_slots).is_some());
+        let metadata_lane_stride_bytes = (lane_capacity * core::mem::size_of::<PayloadMetadata>())
+            .next_multiple_of(CACHELINE_SIZE);
+        let payload_lane_stride_bytes =
+            (lane_capacity * core::mem::size_of::<T>()).next_multiple_of(CACHELINE_SIZE);
+
+        let base_payload_index = lane
+            .checked_mul(lane_capacity)
+            .and_then(|index| u32::try_from(index).ok())
+            .expect("payload index fits u32");
+
+        // SAFETY: `lane` is bounded by `producer_slots`.
+        let free_top = unsafe {
+            free_tops
+                .cast::<u8>()
+                .byte_add(lane * CACHELINE_SIZE)
+                .cast::<u32>()
+        };
+        // SAFETY: `lane` is bounded by `producer_slots`.
+        let retired_top = unsafe {
+            retired_tops
+                .cast::<u8>()
+                .byte_add(lane * CACHELINE_SIZE)
+                .cast::<u32>()
+        };
+        // SAFETY: `lane` is bounded by `producer_slots`.
+        let metadata = unsafe {
+            payload_metadata
+                .cast::<u8>()
+                .byte_add(lane * metadata_lane_stride_bytes)
+                .cast::<PayloadMetadata>()
+        };
+        // SAFETY: `lane` is bounded by `producer_slots`.
+        let payloads = unsafe {
+            payloads
+                .cast::<u8>()
+                .byte_add(lane * payload_lane_stride_bytes)
+                .cast::<T>()
+        };
+
         Self {
-            free_tops,
-            retired_tops,
-            payload_metadata,
+            lane,
+            free_top,
+            retired_top,
+            metadata,
             payloads,
             lane_capacity,
-            lane_mask: lane_capacity - 1,
-            lane_shift: lane_capacity.trailing_zeros(),
-            metadata_lane_stride_bytes,
-            payload_lane_stride_bytes,
-            producer_slots,
-            capacity,
+            base_payload_index,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn capacity(&self) -> usize {
-        self.capacity
     }
 
     #[cfg(test)]
     pub(super) fn reserve_payloads_exact(&self, count: usize) -> Option<ReservedPayloads> {
-        self.take_free_payloads_exact(0, count)
+        self.take_free_payloads_exact(count)
     }
 
     #[inline(always)]
-    pub(super) fn take_free_payloads_exact(
-        &self,
-        lane: usize,
-        count: usize,
-    ) -> Option<ReservedPayloads> {
+    pub(super) fn take_free_payloads_exact(&self, count: usize) -> Option<ReservedPayloads> {
         if count == 0 {
             return None;
         }
 
-        self.pop_free_payloads_exact(lane, count)
+        self.pop_free_payloads_exact(count)
     }
 
     #[cfg(test)]
     pub(super) fn cancel_reserved_payloads(&self, chain: ReservedPayloads) {
-        self.restore_reserved_payloads(0, chain);
+        self.restore_reserved_payloads(chain);
     }
 
     #[inline(always)]
-    pub(super) fn restore_reserved_payloads(&self, lane: usize, chain: ReservedPayloads) {
+    pub(super) fn restore_reserved_payloads(&self, chain: ReservedPayloads) {
         debug_assert!(chain.count != 0);
-        debug_assert_eq!(self.read_free_top(lane), chain.first_stack_offset);
-        self.write_free_top(lane, chain.first_stack_offset + chain.count);
+        debug_assert_eq!(self.read_free_top(), chain.first_stack_offset);
+        self.write_free_top(chain.first_stack_offset + chain.count);
     }
 
     #[inline(always)]
     pub(super) fn handle_for_payload(&self, payload_index: u32) -> u32 {
-        debug_assert!((payload_index as usize) < self.capacity);
+        debug_assert!(self.owns_payload(payload_index));
         debug_assert!(payload_index != EMPTY_PAYLOAD_HANDLE);
         payload_index
     }
@@ -199,27 +186,26 @@ impl<T> PayloadPool<T> {
 
     #[cfg(test)]
     pub(super) fn retire(&self, handle: u32, retired: RetiredPayload) {
-        self.retire_in_lane(retired.lane(), handle, retired);
+        self.retire_payload(handle, retired);
     }
 
     #[inline(always)]
-    pub(super) fn retire_in_lane(&self, lane: usize, handle: u32, retired: RetiredPayload) {
+    pub(super) fn retire_payload(&self, handle: u32, retired: RetiredPayload) {
         let Some(payload_index) = self.valid_payload_index(handle) else {
             return;
         };
-        debug_assert_eq!(lane, retired.lane());
-        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
+        debug_assert_eq!(self.lane, retired.lane);
 
-        let retired_top = self.read_retired_top(lane);
+        let retired_top = self.read_retired_top();
         debug_assert!(retired_top < self.lane_capacity);
-        self.write_retired_sequence(lane, payload_index, retired.sequence);
-        self.write_retired_stack_slot(lane, retired_top, payload_index);
-        self.write_retired_top(lane, retired_top + 1);
+        self.write_retired_sequence(payload_index, retired.sequence);
+        self.write_retired_stack_slot(retired_top, payload_index);
+        self.write_retired_top(retired_top + 1);
     }
 
     #[inline]
-    pub(super) fn retired_payload_count(&self, lane: usize) -> usize {
-        self.read_retired_top(lane)
+    pub(super) fn retired_payload_count(&self) -> usize {
+        self.read_retired_top()
     }
 
     #[cfg(test)]
@@ -227,80 +213,64 @@ impl<T> PayloadPool<T> {
     where
         F: FnMut(RetiredPayload) -> bool,
     {
-        self.reclaim_retired_payloads_in_lane(0, is_protected);
+        self.reclaim_retired(is_protected);
     }
 
-    pub(super) fn reclaim_retired_payloads_in_lane<F>(&self, lane: usize, mut is_protected: F)
+    pub(super) fn reclaim_retired<F>(&self, mut is_protected: F)
     where
         F: FnMut(RetiredPayload) -> bool,
     {
-        let retired_top = self.read_retired_top(lane);
+        let retired_top = self.read_retired_top();
         if retired_top == 0 {
             return;
         }
 
         let mut kept = 0usize;
-        let mut free_top = self.read_free_top(lane);
+        let mut free_top = self.read_free_top();
         for offset in 0..retired_top {
-            let payload_index = self.read_retired_stack_slot(lane, offset);
-            let sequence = self.read_retired_sequence(lane, payload_index);
+            let payload_index = self.read_retired_stack_slot(offset);
+            let sequence = self.read_retired_sequence(payload_index);
 
-            if is_protected(RetiredPayload::new(lane, sequence)) {
+            if is_protected(RetiredPayload::new(self.lane, sequence)) {
                 if kept != offset {
-                    self.write_retired_stack_slot(lane, kept, payload_index);
+                    self.write_retired_stack_slot(kept, payload_index);
                 }
                 kept += 1;
             } else {
                 debug_assert!(free_top < self.lane_capacity);
-                self.write_free_stack_slot(lane, free_top, payload_index);
+                self.write_free_stack_slot(free_top, payload_index);
                 free_top += 1;
             }
         }
 
-        self.write_free_top(lane, free_top);
-        self.write_retired_top(lane, kept);
+        self.write_free_top(free_top);
+        self.write_retired_top(kept);
     }
 
     #[inline]
     pub(super) fn protected_payload_ptr(&self, payload: ProtectedPayload) -> NonNull<T> {
-        self.payload_at(payload.payload_index())
+        self.payload_at(payload.payload_index)
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn payload_at(&self, payload_index: u32) -> NonNull<T> {
-        debug_assert!((payload_index as usize) < self.capacity);
-        let (lane, offset) = self.lane_and_offset(payload_index);
-        self.payload_at_offset(lane, offset)
+        self.payload_at_offset(self.payload_offset(payload_index))
     }
 
     #[inline(always)]
-    pub(super) fn payload_at_in_lane(&self, lane: usize, payload_index: u32) -> NonNull<T> {
-        debug_assert!((payload_index as usize) < self.capacity);
-        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
-        self.payload_at_offset(lane, self.payload_offset(payload_index))
-    }
-
-    #[inline(always)]
-    pub(super) fn reserved_payload_at(
-        &self,
-        lane: usize,
-        chain: ReservedPayloads,
-        index: usize,
-    ) -> u32 {
+    pub(super) fn reserved_payload_at(&self, chain: ReservedPayloads, index: usize) -> u32 {
         debug_assert!(index < chain.count);
         let stack_offset = chain.first_stack_offset + chain.count - 1 - index;
-        let payload_index = self.read_free_stack_slot(lane, stack_offset);
-        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
+        let payload_index = self.read_free_stack_slot(stack_offset);
+        debug_assert!(self.owns_payload(payload_index));
         payload_index
     }
 
     #[inline(always)]
-    fn payload_at_offset(&self, lane: usize, offset: usize) -> NonNull<T> {
-        debug_assert!(lane < self.producer_slots);
+    fn payload_at_offset(&self, offset: usize) -> NonNull<T> {
         debug_assert!(offset < self.lane_capacity);
-        let byte_offset =
-            lane * self.payload_lane_stride_bytes + offset * core::mem::size_of::<T>();
-        // SAFETY: callers only pass validated payload indices.
+        let byte_offset = offset * core::mem::size_of::<T>();
+        // SAFETY: callers only pass validated payload offsets.
         unsafe { self.payloads.cast::<u8>().byte_add(byte_offset).cast() }
     }
 
@@ -309,88 +279,60 @@ impl<T> PayloadPool<T> {
     }
 
     fn valid_payload_index(&self, handle: u32) -> Option<u32> {
-        if handle == EMPTY_PAYLOAD_HANDLE {
-            return None;
-        }
-        let payload_index = handle;
-        if payload_index as usize >= self.capacity {
+        if handle == EMPTY_PAYLOAD_HANDLE || !self.owns_payload(handle) {
             None
         } else {
-            Some(payload_index)
+            Some(handle)
         }
     }
 
     #[inline]
-    fn free_top(&self, lane: usize) -> NonNull<u32> {
-        debug_assert!(lane < self.producer_slots);
-        // SAFETY: `free_tops` points into the live per-lane free-top table.
-        unsafe {
-            self.free_tops
-                .cast::<u8>()
-                .byte_add(lane * CACHELINE_SIZE)
-                .cast::<u32>()
-        }
+    fn read_free_top(&self) -> usize {
+        // SAFETY: this producer owns the lane; consumers never read pool stack tops.
+        unsafe { self.free_top.as_ptr().read() as usize }
     }
 
     #[inline]
-    fn retired_top(&self, lane: usize) -> NonNull<u32> {
-        debug_assert!(lane < self.producer_slots);
-        // SAFETY: `retired_tops` points into the live per-lane retired-top table.
-        unsafe {
-            self.retired_tops
-                .cast::<u8>()
-                .byte_add(lane * CACHELINE_SIZE)
-                .cast::<u32>()
-        }
-    }
-
-    #[inline]
-    fn read_free_top(&self, lane: usize) -> usize {
-        // SAFETY: this producer owns `lane`; consumers never read pool stack tops.
-        unsafe { self.free_top(lane).as_ptr().read() as usize }
-    }
-
-    #[inline]
-    fn write_free_top(&self, lane: usize, top: usize) {
+    fn write_free_top(&self, top: usize) {
         debug_assert!(top <= self.lane_capacity);
-        // SAFETY: this producer owns `lane`; consumers never read pool stack tops.
+        // SAFETY: this producer owns the lane; consumers never read pool stack tops.
         unsafe {
-            self.free_top(lane)
+            self.free_top
                 .as_ptr()
                 .write(u32::try_from(top).expect("payload stack top fits u32"))
         };
     }
 
     #[inline]
-    fn read_retired_top(&self, lane: usize) -> usize {
-        // SAFETY: this producer owns `lane`; consumers never read pool stack tops.
-        unsafe { self.retired_top(lane).as_ptr().read() as usize }
+    fn read_retired_top(&self) -> usize {
+        // SAFETY: this producer owns the lane; consumers never read pool stack tops.
+        unsafe { self.retired_top.as_ptr().read() as usize }
     }
 
     #[inline]
-    fn write_retired_top(&self, lane: usize, top: usize) {
+    fn write_retired_top(&self, top: usize) {
         debug_assert!(top <= self.lane_capacity);
-        // SAFETY: this producer owns `lane`; consumers never read pool stack tops.
+        // SAFETY: this producer owns the lane; consumers never read pool stack tops.
         unsafe {
-            self.retired_top(lane)
+            self.retired_top
                 .as_ptr()
                 .write(u32::try_from(top).expect("payload stack top fits u32"))
         };
     }
 
     #[inline]
-    fn pop_free_payloads_exact(&self, lane: usize, count: usize) -> Option<ReservedPayloads> {
+    fn pop_free_payloads_exact(&self, count: usize) -> Option<ReservedPayloads> {
         debug_assert!(count != 0);
         debug_assert!(count <= self.lane_capacity);
 
-        let top = self.read_free_top(lane);
+        let top = self.read_free_top();
         if top < count {
             return None;
         }
 
         let first_stack_offset = top - count;
-        let first_payload_index = self.read_free_stack_slot(lane, top - 1);
-        self.write_free_top(lane, first_stack_offset);
+        let first_payload_index = self.read_free_stack_slot(top - 1);
+        self.write_free_top(first_stack_offset);
         Some(ReservedPayloads {
             first_stack_offset,
             first_payload_index,
@@ -399,109 +341,98 @@ impl<T> PayloadPool<T> {
     }
 
     #[inline(always)]
-    fn read_free_stack_slot(&self, lane: usize, stack_offset: usize) -> u32 {
-        let metadata = self.metadata_at(lane, stack_offset);
-        // SAFETY: this producer owns `lane`; consumers never read pool stacks.
+    fn read_free_stack_slot(&self, stack_offset: usize) -> u32 {
+        let metadata = self.metadata_at(stack_offset);
+        // SAFETY: this producer owns the lane; consumers never read pool stacks.
         unsafe { addr_of!((*metadata.as_ptr()).free_stack_slot).read() }
     }
 
     #[inline(always)]
-    fn write_free_stack_slot(&self, lane: usize, stack_offset: usize, payload_index: u32) {
-        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
-        let metadata = self.metadata_at(lane, stack_offset);
-        // SAFETY: this producer owns `lane`; consumers never read pool stacks.
+    fn write_free_stack_slot(&self, stack_offset: usize, payload_index: u32) {
+        debug_assert!(self.owns_payload(payload_index));
+        let metadata = self.metadata_at(stack_offset);
+        // SAFETY: this producer owns the lane; consumers never read pool stacks.
         unsafe { addr_of_mut!((*metadata.as_ptr()).free_stack_slot).write(payload_index) };
     }
 
     #[inline(always)]
-    fn read_retired_stack_slot(&self, lane: usize, stack_offset: usize) -> u32 {
-        let metadata = self.metadata_at(lane, stack_offset);
-        // SAFETY: this producer owns `lane`; consumers never read pool stacks.
+    fn read_retired_stack_slot(&self, stack_offset: usize) -> u32 {
+        let metadata = self.metadata_at(stack_offset);
+        // SAFETY: this producer owns the lane; consumers never read pool stacks.
         unsafe { addr_of!((*metadata.as_ptr()).retired_stack_slot).read() }
     }
 
     #[inline(always)]
-    fn write_retired_stack_slot(&self, lane: usize, stack_offset: usize, payload_index: u32) {
-        debug_assert_eq!(self.lane_for_payload(payload_index), lane);
-        let metadata = self.metadata_at(lane, stack_offset);
-        // SAFETY: this producer owns `lane`; consumers never read pool stacks.
+    fn write_retired_stack_slot(&self, stack_offset: usize, payload_index: u32) {
+        debug_assert!(self.owns_payload(payload_index));
+        let metadata = self.metadata_at(stack_offset);
+        // SAFETY: this producer owns the lane; consumers never read pool stacks.
         unsafe { addr_of_mut!((*metadata.as_ptr()).retired_stack_slot).write(payload_index) };
     }
 
     #[inline(always)]
-    fn read_retired_sequence(&self, lane: usize, payload_index: u32) -> usize {
-        let metadata = self.metadata_at(lane, self.payload_offset(payload_index));
-        // SAFETY: this producer owns `lane`; consumers never read retired metadata.
+    fn read_retired_sequence(&self, payload_index: u32) -> usize {
+        let metadata = self.metadata_at(self.payload_offset(payload_index));
+        // SAFETY: this producer owns the lane; consumers never read retired metadata.
         unsafe { addr_of!((*metadata.as_ptr()).retired_sequence).read() }
     }
 
     #[inline(always)]
-    fn write_retired_sequence(&self, lane: usize, payload_index: u32, sequence: usize) {
-        let metadata = self.metadata_at(lane, self.payload_offset(payload_index));
-        // SAFETY: this producer owns `lane`; consumers never read retired metadata.
+    fn write_retired_sequence(&self, payload_index: u32, sequence: usize) {
+        let metadata = self.metadata_at(self.payload_offset(payload_index));
+        // SAFETY: this producer owns the lane; consumers never read retired metadata.
         unsafe { addr_of_mut!((*metadata.as_ptr()).retired_sequence).write(sequence) };
     }
 
     fn reset_stacks(&self) {
-        for lane in 0..self.producer_slots {
-            for stack_offset in 0..self.lane_capacity {
-                let payload_index = self.payload_index(lane, self.lane_capacity - 1 - stack_offset);
-                self.write_free_stack_slot(lane, stack_offset, payload_index);
-                self.write_retired_stack_slot(lane, stack_offset, self.payload_index(lane, 0));
-                self.write_retired_sequence(lane, self.payload_index(lane, stack_offset), 0);
-            }
-
-            self.write_free_top(lane, self.lane_capacity);
-            self.write_retired_top(lane, 0);
+        for stack_offset in 0..self.lane_capacity {
+            let payload_index = self.payload_index(self.lane_capacity - 1 - stack_offset);
+            self.write_free_stack_slot(stack_offset, payload_index);
+            self.write_retired_stack_slot(stack_offset, self.base_payload_index);
+            self.write_retired_sequence(self.payload_index(stack_offset), 0);
         }
+
+        self.write_free_top(self.lane_capacity);
+        self.write_retired_top(0);
     }
 
     #[inline(always)]
-    fn metadata_at(&self, lane: usize, offset: usize) -> NonNull<PayloadMetadata> {
-        debug_assert!(lane < self.producer_slots);
+    fn metadata_at(&self, offset: usize) -> NonNull<PayloadMetadata> {
         debug_assert!(offset < self.lane_capacity);
-        let byte_offset = lane * self.metadata_lane_stride_bytes
-            + offset * core::mem::size_of::<PayloadMetadata>();
+        let byte_offset = offset * core::mem::size_of::<PayloadMetadata>();
         // SAFETY: callers only pass validated stack or payload offsets.
         unsafe {
-            self.payload_metadata
+            self.metadata
                 .cast::<u8>()
                 .byte_add(byte_offset)
                 .cast::<PayloadMetadata>()
         }
     }
 
-    #[inline]
-    fn lane_and_offset(&self, payload_index: u32) -> (usize, usize) {
-        let payload_index = payload_index as usize;
-        (
-            payload_index >> self.lane_shift,
-            payload_index & self.lane_mask,
-        )
-    }
-
-    #[inline]
-    fn lane_for_payload(&self, payload_index: u32) -> usize {
-        (payload_index as usize) >> self.lane_shift
+    #[inline(always)]
+    fn owns_payload(&self, payload_index: u32) -> bool {
+        payload_index.wrapping_sub(self.base_payload_index) < self.lane_capacity as u32
     }
 
     #[inline(always)]
     fn payload_offset(&self, payload_index: u32) -> usize {
-        (payload_index as usize) & self.lane_mask
+        debug_assert!(self.owns_payload(payload_index));
+        payload_index.wrapping_sub(self.base_payload_index) as usize
     }
 
     #[inline]
-    fn payload_index(&self, lane: usize, offset: usize) -> u32 {
-        debug_assert!(lane < self.producer_slots);
+    fn payload_index(&self, offset: usize) -> u32 {
         debug_assert!(offset < self.lane_capacity);
-        ((lane << self.lane_shift) | offset) as u32
+        self.base_payload_index
+            .checked_add(u32::try_from(offset).expect("payload offset fits u32"))
+            .expect("payload index fits u32")
     }
 }
 
 #[inline]
 pub(super) fn capacity_for_ring_capacity(ring_capacity: usize) -> Option<usize> {
     let capacity = ring_capacity.checked_mul(PAYLOADS_PER_RING_ENTRY)?;
-    if capacity == 0 || capacity > u32::MAX as usize {
+    if capacity == 0 || capacity > EMPTY_PAYLOAD_HANDLE as usize {
         None
     } else {
         Some(capacity)
@@ -555,7 +486,7 @@ mod tests {
         ptr::NonNull,
     };
 
-    fn initialized_pool(
+    fn initialized_pools(
         capacity: usize,
     ) -> (u32, u32, Vec<PayloadMetadata>, Vec<MaybeUninit<u64>>) {
         let free_top = initial_free_top(capacity);
@@ -590,14 +521,13 @@ mod tests {
         payloads: &'a mut [MaybeUninit<u64>],
     ) -> PayloadPool<u64> {
         PayloadPool::new(
+            0,
             NonNull::from(&mut *free_top),
             NonNull::from(&mut *retired_top),
             NonNull::new(payload_metadata.as_ptr().cast_mut())
                 .expect("non-empty payload metadata slice"),
             NonNull::new(payloads.as_mut_ptr().cast()).expect("non-empty payload slice"),
             payload_metadata.len(),
-            payload_metadata.len() * size_of::<PayloadMetadata>(),
-            payload_metadata.len() * size_of::<u64>(),
             1,
         )
     }
@@ -609,7 +539,7 @@ mod tests {
 
     #[test]
     fn reserve_payloads_exact_removes_requested_prefix() {
-        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(4);
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pools(4);
         let mut free_top = free_top;
         let mut retired_top = retired_top;
         let pool = pool(
@@ -621,7 +551,7 @@ mod tests {
 
         let first = pool.reserve_payloads_exact(2).expect("first reserve");
         assert_eq!(first.first_payload_index(), 0);
-        assert_eq!(pool.reserved_payload_at(0, first, 1), 1);
+        assert_eq!(pool.reserved_payload_at(first, 1), 1);
         assert_eq!(free_top, 2);
 
         let second = pool.reserve_payloads_exact(2).expect("second reserve");
@@ -631,7 +561,7 @@ mod tests {
 
     #[test]
     fn cancel_reserved_payloads_restores_stack_to_pool() {
-        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(4);
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pools(4);
         let mut free_top = free_top;
         let mut retired_top = retired_top;
         let pool = pool(
@@ -651,7 +581,7 @@ mod tests {
 
     #[test]
     fn reclaim_retired_payloads_restores_reusable_payloads() {
-        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(4);
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pools(4);
         let mut free_top = free_top;
         let mut retired_top = retired_top;
         let pool = pool(
@@ -673,7 +603,7 @@ mod tests {
 
     #[test]
     fn protected_retired_payload_blocks_reuse_until_unprotected() {
-        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(1);
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pools(1);
         let mut free_top = free_top;
         let mut retired_top = retired_top;
         let pool = pool(
@@ -686,7 +616,7 @@ mod tests {
         let reserved = pool.reserve_payloads_exact(1).expect("reserve");
         let handle = pool.handle_for_payload(reserved.first_payload_index());
         pool.retire(handle, RetiredPayload::new(0, 5));
-        pool.reclaim_retired_payloads(|retired| retired.sequence() == 5);
+        pool.reclaim_retired_payloads(|retired| retired.sequence == 5);
         assert!(pool.reserve_payloads_exact(1).is_none());
 
         pool.reclaim_retired_payloads(|_| false);
@@ -695,7 +625,7 @@ mod tests {
 
     #[test]
     fn invalid_handle_does_not_resolve_to_payload() {
-        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(1);
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pools(1);
         let mut free_top = free_top;
         let mut retired_top = retired_top;
         let pool = pool(
@@ -712,7 +642,7 @@ mod tests {
 
     #[test]
     fn recover_as_exclusive_restores_all_payloads() {
-        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pool(4);
+        let (free_top, retired_top, payload_metadata, mut payloads) = initialized_pools(4);
         let mut free_top = free_top;
         let mut retired_top = retired_top;
         let pool = pool(
