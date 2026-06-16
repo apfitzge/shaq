@@ -6,6 +6,7 @@ use core::sync::atomic::AtomicUsize;
 const _: () = assert!(size_of::<usize>() >= size_of::<u64>());
 
 pub mod error;
+mod futex;
 pub mod mpmc;
 mod shmem;
 pub mod spsc;

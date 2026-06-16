@@ -1,11 +1,18 @@
 //! DPDK-style bounded MPMC ring queue
 
-use crate::{error::Error, normalized_capacity, shmem::Region, CacheAlignedAtomicSize, VERSION};
+use crate::{
+    error::{Error, WaitError},
+    futex::Waiters,
+    normalized_capacity,
+    shmem::Region,
+    CacheAlignedAtomicSize, VERSION,
+};
 use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
 use std::{
     fs::File,
     num::NonZeroUsize,
     sync::{atomic::AtomicU64, Arc},
+    time::Duration,
 };
 
 /// Unique identifier for MPMC queue in shared memory.
@@ -255,6 +262,12 @@ impl<T> Consumer<T> {
         self.reserve_read().map(ReadGuard::read)
     }
 
+    /// Attempts to read a value from the queue, waiting up to `timeout` for
+    /// a producer to publish data.
+    pub fn read_timeout(&self, timeout: Duration) -> Result<T, WaitError> {
+        self.reserve_read_timeout(timeout).map(ReadGuard::read)
+    }
+
     /// Attempts to reserve a value from the queue, returning a guard.
     /// The slot is released back to producers when the guard is dropped.
     ///
@@ -269,6 +282,12 @@ impl<T> Consumer<T> {
             start: position,
             _marker: PhantomData,
         })
+    }
+
+    /// Attempts to reserve a value from the queue, waiting up to `timeout` for
+    /// a producer to publish data.
+    pub fn reserve_read_timeout(&self, timeout: Duration) -> Result<ReadGuard<'_, T>, WaitError> {
+        self.wait_for_read(timeout, || self.reserve_read())
     }
 
     /// Attempts to reserve up to `max` values from the queue.
@@ -289,6 +308,36 @@ impl<T> Consumer<T> {
             buffer_mask: self.queue.buffer_mask,
             _marker: PhantomData,
         })
+    }
+
+    /// Attempts to reserve up to `max` values from the queue, waiting up to
+    /// `timeout` for a producer to publish data.
+    ///
+    /// Returns `Ok(None)` immediately when `max == 0`.
+    pub fn reserve_read_batch_timeout(
+        &self,
+        max: usize,
+        timeout: Duration,
+    ) -> Result<Option<ReadBatch<'_, T>>, WaitError> {
+        if max == 0 {
+            return Ok(None);
+        }
+
+        self.wait_for_read(timeout, || self.reserve_read_batch(max))
+            .map(Some)
+    }
+
+    fn wait_for_read<R>(
+        &self,
+        timeout: Duration,
+        check: impl FnMut() -> Option<R>,
+    ) -> Result<R, WaitError> {
+        // SAFETY: `self.queue.header` points to this consumer's live shared
+        // queue header.
+        let header = unsafe { self.queue.header.as_ref() };
+        header
+            .waiters
+            .wait_for(&header.producer_publication, timeout, check)
     }
 
     /// Makes reserved-but-not-released reads left behind by a previous
@@ -574,6 +623,8 @@ struct SharedQueueHeader {
     /// Consumers advance this in-order after dropping/reading claimed slots.
     /// Producers use it to determine how much free space is available.
     consumer_release: CacheAlignedAtomicSize,
+    /// Consumer wait/wake coordination.
+    waiters: Waiters,
 }
 
 impl SharedQueueHeader {
@@ -668,6 +719,7 @@ impl SharedQueueHeader {
         header.producer_publication.store(0, Ordering::Release);
         header.consumer_reservation.store(0, Ordering::Release);
         header.consumer_release.store(0, Ordering::Release);
+        header.waiters.initialize();
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.magic.store(MAGIC, Ordering::Release);
@@ -714,9 +766,13 @@ impl SharedQueueHeader {
         while header.producer_publication.load(Ordering::Acquire) != start {
             core::hint::spin_loop();
         }
+        // Release publication; `wake` supplies the fence that pairs it with
+        // a registering waiter and must be called unconditionally; see the
+        // `futex` module docs.
         header
             .producer_publication
             .store(start.wrapping_add(count), Ordering::Release);
+        header.waiters.wake(&header.producer_publication, count);
     }
 
     /// # Safety
@@ -952,6 +1008,13 @@ mod tests {
         (file, producer, consumer)
     }
 
+    fn expect_wait_ok<T>(result: Result<T, WaitError>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(WaitError::Timeout) => panic!("wait timed out"),
+        }
+    }
+
     #[test]
     fn test_producer_consumer() {
         let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
@@ -967,6 +1030,61 @@ mod tests {
             assert_eq!(consumer.try_read(), Some(i as Item));
         }
         assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_read_timeout_observes_publication() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        assert!(matches!(
+            consumer.read_timeout(Duration::ZERO),
+            Err(WaitError::Timeout)
+        ));
+
+        producer.try_write(42).unwrap();
+
+        assert_eq!(expect_wait_ok(consumer.read_timeout(Duration::ZERO)), 42);
+        assert_eq!(consumer.try_read(), None);
+    }
+
+    #[test]
+    fn test_reserve_read_timeout_observes_publication() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        assert!(matches!(
+            consumer.reserve_read_timeout(Duration::ZERO),
+            Err(WaitError::Timeout)
+        ));
+
+        producer.try_write(7).unwrap();
+
+        let guard = expect_wait_ok(consumer.reserve_read_timeout(Duration::ZERO));
+        assert_eq!(*guard.as_ref(), 7);
+    }
+
+    #[test]
+    fn test_reserve_read_batch_timeout_observes_publication() {
+        let (_file, producer, consumer) = create_test_queue::<Item>(BUFFER_SIZE);
+
+        assert!(matches!(
+            consumer.reserve_read_batch_timeout(4, Duration::ZERO),
+            Err(WaitError::Timeout)
+        ));
+        assert!(matches!(
+            consumer.reserve_read_batch_timeout(0, Duration::ZERO),
+            Ok(None)
+        ));
+
+        assert!(producer.try_write_slice(&[1, 2, 3]));
+
+        let batch = match expect_wait_ok(consumer.reserve_read_batch_timeout(4, Duration::ZERO)) {
+            Some(batch) => batch,
+            None => panic!("batch should be returned"),
+        };
+        assert_eq!(batch.len(), 3);
+        for (index, expected) in [1, 2, 3].into_iter().enumerate() {
+            assert_eq!(unsafe { batch.read(index) }, expected);
+        }
     }
 
     #[test]
