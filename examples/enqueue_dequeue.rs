@@ -197,7 +197,7 @@ fn run_spsc_producer(
         move || {
             producer.sync();
             let mut produced = 0;
-            for _ in 0..SYNC_CADENCE {
+            for _ in 0..SYNC_CADENCE.get() {
                 // SAFETY: reserve() yields a valid write slot.
                 let Some(mut spot) = (unsafe { producer.reserve() }) else {
                     producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
@@ -230,7 +230,7 @@ fn run_spsc_consumer(
             }
         }
 
-        for _ in 1..SYNC_CADENCE {
+        for _ in 1..SYNC_CADENCE.get() {
             if consumer.try_read().is_none() {
                 break;
             }
@@ -351,8 +351,7 @@ fn run_mpmc_consumer(
     let wait_timeout = Duration::from_millis(10);
     run_consumer_loop(exit, move || {
         let batch = match consumer.reserve_read_batch_timeout(SYNC_CADENCE, wait_timeout) {
-            Ok(Some(batch)) => batch,
-            Ok(None) => return,
+            Ok(batch) => batch,
             Err(WaitError::Timeout) => {
                 consumer_reserve_failures.fetch_add(1, Ordering::Relaxed);
                 return;
