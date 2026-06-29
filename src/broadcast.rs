@@ -132,6 +132,26 @@ impl Layout {
     }
 
     fn checked_new<T>(config: &BroadcastConfig) -> Option<Self> {
+        if align_of::<T>() > ProducerLane::block_align() {
+            return None;
+        }
+        Self::checked_new_for_payload(config, size_of::<T>(), align_of::<T>())
+    }
+
+    fn new_for_payload(
+        config: &BroadcastConfig,
+        payload_size: usize,
+        payload_align: usize,
+    ) -> Result<Self, Error> {
+        Self::checked_new_for_payload(config, payload_size, payload_align)
+            .ok_or(Error::InvalidBufferSize)
+    }
+
+    fn checked_new_for_payload(
+        config: &BroadcastConfig,
+        payload_size: usize,
+        payload_align: usize,
+    ) -> Option<Self> {
         if config.capacity == 0 {
             return None;
         }
@@ -155,12 +175,17 @@ impl Layout {
             size_of::<SharedQueueHeader>().next_multiple_of(ConsumerState::block_align());
         let consumer_state_bytes = ConsumerState::block_size(config.consumer_slots)?;
 
-        let block_align = ProducerLane::<T>::block_align();
+        let block_align = ProducerLane::block_align();
         let producer_blocks_offset = consumer_state_offset
             .checked_add(consumer_state_bytes)?
             .checked_next_multiple_of(block_align)?;
-        let block_stride = ProducerLane::<T>::block_size(capacity, config.consumer_slots)?
-            .checked_next_multiple_of(block_align)?;
+        let block_stride = producer_lane::block_size_for_payload(
+            capacity,
+            config.consumer_slots,
+            payload_size,
+            payload_align,
+        )?
+        .checked_next_multiple_of(block_align)?;
         let producer_blocks_bytes = block_stride.checked_mul(config.producer_slots)?;
         let total = producer_blocks_offset.checked_add(producer_blocks_bytes)?;
 
@@ -168,8 +193,8 @@ impl Layout {
             capacity,
             producer_slots: config.producer_slots,
             consumer_slots: config.consumer_slots,
-            payload_size: size_of::<T>(),
-            payload_align: align_of::<T>(),
+            payload_size,
+            payload_align,
             consumer_state_offset,
             producer_blocks_offset,
             block_stride,
@@ -191,7 +216,7 @@ impl Layout {
         };
         // `capacity` is already a power of two, so the recomputed layout must
         // match the stored capacity exactly.
-        let layout = Layout::new::<T>(&config)?;
+        let layout = Layout::new_for_payload(&config, header.payload_size, header.payload_align)?;
         if layout.capacity as usize != capacity || region_size < layout.total {
             return Err(Error::InvalidBufferSize);
         }
@@ -209,6 +234,8 @@ struct SharedQueue<T> {
     capacity: u32,
     producer_slots: usize,
     block_stride: usize,
+    payload_size: usize,
+    payload_align: usize,
     _marker: PhantomData<T>,
 }
 
@@ -268,7 +295,7 @@ impl<T> SharedQueue<T> {
             // SAFETY: `lane < producer_slots`; blocks are `block_stride` apart.
             let block = unsafe { producer_blocks.byte_add(lane.wrapping_mul(layout.block_stride)) };
             // SAFETY: the block is sized for `(capacity, consumer_slots)`.
-            unsafe { ProducerLane::<T>::init(block, layout.consumer_slots) };
+            unsafe { ProducerLane::init(block, layout.consumer_slots) };
         }
 
         // Header initialization publishes the queue, so it runs after every
@@ -299,6 +326,8 @@ impl<T> SharedQueue<T> {
             capacity: layout.capacity,
             producer_slots: layout.producer_slots,
             block_stride: layout.block_stride,
+            payload_size: layout.payload_size,
+            payload_align: layout.payload_align,
             _marker: PhantomData,
         }
     }
@@ -309,7 +338,7 @@ impl<T> SharedQueue<T> {
     }
 
     /// A view over producer lane `lane`.
-    fn lane(&self, lane: usize) -> ProducerLane<T> {
+    fn lane(&self, lane: usize) -> ProducerLane {
         debug_assert!(lane < self.producer_slots);
         // SAFETY: `lane < producer_slots`; blocks are `block_stride` apart.
         let block = unsafe {
@@ -317,7 +346,15 @@ impl<T> SharedQueue<T> {
                 .byte_add(lane.wrapping_mul(self.block_stride))
         };
         // SAFETY: the block was initialized with these parameters.
-        unsafe { ProducerLane::from_block(block, self.capacity, self.consumer_slots()) }
+        unsafe {
+            ProducerLane::from_block(
+                block,
+                self.capacity,
+                self.consumer_slots(),
+                self.payload_size,
+                self.payload_align,
+            )
+        }
     }
 
     /// Claims a free producer lane, returning its index.
@@ -417,6 +454,8 @@ impl<T> Clone for SharedQueue<T> {
             capacity: self.capacity,
             producer_slots: self.producer_slots,
             block_stride: self.block_stride,
+            payload_size: self.payload_size,
+            payload_align: self.payload_align,
             _marker: PhantomData,
         }
     }
@@ -434,7 +473,7 @@ unsafe impl<T: Send> Sync for SharedQueue<T> {}
 /// `queue` is kept for `try_clone` and to keep the region mapping alive.
 pub struct Producer<T> {
     queue: SharedQueue<T>,
-    lane: ProducerLane<T>,
+    lane: ProducerLane,
     index: usize,
 }
 
@@ -650,6 +689,7 @@ impl<T> WriteGuard<'_, T> {
             self.producer
                 .lane
                 .payload_ptr(self.start)
+                .cast::<T>()
                 .as_ptr()
                 .write(value)
         };
@@ -691,6 +731,7 @@ impl<T> WriteBatch<'_, T> {
             .producer
             .lane
             .payload_ptr(self.start.wrapping_add(index))
+            .cast::<T>()
             .as_ptr();
         // SAFETY: forwarded; the cell is reserved for this producer.
         unsafe { &mut *ptr.cast() }
@@ -719,7 +760,7 @@ pub struct Consumer<T> {
     queue: SharedQueue<T>,
     index: usize,
     /// One cached view per lane (avoids rebuilding it on every read).
-    lanes: Box<[ProducerLane<T>]>,
+    lanes: Box<[ProducerLane]>,
     /// Next sequence to read per lane (local cache of the published cursors).
     next_by_lane: Box<[usize]>,
     /// Lane to start the next round-robin scan from (rotates for fairness).
@@ -774,7 +815,7 @@ impl<T> Consumer<T> {
         let index = queue.acquire_consumer_index()?;
         // Cache a view per lane (independent of `queue`), and join each — at the
         // frontier, or up to one ring behind it when `from_backlog`.
-        let lanes: Box<[ProducerLane<T>]> = (0..queue.producer_slots())
+        let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
             .map(|lane| queue.lane(lane))
             .collect();
         let next_by_lane = lanes
@@ -822,7 +863,7 @@ impl<T> Consumer<T> {
         queue.recover_consumer_index(index);
         // Resume each lane at the dead owner's recorded position (read-only, so
         // its backpressure is never dropped).
-        let lanes: Box<[ProducerLane<T>]> = (0..queue.producer_slots())
+        let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
             .map(|lane| queue.lane(lane))
             .collect();
         let next_by_lane = lanes
@@ -862,18 +903,18 @@ impl<T> Consumer<T> {
         Ok(())
     }
 
-    fn join_lane(lane: &ProducerLane<T>, index: usize, from_backlog: bool) -> usize {
+    fn join_lane(lane: &ProducerLane, index: usize, from_backlog: bool) -> usize {
         let consumer_state = lane.consumer_state();
         consumer_state.join(index, from_backlog, lane.published(), || lane.reserved())
     }
 
-    fn recover_lane(lane: &ProducerLane<T>, index: usize) -> usize {
+    fn recover_lane(lane: &ProducerLane, index: usize) -> usize {
         let consumer_state = lane.consumer_state();
         consumer_state.recover(index, lane.published(), || lane.reserved())
     }
 
     #[inline]
-    fn lane(&self, lane: usize) -> &ProducerLane<T> {
+    fn lane(&self, lane: usize) -> &ProducerLane {
         debug_assert!(lane < self.lanes.len());
         // SAFETY: every caller passes a lane produced by this consumer's
         // round-robin state or a guard/batch that was created from it.
@@ -953,6 +994,7 @@ impl<T> Consumer<T> {
             self.lane(readable.lane)
                 .payload_ptr(readable.sequence)
                 .as_ptr()
+                .cast::<T>()
                 .read()
         };
         self.advance(readable.lane, NonZeroUsize::MIN);
@@ -970,7 +1012,10 @@ impl<T> Consumer<T> {
     }
 
     fn reserve_read_at(&mut self, readable: ReadableLane) -> ReadGuard<'_, T> {
-        let payload = self.lane(readable.lane).payload_ptr(readable.sequence);
+        let payload = self
+            .lane(readable.lane)
+            .payload_ptr(readable.sequence)
+            .cast();
         ReadGuard {
             consumer: self,
             lane: readable.lane,
@@ -1127,6 +1172,7 @@ impl<T> ReadBatch<'_, T> {
             &*self.consumer.lanes[self.lane]
                 .payload_ptr(self.start.wrapping_add(index))
                 .as_ptr()
+                .cast()
         }
     }
 
@@ -1145,6 +1191,7 @@ impl<T> ReadBatch<'_, T> {
             self.consumer.lanes[self.lane]
                 .payload_ptr(self.start.wrapping_add(index))
                 .as_ptr()
+                .cast::<T>()
                 .read()
         }
     }
@@ -1864,7 +1911,7 @@ mod tests {
         // the index, join, record the cursor) so nothing releases the slot.
         let index = queue.acquire_consumer_index().unwrap();
         let lane = queue.lane(0);
-        Consumer::join_lane(&lane, index, false);
+        Consumer::<Payload>::join_lane(&lane, index, false);
 
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
@@ -1894,7 +1941,7 @@ mod tests {
         // its owner "crashes" (no release).
         let index = queue.acquire_consumer_index().unwrap();
         let lane = queue.lane(0);
-        Consumer::join_lane(&lane, index, false);
+        Consumer::<Payload>::join_lane(&lane, index, false);
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
             assert!(producer.try_write(value).is_ok());
