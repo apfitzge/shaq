@@ -35,6 +35,7 @@ use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
+use core::slice;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::fs::File;
 use std::mem::MaybeUninit;
@@ -207,7 +208,12 @@ impl Layout {
         if header.payload_size != size_of::<T>() || header.payload_align != align_of::<T>() {
             return Err(Error::InvalidBufferSize);
         }
+        Self::from_header_payload(header, region_size)
+    }
 
+    /// Reconstructs and validates the layout from an initialized header without
+    /// knowing the producer's Rust payload type.
+    fn from_header_payload(header: &SharedQueueHeader, region_size: usize) -> Result<Self, Error> {
         let capacity = header.capacity as usize;
         let config = BroadcastConfig {
             capacity,
@@ -261,6 +267,22 @@ impl SharedQueue {
     /// # Safety
     /// - `region` must reference memory laid out by [`Self::create_in_region`].
     unsafe fn join_region<T>(region: &Arc<Region>) -> Result<Self, Error> {
+        unsafe { Self::join_region_with(region, Layout::from_header::<T>) }
+    }
+
+    /// Validates an initialized broadcast region and returns a handle without
+    /// checking against a Rust payload type.
+    ///
+    /// # Safety
+    /// - `region` must reference memory laid out by [`Self::create_in_region`].
+    unsafe fn join_region_untyped(region: &Arc<Region>) -> Result<Self, Error> {
+        unsafe { Self::join_region_with(region, Layout::from_header_payload) }
+    }
+
+    unsafe fn join_region_with(
+        region: &Arc<Region>,
+        layout_from_header: impl FnOnce(&SharedQueueHeader, usize) -> Result<Layout, Error>,
+    ) -> Result<Self, Error> {
         let header = region.addr().cast::<SharedQueueHeader>();
         // SAFETY: regions are page-aligned (>= align_of::<SharedQueueHeader>()).
         let header_ref = unsafe { header.as_ref() };
@@ -273,7 +295,7 @@ impl SharedQueue {
                 actual: header_ref.version,
             });
         }
-        let layout = Layout::from_header::<T>(header_ref, region.size())?;
+        let layout = layout_from_header(header_ref, region.size())?;
         Ok(Self::from_region(Arc::clone(region), layout))
     }
 
@@ -440,6 +462,18 @@ impl SharedQueue {
         // SAFETY: validated against the stored header.
         unsafe { Self::join_region::<T>(&region) }
     }
+
+    /// Maps and validates an existing broadcast queue in `file` without
+    /// checking against a Rust payload type.
+    ///
+    /// # Safety
+    /// - `file` must refer to a live broadcast queue, not resized while joined.
+    unsafe fn join_untyped(file: &File) -> Result<Self, Error> {
+        let file_size = file.metadata()?.len() as usize;
+        let region = Region::map_file(file, file_size)?;
+        // SAFETY: validated against the stored header.
+        unsafe { Self::join_region_untyped(&region) }
+    }
 }
 
 impl Clone for SharedQueue {
@@ -587,6 +621,18 @@ impl<T> Producer<T> {
     /// [`Consumer::join_from_backlog`]).
     pub fn join_as_consumer_from_backlog(&self) -> Result<Consumer<T>, Error> {
         Consumer::from_queue(self.queue.clone(), true)
+    }
+
+    /// Joins the same queue as an untyped consumer. The consumer discovers the
+    /// payload size from the queue header and reads each payload as bytes.
+    pub fn join_as_slice_consumer(&self) -> Result<SliceConsumer, Error> {
+        SliceConsumer::from_queue(self.queue.clone(), false)
+    }
+
+    /// Like [`Self::join_as_slice_consumer`], but starts up to one ring behind
+    /// the frontier so the consumer reads data published before it joined.
+    pub fn join_as_slice_consumer_from_backlog(&self) -> Result<SliceConsumer, Error> {
+        SliceConsumer::from_queue(self.queue.clone(), true)
     }
 
     /// Publishes one value, or returns it on backpressure (the slowest consumer
@@ -762,9 +808,9 @@ impl<T> Drop for WriteBatch<'_, T> {
     }
 }
 
-/// A consumer: owns one consumer index and reads every lane round-robin. Reads
-/// only items published after it joins. Single-threaded use (`&mut self`).
-pub struct Consumer<T> {
+/// Shared consumer machinery: owns a consumer index, tracks one cursor per
+/// producer lane, and reserves raw payload pointers.
+struct ConsumerCore {
     queue: SharedQueue,
     index: usize,
     /// One cached view per lane (avoids rebuilding it on every read).
@@ -773,56 +819,12 @@ pub struct Consumer<T> {
     next_by_lane: Box<[usize]>,
     /// Lane to start the next round-robin scan from (rotates for fairness).
     scan_start_lane: usize,
-    _marker: PhantomData<T>,
 }
 
-#[derive(Clone, Copy)]
-struct ReadableLane {
-    lane: usize,
-    sequence: usize,
-    published: usize,
-}
-
-impl<T> Consumer<T> {
-    /// Creates a broadcast queue in `file` and joins as a consumer.
-    ///
-    /// # Safety
-    /// - Same as [`Producer::create`]: `file` initialized as a queue exactly once
-    ///   (the consumer may be the initializer), same POD-like `T` across all
-    ///   handles.
-    pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
-        // SAFETY: caller guarantees this mapping is initialized exactly once.
-        let queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
-        Self::from_queue(queue, false)
-    }
-
-    /// Joins an existing broadcast queue in `file` as a consumer, starting at the
-    /// current frontier (only items published after the join).
-    ///
-    /// # Safety
-    /// - Same as [`Producer::join`]: live queue, same `T` across all handles.
-    pub unsafe fn join(file: &File) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        Self::from_queue(queue, false)
-    }
-
-    /// Like [`Self::join`], but starts up to one ring behind the frontier so the
-    /// consumer reads data published before it joined. Best for slow queues; on a
-    /// fast one that has already lapped, it falls back to the frontier (see
-    /// [`Self::join`]).
-    ///
-    /// # Safety
-    /// - Same as [`Self::join`].
-    pub unsafe fn join_from_backlog(file: &File) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        Self::from_queue(queue, true)
-    }
-
+impl ConsumerCore {
     fn from_queue(queue: SharedQueue, from_backlog: bool) -> Result<Self, Error> {
         let index = queue.acquire_consumer_index()?;
-        // Cache a view per lane (independent of `queue`), and join each — at the
+        // Cache a view per lane (independent of `queue`), and join each at the
         // frontier, or up to one ring behind it when `from_backlog`.
         let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
             .map(|lane| queue.lane(lane))
@@ -837,33 +839,7 @@ impl<T> Consumer<T> {
             lanes,
             next_by_lane,
             scan_start_lane: 0,
-            _marker: PhantomData,
         })
-    }
-
-    /// The consumer index this handle owns. Record it so a replacement can
-    /// [`recover`](Self::recover) it if this consumer's process dies.
-    pub fn index(&self) -> usize {
-        self.index
-    }
-
-    /// Takes over a consumer index whose owner died, without the usual ownership
-    /// handshake, **resuming where the dead owner left off** on each lane — its
-    /// unread items are still pinned by its reserve limit, so they are delivered.
-    /// To instead restart fresh, [`force_release`](Self::force_release) the index
-    /// and `join` it however you like.
-    ///
-    /// # Safety
-    /// - All of [`Self::join`]'s requirements, plus: the consumer that owned
-    ///   `index` must be dead and no other live handle may use it — two consumers
-    ///   sharing an index corrupts each other's cursor.
-    /// - Recovery must be serialized externally; it must not race with other
-    ///   recovery/force-release operations or with producer/consumer joins or
-    ///   drops on the same queue.
-    pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        Self::recover_in_queue(queue, index)
     }
 
     fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
@@ -871,8 +847,7 @@ impl<T> Consumer<T> {
             return Err(Error::InvalidIndex);
         }
         queue.recover_consumer_index(index);
-        // Resume each lane at the dead owner's recorded position (read-only, so
-        // its backpressure is never dropped).
+        // Resume each lane at the dead owner's recorded position.
         let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
             .map(|lane| queue.lane(lane))
             .collect();
@@ -886,24 +861,10 @@ impl<T> Consumer<T> {
             lanes,
             next_by_lane,
             scan_start_lane: 0,
-            _marker: PhantomData,
         })
     }
 
-    /// Force-releases a consumer index whose owner died, returning it to the free
-    /// pool: the lanes are un-wedged and a later [`join`](Self::join) /
-    /// [`join_from_backlog`](Self::join_from_backlog) can reclaim it fresh. Use this
-    /// (rather than [`recover`](Self::recover)) when you want to drop the dead
-    /// consumer's backlog and choose a new start position.
-    ///
-    /// # Safety
-    /// - As [`Self::join`], plus: the consumer that owned `index` must be dead and
-    ///   no other live handle may use it.
-    /// - Force-release must be serialized externally, with the same restrictions
-    ///   as [`Self::recover`].
-    pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
+    fn force_release(queue: SharedQueue, index: usize) -> Result<(), Error> {
         if index >= queue.consumer_slots() {
             return Err(Error::InvalidIndex);
         }
@@ -922,6 +883,14 @@ impl<T> Consumer<T> {
     fn recover_lane(lane: &ProducerLane, index: usize) -> usize {
         let consumer_state = lane.consumer_state();
         consumer_state.recover(index, lane.published(), || lane.reserved())
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn payload_size(&self) -> usize {
+        self.queue.payload_size
     }
 
     #[inline]
@@ -973,6 +942,51 @@ impl<T> Consumer<T> {
         None
     }
 
+    /// Returns `(lane, payload)` for the next readable payload without advancing
+    /// this consumer's cursor.
+    ///
+    /// `lane` identifies which producer lane the payload came from. `payload`
+    /// points at the published cell for this consumer's current sequence on
+    /// that lane, and remains protected from overwrite until the caller later
+    /// calls [`Self::advance`] for the returned lane.
+    fn try_reserve_read(&mut self) -> Option<(usize, NonNull<u8>)> {
+        let readable = self.next_readable()?;
+        Some(self.reserve_read_at(readable))
+    }
+
+    fn reserve_read_at(&mut self, readable: ReadableLane) -> (usize, NonNull<u8>) {
+        let payload = self.lane(readable.lane).payload_ptr(readable.sequence);
+        (readable.lane, payload)
+    }
+
+    /// Returns `(lane, start, count)` for up to `max` consecutive readable
+    /// payloads from one producer lane without advancing this consumer's cursor.
+    ///
+    /// `lane` identifies the producer lane. `start` is the first sequence to
+    /// read on that lane. `count` is the number of consecutive published cells
+    /// reserved, bounded by both `max` and the lane's current publication. The
+    /// range `start..start + count` remains protected from overwrite until the
+    /// caller later calls [`Self::advance`] for the returned lane and count.
+    fn try_reserve_read_batch(
+        &mut self,
+        max: NonZeroUsize,
+    ) -> Option<(usize, usize, NonZeroUsize)> {
+        let readable = self.next_readable()?;
+        Some(self.reserve_read_batch_at(readable, max))
+    }
+
+    fn reserve_read_batch_at(
+        &mut self,
+        readable: ReadableLane,
+        max: NonZeroUsize,
+    ) -> (usize, usize, NonZeroUsize) {
+        // `next_readable` guarantees at least one published value past `sequence`.
+        let available = readable.published.wrapping_sub(readable.sequence);
+        let count = available.min(max.get());
+        let count = NonZeroUsize::new(count).expect("readable lane has at least one value");
+        (readable.lane, readable.sequence, count)
+    }
+
     /// Advances this consumer's cursor on `lane` by `count` consumed values,
     /// publishing the progress and rotating the scan start. The consumer is the
     /// sole reader of its own cursor (`&mut self`), so the cursor only moves here
@@ -991,24 +1005,147 @@ impl<T> Consumer<T> {
         self.scan_start_lane = scan_start_lane;
     }
 
+    /// Blocks until [`Self::next_readable`] would succeed, sleeping on the
+    /// queue's global wake counter (a publish on any lane wakes it).
+    fn wait_until_readable(&self, timeout: Duration) -> Result<ReadableLane, WaitError> {
+        self.queue.wait_for(timeout, || self.next_readable())
+    }
+}
+
+impl Drop for ConsumerCore {
+    fn drop(&mut self) {
+        // Drop each lane's reserve limit first, then the global ownership, so no
+        // limit lingers for an index another consumer could reclaim.
+        for lane in self.lanes.iter() {
+            lane.consumer_state().release(self.index);
+        }
+        self.queue.release_consumer_index(self.index);
+    }
+}
+
+// SAFETY: core consumer state is single-threaded by its public wrappers, but
+// may be moved between threads.
+unsafe impl Send for ConsumerCore {}
+
+/// A consumer: owns one consumer index and reads every lane round-robin. Reads
+/// only items published after it joins. Single-threaded use (`&mut self`).
+pub struct Consumer<T> {
+    core: ConsumerCore,
+    _marker: PhantomData<T>,
+}
+
+#[derive(Clone, Copy)]
+struct ReadableLane {
+    lane: usize,
+    sequence: usize,
+    published: usize,
+}
+
+impl<T> Consumer<T> {
+    /// Creates a broadcast queue in `file` and joins as a consumer.
+    ///
+    /// # Safety
+    /// - Same as [`Producer::create`]: `file` initialized as a queue exactly once
+    ///   (the consumer may be the initializer), same POD-like `T` across all
+    ///   handles.
+    pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
+        // SAFETY: caller guarantees this mapping is initialized exactly once.
+        let queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
+        Self::from_queue(queue, false)
+    }
+
+    /// Joins an existing broadcast queue in `file` as a consumer, starting at the
+    /// current frontier (only items published after the join).
+    ///
+    /// # Safety
+    /// - Same as [`Producer::join`]: live queue, same `T` across all handles.
+    pub unsafe fn join(file: &File) -> Result<Self, Error> {
+        // SAFETY: validated against the stored header.
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
+        Self::from_queue(queue, false)
+    }
+
+    /// Like [`Self::join`], but starts up to one ring behind the frontier so the
+    /// consumer reads data published before it joined. Best for slow queues; on a
+    /// fast one that has already lapped, it falls back to the frontier (see
+    /// [`Self::join`]).
+    ///
+    /// # Safety
+    /// - Same as [`Self::join`].
+    pub unsafe fn join_from_backlog(file: &File) -> Result<Self, Error> {
+        // SAFETY: validated against the stored header.
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
+        Self::from_queue(queue, true)
+    }
+
+    fn from_queue(queue: SharedQueue, from_backlog: bool) -> Result<Self, Error> {
+        Ok(Self {
+            core: ConsumerCore::from_queue(queue, from_backlog)?,
+            _marker: PhantomData,
+        })
+    }
+
+    /// The consumer index this handle owns. Record it so a replacement can
+    /// [`recover`](Self::recover) it if this consumer's process dies.
+    pub fn index(&self) -> usize {
+        self.core.index()
+    }
+
+    /// Takes over a consumer index whose owner died, without the usual ownership
+    /// handshake, **resuming where the dead owner left off** on each lane — its
+    /// unread items are still pinned by its reserve limit, so they are delivered.
+    /// To instead restart fresh, [`force_release`](Self::force_release) the index
+    /// and `join` it however you like.
+    ///
+    /// # Safety
+    /// - All of [`Self::join`]'s requirements, plus: the consumer that owned
+    ///   `index` must be dead and no other live handle may use it — two consumers
+    ///   sharing an index corrupts each other's cursor.
+    /// - Recovery must be serialized externally; it must not race with other
+    ///   recovery/force-release operations or with producer/consumer joins or
+    ///   drops on the same queue.
+    pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
+        // SAFETY: validated against the stored header.
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
+        Self::recover_in_queue(queue, index)
+    }
+
+    fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
+        Ok(Self {
+            core: ConsumerCore::recover_in_queue(queue, index)?,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Force-releases a consumer index whose owner died, returning it to the free
+    /// pool: the lanes are un-wedged and a later [`join`](Self::join) /
+    /// [`join_from_backlog`](Self::join_from_backlog) can reclaim it fresh. Use this
+    /// (rather than [`recover`](Self::recover)) when you want to drop the dead
+    /// consumer's backlog and choose a new start position.
+    ///
+    /// # Safety
+    /// - As [`Self::join`], plus: the consumer that owned `index` must be dead and
+    ///   no other live handle may use it.
+    /// - Force-release must be serialized externally, with the same restrictions
+    ///   as [`Self::recover`].
+    pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
+        // SAFETY: validated against the stored header.
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
+        ConsumerCore::force_release(queue, index)
+    }
+
     /// Reads the next available value by copying it out, or `None` if every lane
     /// is caught up.
     pub fn try_read(&mut self) -> Option<T>
     where
         T: Copy,
     {
-        let readable = self.next_readable()?;
+        let (lane, payload) = self.core.try_reserve_read()?;
         // SAFETY: `sequence < publication`, so the cell is published (initialized);
         // this consumer's cursor still protects it from being overwritten until we
         // advance below. The copy happens before the cursor advances.
-        let value = unsafe {
-            self.lane(readable.lane)
-                .payload_ptr(readable.sequence)
-                .as_ptr()
-                .cast::<T>()
-                .read()
-        };
-        self.advance(readable.lane, NonZeroUsize::MIN);
+        let value = unsafe { payload.cast::<T>().as_ptr().read() };
+        self.core.advance(lane, NonZeroUsize::MIN);
         Some(value)
     }
 
@@ -1018,19 +1155,16 @@ impl<T> Consumer<T> {
     /// guard is dropped, which advances past it.
     #[must_use]
     pub fn try_reserve_read(&mut self) -> Option<ReadGuard<'_, T>> {
-        let readable = self.next_readable()?;
+        let readable = self.core.next_readable()?;
         Some(self.reserve_read_at(readable))
     }
 
     fn reserve_read_at(&mut self, readable: ReadableLane) -> ReadGuard<'_, T> {
-        let payload = self
-            .lane(readable.lane)
-            .payload_ptr(readable.sequence)
-            .cast();
+        let (lane, payload) = self.core.reserve_read_at(readable);
         ReadGuard {
-            consumer: self,
-            lane: readable.lane,
-            payload,
+            consumer: &mut self.core,
+            lane,
+            payload: payload.cast(),
         }
     }
 
@@ -1042,8 +1176,14 @@ impl<T> Consumer<T> {
     /// is dropped, which advances past the whole batch.
     #[must_use]
     pub fn try_reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
-        let readable = self.next_readable()?;
-        Some(self.reserve_read_batch_at(readable, max))
+        let (lane, start, count) = self.core.try_reserve_read_batch(max)?;
+        Some(ReadBatch {
+            consumer: &mut self.core,
+            lane,
+            start,
+            count,
+            _marker: PhantomData,
+        })
     }
 
     fn reserve_read_batch_at(
@@ -1051,15 +1191,13 @@ impl<T> Consumer<T> {
         readable: ReadableLane,
         max: NonZeroUsize,
     ) -> ReadBatch<'_, T> {
-        // `next_readable` guarantees at least one published value past `sequence`.
-        let available = readable.published.wrapping_sub(readable.sequence);
-        let count = available.min(max.get());
-        let count = NonZeroUsize::new(count).expect("readable lane has at least one value");
+        let (lane, start, count) = self.core.reserve_read_batch_at(readable, max);
         ReadBatch {
-            consumer: self,
-            lane: readable.lane,
-            start: readable.sequence,
+            consumer: &mut self.core,
+            lane,
+            start,
             count,
+            _marker: PhantomData,
         }
     }
 
@@ -1069,7 +1207,7 @@ impl<T> Consumer<T> {
         &mut self,
         timeout: Duration,
     ) -> Result<ReadGuard<'_, T>, WaitError> {
-        let readable = self.wait_until_readable(timeout)?;
+        let readable = self.core.wait_until_readable(timeout)?;
         Ok(self.reserve_read_at(readable))
     }
 
@@ -1080,7 +1218,7 @@ impl<T> Consumer<T> {
         max: NonZeroUsize,
         timeout: Duration,
     ) -> Result<ReadBatch<'_, T>, WaitError> {
-        let readable = self.wait_until_readable(timeout)?;
+        let readable = self.core.wait_until_readable(timeout)?;
         Ok(self.reserve_read_batch_at(readable, max))
     }
 
@@ -1093,23 +1231,6 @@ impl<T> Consumer<T> {
         let guard = self.reserve_read_timeout(timeout)?;
         Ok(guard.read())
     }
-
-    /// Blocks until [`Self::next_readable`] would succeed, sleeping on the queue's
-    /// global wake counter (a publish on any lane wakes it).
-    fn wait_until_readable(&self, timeout: Duration) -> Result<ReadableLane, WaitError> {
-        self.queue.wait_for(timeout, || self.next_readable())
-    }
-}
-
-impl<T> Drop for Consumer<T> {
-    fn drop(&mut self) {
-        // Drop each lane's reserve limit first, then the global ownership, so no
-        // limit lingers for an index another consumer could reclaim.
-        for lane in self.lanes.iter() {
-            lane.consumer_state().release(self.index);
-        }
-        self.queue.release_consumer_index(self.index);
-    }
 }
 
 // SAFETY: a consumer is single-threaded (read ops take `&mut self`) but may be
@@ -1121,7 +1242,7 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 /// it); dropping the guard advances past it.
 #[must_use]
 pub struct ReadGuard<'a, T> {
-    consumer: &'a mut Consumer<T>,
+    consumer: &'a mut ConsumerCore,
     lane: usize,
     payload: NonNull<T>,
 }
@@ -1156,10 +1277,11 @@ impl<T> Drop for ReadGuard<'_, T> {
 /// whole batch.
 #[must_use]
 pub struct ReadBatch<'a, T> {
-    consumer: &'a mut Consumer<T>,
+    consumer: &'a mut ConsumerCore,
     lane: usize,
     start: usize,
     count: NonZeroUsize,
+    _marker: PhantomData<T>,
 }
 
 impl<T> ReadBatch<'_, T> {
@@ -1209,6 +1331,269 @@ impl<T> ReadBatch<'_, T> {
 }
 
 impl<T> Drop for ReadBatch<'_, T> {
+    fn drop(&mut self) {
+        self.consumer.advance(self.lane, self.count);
+    }
+}
+
+/// An untyped consumer that reads each broadcast payload as a byte slice.
+///
+/// `SliceConsumer` joins an existing queue without knowing its Rust payload
+/// type. The payload size is discovered from the queue header, and every read
+/// returns a guard exposing the payload bytes. Dropping the guard advances the
+/// consumer cursor, just like [`ReadGuard`].
+pub struct SliceConsumer {
+    core: ConsumerCore,
+}
+
+impl SliceConsumer {
+    /// Joins an existing broadcast queue in `file` as an untyped consumer,
+    /// starting at the current frontier.
+    ///
+    /// # Safety
+    /// - `file` must refer to a live broadcast queue, not resized while joined.
+    /// - Payload bytes must be meaningful to the caller without relying on Rust
+    ///   type validation.
+    pub unsafe fn join(file: &File) -> Result<Self, Error> {
+        // SAFETY: validated against the stored header.
+        let queue = unsafe { SharedQueue::join_untyped(file) }?;
+        Self::from_queue(queue, false)
+    }
+
+    /// Like [`Self::join`], but starts up to one ring behind the frontier so the
+    /// consumer reads data published before it joined.
+    ///
+    /// # Safety
+    /// - Same as [`Self::join`].
+    pub unsafe fn join_from_backlog(file: &File) -> Result<Self, Error> {
+        // SAFETY: validated against the stored header.
+        let queue = unsafe { SharedQueue::join_untyped(file) }?;
+        Self::from_queue(queue, true)
+    }
+
+    fn from_queue(queue: SharedQueue, from_backlog: bool) -> Result<Self, Error> {
+        Ok(Self {
+            core: ConsumerCore::from_queue(queue, from_backlog)?,
+        })
+    }
+
+    /// The consumer index this handle owns. Record it so a replacement can
+    /// [`recover`](Self::recover) it if this consumer's process dies.
+    pub fn index(&self) -> usize {
+        self.core.index()
+    }
+
+    /// Number of bytes in each payload cell, discovered from the queue header.
+    pub fn payload_size(&self) -> usize {
+        self.core.payload_size()
+    }
+
+    /// Takes over a consumer index whose owner died, resuming where the dead
+    /// owner left off on each lane.
+    ///
+    /// # Safety
+    /// - All of [`Self::join`]'s requirements, plus: the consumer that owned
+    ///   `index` must be dead and no other live handle may use it.
+    /// - Recovery must be serialized externally; it must not race with other
+    ///   recovery/force-release operations or with producer/consumer joins or
+    ///   drops on the same queue.
+    pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
+        // SAFETY: validated against the stored header.
+        let queue = unsafe { SharedQueue::join_untyped(file) }?;
+        Self::recover_in_queue(queue, index)
+    }
+
+    fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
+        Ok(Self {
+            core: ConsumerCore::recover_in_queue(queue, index)?,
+        })
+    }
+
+    /// Force-releases a consumer index whose owner died, returning it to the
+    /// free pool.
+    ///
+    /// # Safety
+    /// - As [`Self::join`], plus: the consumer that owned `index` must be dead
+    ///   and no other live handle may use it.
+    /// - Force-release must be serialized externally, with the same restrictions
+    ///   as [`Self::recover`].
+    pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
+        // SAFETY: validated against the stored header.
+        let queue = unsafe { SharedQueue::join_untyped(file) }?;
+        ConsumerCore::force_release(queue, index)
+    }
+
+    /// Reserves the next available payload and exposes it as bytes, or `None` if
+    /// every lane is caught up. The returned guard holds this consumer's cursor
+    /// until it is dropped.
+    #[must_use]
+    pub fn try_read(&mut self) -> Option<SliceReadGuard<'_>> {
+        self.try_reserve_read()
+    }
+
+    /// Alias for [`Self::try_read`].
+    #[must_use]
+    pub fn try_reserve_read(&mut self) -> Option<SliceReadGuard<'_>> {
+        let readable = self.core.next_readable()?;
+        Some(self.reserve_read_at(readable))
+    }
+
+    fn reserve_read_at(&mut self, readable: ReadableLane) -> SliceReadGuard<'_> {
+        let (lane, payload) = self.core.reserve_read_at(readable);
+        let len = self.core.payload_size();
+        SliceReadGuard {
+            consumer: &mut self.core,
+            lane,
+            payload,
+            len,
+        }
+    }
+
+    /// Reserves up to `max` consecutive published payloads from the next
+    /// readable lane, or `None` if every lane is caught up.
+    #[must_use]
+    pub fn try_reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<SliceReadBatch<'_>> {
+        let (lane, start, count) = self.core.try_reserve_read_batch(max)?;
+        let payload_size = self.core.payload_size();
+        Some(SliceReadBatch {
+            consumer: &mut self.core,
+            lane,
+            start,
+            count,
+            payload_size,
+        })
+    }
+
+    fn reserve_read_batch_at(
+        &mut self,
+        readable: ReadableLane,
+        max: NonZeroUsize,
+    ) -> SliceReadBatch<'_> {
+        let (lane, start, count) = self.core.reserve_read_batch_at(readable, max);
+        let payload_size = self.core.payload_size();
+        SliceReadBatch {
+            consumer: &mut self.core,
+            lane,
+            start,
+            count,
+            payload_size,
+        }
+    }
+
+    /// Blocks until any lane has an unread payload or `timeout` elapses, then
+    /// returns a [`SliceReadGuard`] for it; `Err(Timeout)` if none arrived.
+    pub fn read_timeout(&mut self, timeout: Duration) -> Result<SliceReadGuard<'_>, WaitError> {
+        self.reserve_read_timeout(timeout)
+    }
+
+    /// Blocks until any lane has an unread payload or `timeout` elapses, then
+    /// returns a [`SliceReadGuard`] for it; `Err(Timeout)` if none arrived.
+    pub fn reserve_read_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<SliceReadGuard<'_>, WaitError> {
+        let readable = self.core.wait_until_readable(timeout)?;
+        Ok(self.reserve_read_at(readable))
+    }
+
+    /// Blocks until any lane has unread payloads or `timeout` elapses, then
+    /// returns a [`SliceReadBatch`] of up to `max` of them.
+    pub fn reserve_read_batch_timeout(
+        &mut self,
+        max: NonZeroUsize,
+        timeout: Duration,
+    ) -> Result<SliceReadBatch<'_>, WaitError> {
+        let readable = self.core.wait_until_readable(timeout)?;
+        Ok(self.reserve_read_batch_at(readable, max))
+    }
+}
+
+// SAFETY: a slice consumer is single-threaded (read ops take `&mut self`) but
+// may be moved between threads.
+unsafe impl Send for SliceConsumer {}
+
+/// An in-place borrow of one published payload as bytes.
+#[must_use]
+pub struct SliceReadGuard<'a> {
+    consumer: &'a mut ConsumerCore,
+    lane: usize,
+    payload: NonNull<u8>,
+    len: usize,
+}
+
+impl SliceReadGuard<'_> {
+    /// Byte length of the payload.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the payload bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the cell is published and held by this consumer's cursor.
+        unsafe { slice::from_raw_parts(self.payload.as_ptr(), self.len) }
+    }
+}
+
+impl AsRef<[u8]> for SliceReadGuard<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Drop for SliceReadGuard<'_> {
+    fn drop(&mut self) {
+        self.consumer.advance(self.lane, NonZeroUsize::MIN);
+    }
+}
+
+/// An in-place borrow of consecutive published payloads from one lane as bytes.
+#[must_use]
+pub struct SliceReadBatch<'a> {
+    consumer: &'a mut ConsumerCore,
+    lane: usize,
+    start: usize,
+    count: NonZeroUsize,
+    payload_size: usize,
+}
+
+impl SliceReadBatch<'_> {
+    pub fn len(&self) -> usize {
+        self.count.get()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Byte length of each payload in the batch.
+    pub fn payload_size(&self) -> usize {
+        self.payload_size
+    }
+
+    /// Byte slice for the payload at `index`.
+    ///
+    /// # Safety
+    /// - `index < len`.
+    pub unsafe fn as_slice(&self, index: usize) -> &[u8] {
+        debug_assert!(index < self.count.get());
+        // SAFETY: forwarded; the cell is published and held by this consumer's
+        // cursor until the batch is dropped.
+        unsafe {
+            let ptr = self
+                .consumer
+                .lane(self.lane)
+                .payload_ptr(self.start.wrapping_add(index))
+                .as_ptr();
+            slice::from_raw_parts(ptr, self.payload_size)
+        }
+    }
+}
+
+impl Drop for SliceReadBatch<'_> {
     fn drop(&mut self) {
         self.consumer.advance(self.lane, self.count);
     }
@@ -1421,6 +1806,76 @@ mod tests {
         // SAFETY: the region is a live broadcast queue; validation should fail.
         let err = unsafe { SharedQueue::join_region::<[u8; 4]>(&region) };
         assert!(matches!(err, Err(Error::InvalidBufferSize)));
+    }
+
+    #[test]
+    fn slice_consumer_reads_payload_bytes() {
+        let mut producer = create_heap_producer(BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        });
+        let mut consumer = producer.join_as_slice_consumer().unwrap();
+        assert_eq!(consumer.payload_size(), size_of::<Payload>());
+
+        let value = 0x0102_0304_0506_0708u64;
+        assert!(producer.try_write(value).is_ok());
+
+        let guard = consumer.try_read().expect("readable");
+        assert_eq!(guard.len(), size_of::<Payload>());
+        assert_eq!(guard.as_slice(), value.to_ne_bytes());
+        drop(guard);
+
+        assert!(consumer.try_read().is_none());
+    }
+
+    #[test]
+    fn slice_consumer_batch_reads_payload_bytes() {
+        let mut producer = create_heap_producer(BroadcastConfig {
+            capacity: 8,
+            producer_slots: 1,
+            consumer_slots: 1,
+        });
+        let mut consumer = producer.join_as_slice_consumer().unwrap();
+
+        assert!(producer.try_write_slice(&[11, 12, 13]));
+        {
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+                .expect("readable batch");
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch.payload_size(), size_of::<Payload>());
+            // SAFETY: both indexes are below `batch.len()`.
+            unsafe {
+                assert_eq!(batch.as_slice(0), 11u64.to_ne_bytes());
+                assert_eq!(batch.as_slice(1), 12u64.to_ne_bytes());
+            }
+        }
+
+        let guard = consumer.try_read().expect("remaining item");
+        assert_eq!(guard.as_slice(), 13u64.to_ne_bytes());
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn slice_consumer_joins_file_without_payload_type() {
+        let config = BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        };
+        let file = create_temp_shmem_file().expect("temp file");
+        // SAFETY: a fresh temp file, initialized exactly once here.
+        let mut producer = unsafe { Producer::<Payload>::create(&file, config) }.unwrap();
+        // SAFETY: the file now contains a live broadcast queue.
+        let mut consumer = unsafe { SliceConsumer::join(&file) }.unwrap();
+        assert_eq!(consumer.payload_size(), size_of::<Payload>());
+
+        let value = 0xfeed_face_cafe_beefu64;
+        assert!(producer.try_write(value).is_ok());
+
+        let guard = consumer.read_timeout(Duration::ZERO).expect("readable");
+        assert_eq!(guard.as_slice(), value.to_ne_bytes());
     }
 
     #[test]
@@ -1922,7 +2377,7 @@ mod tests {
         // the index, join, record the cursor) so nothing releases the slot.
         let index = queue.acquire_consumer_index().unwrap();
         let lane = queue.lane(0);
-        Consumer::<Payload>::join_lane(&lane, index, false);
+        ConsumerCore::join_lane(&lane, index, false);
 
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
@@ -1952,7 +2407,7 @@ mod tests {
         // its owner "crashes" (no release).
         let index = queue.acquire_consumer_index().unwrap();
         let lane = queue.lane(0);
-        Consumer::<Payload>::join_lane(&lane, index, false);
+        ConsumerCore::join_lane(&lane, index, false);
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
             assert!(producer.try_write(value).is_ok());
