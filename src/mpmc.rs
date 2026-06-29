@@ -84,7 +84,7 @@ impl<T> Producer<T> {
     /// Writes item into the queue or returns it if there is not enough space.
     pub fn try_write(&self, item: T) -> Result<(), T> {
         // SAFETY: On successful reservation the item is written below.
-        let guard = match unsafe { self.reserve_write() } {
+        let guard = match unsafe { self.try_reserve_write() } {
             Some(guard) => guard,
             None => return Err(item),
         };
@@ -104,7 +104,7 @@ impl<T> Producer<T> {
         };
 
         // SAFETY: if successful we write all items below.
-        let mut guard = match unsafe { self.reserve_write_batch(len) } {
+        let mut guard = match unsafe { self.try_reserve_write_batch(len) } {
             Some(guard) => guard,
             None => return false,
         };
@@ -126,7 +126,7 @@ impl<T> Producer<T> {
     /// # Safety
     /// - The caller must initialize the reserved slot before the guard is dropped.
     #[must_use]
-    pub unsafe fn reserve_write(&self) -> Option<WriteGuard<'_, T>> {
+    pub unsafe fn try_reserve_write(&self) -> Option<WriteGuard<'_, T>> {
         self.queue
             .reserve_write()
             .map(|(cell, position)| WriteGuard {
@@ -147,7 +147,7 @@ impl<T> Producer<T> {
     /// # Safety
     /// - The caller must initialize all reserved slots before the batch is dropped.
     #[must_use]
-    pub unsafe fn reserve_write_batch(&self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
+    pub unsafe fn try_reserve_write_batch(&self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
         let start = self.queue.reserve_write_batch(count)?;
         Some(WriteBatch {
             header: self.queue.header,
@@ -259,7 +259,7 @@ impl<T> Consumer<T> {
     /// Attempts to read a value from the queue.
     /// Returns `None` if there are no values available.
     pub fn try_read(&self) -> Option<T> {
-        self.reserve_read().map(ReadGuard::read)
+        self.try_reserve_read().map(ReadGuard::read)
     }
 
     /// Attempts to read a value from the queue, waiting up to `timeout` for
@@ -275,7 +275,7 @@ impl<T> Consumer<T> {
     /// released in order they were reserved. Holding a [`ReadGuard`] should
     /// be treated similarly to holding a lock on a critical section.
     #[must_use]
-    pub fn reserve_read(&self) -> Option<ReadGuard<'_, T>> {
+    pub fn try_reserve_read(&self) -> Option<ReadGuard<'_, T>> {
         self.queue.reserve_read().map(|(cell, position)| ReadGuard {
             header: self.queue.header,
             cell,
@@ -287,7 +287,7 @@ impl<T> Consumer<T> {
     /// Attempts to reserve a value from the queue, waiting up to `timeout` for
     /// a producer to publish data.
     pub fn reserve_read_timeout(&self, timeout: Duration) -> Result<ReadGuard<'_, T>, WaitError> {
-        self.wait_for_read(timeout, || self.reserve_read())
+        self.wait_for_read(timeout, || self.try_reserve_read())
     }
 
     /// Attempts to reserve up to `max` values from the queue.
@@ -298,7 +298,7 @@ impl<T> Consumer<T> {
     /// released in order they were reserved. Holding a [`ReadBatch`] should
     /// be treated similarly to holding a lock on a critical section.
     #[must_use]
-    pub fn reserve_read_batch(&self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
+    pub fn try_reserve_read_batch(&self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
         let (start, count) = self.queue.reserve_read_batch(max)?;
         Some(ReadBatch {
             header: self.queue.header,
@@ -320,7 +320,7 @@ impl<T> Consumer<T> {
         max: NonZeroUsize,
         timeout: Duration,
     ) -> Result<ReadBatch<'_, T>, WaitError> {
-        self.wait_for_read(timeout, || self.reserve_read_batch(max))
+        self.wait_for_read(timeout, || self.try_reserve_read_batch(max))
     }
 
     fn wait_for_read<R>(
@@ -1123,13 +1123,13 @@ mod tests {
         for create_queue in test_queue_creators::<Item>() {
             let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
-            let mut guard = unsafe { producer.reserve_write() }.expect("reserve failed");
+            let mut guard = unsafe { producer.try_reserve_write() }.expect("reserve failed");
             unsafe {
                 *guard.as_mut_ptr() = 42;
             }
             drop(guard);
 
-            let guard = consumer.reserve_read().expect("try_read_ptr failed");
+            let guard = consumer.try_reserve_read().expect("try_read_ptr failed");
             unsafe {
                 assert_eq!(*guard.as_ptr(), 42);
             }
@@ -1143,8 +1143,8 @@ mod tests {
             let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
             let batch_size = NonZeroUsize::new(4).unwrap();
-            let mut batch =
-                unsafe { producer.reserve_write_batch(batch_size) }.expect("reserve_batch failed");
+            let mut batch = unsafe { producer.try_reserve_write_batch(batch_size) }
+                .expect("reserve_batch failed");
             for index in 0..batch.len() {
                 unsafe {
                     *batch.as_mut_ptr(index) = index as u64;
@@ -1153,7 +1153,7 @@ mod tests {
             drop(batch);
 
             let batch = consumer
-                .reserve_read_batch(batch_size)
+                .try_reserve_read_batch(batch_size)
                 .expect("try_read_batch failed");
             for index in 0..batch.len() {
                 unsafe {
@@ -1171,7 +1171,7 @@ mod tests {
 
             unsafe {
                 assert!(producer
-                    .reserve_write_batch(NonZeroUsize::new(BUFFER_CAPACITY + 1).unwrap())
+                    .try_reserve_write_batch(NonZeroUsize::new(BUFFER_CAPACITY + 1).unwrap())
                     .is_none());
             }
 
@@ -1179,7 +1179,7 @@ mod tests {
                 assert_eq!(producer.try_write(i as Item), Ok(()));
             }
             let batch = consumer
-                .reserve_read_batch(NonZeroUsize::new(5).unwrap())
+                .try_reserve_read_batch(NonZeroUsize::new(5).unwrap())
                 .expect("try_read_batch up-to failed");
             assert_eq!(batch.len(), 4);
             for index in 0..batch.len() {
@@ -1344,7 +1344,7 @@ mod tests {
                 producer.try_write(i).unwrap();
             }
 
-            let guard = consumer.reserve_read().expect("reserve read");
+            let guard = consumer.try_reserve_read().expect("reserve read");
             assert_eq!(*guard.as_ref(), 0);
             core::mem::forget(guard);
 
@@ -1368,7 +1368,7 @@ mod tests {
                 producer.try_write(i).unwrap();
             }
 
-            let guard = consumer.reserve_read().expect("reserve read");
+            let guard = consumer.try_reserve_read().expect("reserve read");
             assert_eq!(*guard.as_ref(), 0);
             core::mem::forget(guard);
 
@@ -1391,7 +1391,7 @@ mod tests {
 
             producer.try_write(10).unwrap();
 
-            let mut guard = unsafe { producer.reserve_write() }.expect("reserve write");
+            let mut guard = unsafe { producer.try_reserve_write() }.expect("reserve write");
             unsafe {
                 guard.as_mut_ptr().write(99);
             }

@@ -352,7 +352,7 @@ fn run_mpmc_producer(
 ) {
     run_producer_loop::<Item, _>(exit, report_prefix, total_items_produced, move || {
         // SAFETY: we write the batch below.
-        let Some(mut batch) = (unsafe { producer.reserve_write_batch(SYNC_CADENCE) }) else {
+        let Some(mut batch) = (unsafe { producer.try_reserve_write_batch(SYNC_CADENCE) }) else {
             producer_reserve_failures.fetch_add(1, Ordering::Relaxed);
             return None;
         };
