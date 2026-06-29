@@ -225,7 +225,7 @@ impl Layout {
 }
 
 /// A handle onto the shared region: the header plus the section base pointers.
-struct SharedQueue<T> {
+struct SharedQueue {
     region: Arc<Region>,
     header: NonNull<SharedQueueHeader>,
     consumer_state: ConsumerState,
@@ -236,15 +236,14 @@ struct SharedQueue<T> {
     block_stride: usize,
     payload_size: usize,
     payload_align: usize,
-    _marker: PhantomData<T>,
 }
 
-impl<T> SharedQueue<T> {
+impl SharedQueue {
     /// Initializes a broadcast region and returns a handle.
     ///
     /// # Safety
     /// - `region` must be initialized as a broadcast queue at most once.
-    unsafe fn create_in_region(
+    unsafe fn create_in_region<T>(
         region: &Arc<Region>,
         config: &BroadcastConfig,
     ) -> Result<Self, Error> {
@@ -261,7 +260,7 @@ impl<T> SharedQueue<T> {
     ///
     /// # Safety
     /// - `region` must reference memory laid out by [`Self::create_in_region`].
-    unsafe fn join_region(region: &Arc<Region>) -> Result<Self, Error> {
+    unsafe fn join_region<T>(region: &Arc<Region>) -> Result<Self, Error> {
         let header = region.addr().cast::<SharedQueueHeader>();
         // SAFETY: regions are page-aligned (>= align_of::<SharedQueueHeader>()).
         let header_ref = unsafe { header.as_ref() };
@@ -328,7 +327,6 @@ impl<T> SharedQueue<T> {
             block_stride: layout.block_stride,
             payload_size: layout.payload_size,
             payload_align: layout.payload_align,
-            _marker: PhantomData,
         }
     }
 
@@ -424,27 +422,27 @@ impl<T> SharedQueue<T> {
     /// # Safety
     /// - `file` must be initialized as a queue at most once (by the designated
     ///   initializer) and not resized while any handle is joined.
-    unsafe fn create(file: &File, config: &BroadcastConfig) -> Result<Self, Error> {
+    unsafe fn create<T>(file: &File, config: &BroadcastConfig) -> Result<Self, Error> {
         let layout = Layout::new::<T>(config)?;
         file.set_len(layout.total as u64)?;
         let region = Region::map_file(file, layout.total)?;
         // SAFETY: caller guarantees this mapping is initialized exactly once.
-        unsafe { Self::create_in_region(&region, config) }
+        unsafe { Self::create_in_region::<T>(&region, config) }
     }
 
     /// Maps and validates an existing broadcast queue in `file`.
     ///
     /// # Safety
     /// - `file` must refer to a live broadcast queue, not resized while joined.
-    unsafe fn join(file: &File) -> Result<Self, Error> {
+    unsafe fn join<T>(file: &File) -> Result<Self, Error> {
         let file_size = file.metadata()?.len() as usize;
         let region = Region::map_file(file, file_size)?;
         // SAFETY: validated against the stored header.
-        unsafe { Self::join_region(&region) }
+        unsafe { Self::join_region::<T>(&region) }
     }
 }
 
-impl<T> Clone for SharedQueue<T> {
+impl Clone for SharedQueue {
     fn clone(&self) -> Self {
         Self {
             region: Arc::clone(&self.region),
@@ -456,15 +454,14 @@ impl<T> Clone for SharedQueue<T> {
             block_stride: self.block_stride,
             payload_size: self.payload_size,
             payload_align: self.payload_align,
-            _marker: PhantomData,
         }
     }
 }
 
 // SAFETY: the region is shared (file-backed / heap) and access is synchronized
 // by the queue protocol; the pointers are stable for the region's lifetime.
-unsafe impl<T: Send> Send for SharedQueue<T> {}
-unsafe impl<T: Send> Sync for SharedQueue<T> {}
+unsafe impl Send for SharedQueue {}
+unsafe impl Sync for SharedQueue {}
 
 /// A producer: owns one lane and publishes into it. Single-threaded use (its
 /// write ops take `&mut self`); move it between threads to hand off ownership.
@@ -472,9 +469,10 @@ unsafe impl<T: Send> Sync for SharedQueue<T> {}
 /// Holds the lane view directly (stable for the producer's lifetime); the
 /// `queue` is kept for `try_clone` and to keep the region mapping alive.
 pub struct Producer<T> {
-    queue: SharedQueue<T>,
+    queue: SharedQueue,
     lane: ProducerLane,
     index: usize,
+    _marker: PhantomData<T>,
 }
 
 impl<T> Producer<T> {
@@ -489,7 +487,7 @@ impl<T> Producer<T> {
     ///   consumer to duplicate by raw reads.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
         // SAFETY: caller guarantees this mapping is initialized exactly once.
-        let queue = unsafe { SharedQueue::create(file, &config) }?;
+        let queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
         Self::from_queue(queue)
     }
 
@@ -500,14 +498,19 @@ impl<T> Producer<T> {
     ///   with the same `T` as every other handle (see [`Self::create`]).
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join(file) }?;
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
         Self::from_queue(queue)
     }
 
-    fn from_queue(queue: SharedQueue<T>) -> Result<Self, Error> {
+    fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
         let index = queue.acquire_producer_lane()?;
         let lane = queue.lane(index);
-        Ok(Self { queue, lane, index })
+        Ok(Self {
+            queue,
+            lane,
+            index,
+            _marker: PhantomData,
+        })
     }
 
     /// The lane this producer owns. Record it so a replacement can
@@ -530,17 +533,22 @@ impl<T> Producer<T> {
     ///   drops on the same queue.
     pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
         // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join(file) }?;
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
         Self::recover_in_queue(queue, index)
     }
 
-    fn recover_in_queue(queue: SharedQueue<T>, index: usize) -> Result<Self, Error> {
+    fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
         if index >= queue.producer_slots() {
             return Err(Error::InvalidIndex);
         }
         let lane = queue.lane(index);
         lane.recover();
-        Ok(Self { queue, lane, index })
+        Ok(Self {
+            queue,
+            lane,
+            index,
+            _marker: PhantomData,
+        })
     }
 
     /// Force-releases a lane whose producer died, returning it to the free pool
@@ -554,7 +562,7 @@ impl<T> Producer<T> {
     ///   as [`Self::recover`].
     pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
         // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::<T>::join(file) }?;
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
         if index >= queue.producer_slots() {
             return Err(Error::InvalidIndex);
         }
@@ -757,7 +765,7 @@ impl<T> Drop for WriteBatch<'_, T> {
 /// A consumer: owns one consumer index and reads every lane round-robin. Reads
 /// only items published after it joins. Single-threaded use (`&mut self`).
 pub struct Consumer<T> {
-    queue: SharedQueue<T>,
+    queue: SharedQueue,
     index: usize,
     /// One cached view per lane (avoids rebuilding it on every read).
     lanes: Box<[ProducerLane]>,
@@ -765,6 +773,7 @@ pub struct Consumer<T> {
     next_by_lane: Box<[usize]>,
     /// Lane to start the next round-robin scan from (rotates for fairness).
     scan_start_lane: usize,
+    _marker: PhantomData<T>,
 }
 
 #[derive(Clone, Copy)]
@@ -783,7 +792,7 @@ impl<T> Consumer<T> {
     ///   handles.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
         // SAFETY: caller guarantees this mapping is initialized exactly once.
-        let queue = unsafe { SharedQueue::create(file, &config) }?;
+        let queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
         Self::from_queue(queue, false)
     }
 
@@ -794,7 +803,7 @@ impl<T> Consumer<T> {
     /// - Same as [`Producer::join`]: live queue, same `T` across all handles.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
         // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join(file) }?;
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
         Self::from_queue(queue, false)
     }
 
@@ -807,11 +816,11 @@ impl<T> Consumer<T> {
     /// - Same as [`Self::join`].
     pub unsafe fn join_from_backlog(file: &File) -> Result<Self, Error> {
         // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join(file) }?;
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
         Self::from_queue(queue, true)
     }
 
-    fn from_queue(queue: SharedQueue<T>, from_backlog: bool) -> Result<Self, Error> {
+    fn from_queue(queue: SharedQueue, from_backlog: bool) -> Result<Self, Error> {
         let index = queue.acquire_consumer_index()?;
         // Cache a view per lane (independent of `queue`), and join each — at the
         // frontier, or up to one ring behind it when `from_backlog`.
@@ -828,6 +837,7 @@ impl<T> Consumer<T> {
             lanes,
             next_by_lane,
             scan_start_lane: 0,
+            _marker: PhantomData,
         })
     }
 
@@ -852,11 +862,11 @@ impl<T> Consumer<T> {
     ///   drops on the same queue.
     pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
         // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join(file) }?;
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
         Self::recover_in_queue(queue, index)
     }
 
-    fn recover_in_queue(queue: SharedQueue<T>, index: usize) -> Result<Self, Error> {
+    fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
         if index >= queue.consumer_slots() {
             return Err(Error::InvalidIndex);
         }
@@ -876,6 +886,7 @@ impl<T> Consumer<T> {
             lanes,
             next_by_lane,
             scan_start_lane: 0,
+            _marker: PhantomData,
         })
     }
 
@@ -892,7 +903,7 @@ impl<T> Consumer<T> {
     ///   as [`Self::recover`].
     pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
         // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::<T>::join(file) }?;
+        let queue = unsafe { SharedQueue::join::<T>(file) }?;
         if index >= queue.consumer_slots() {
             return Err(Error::InvalidIndex);
         }
@@ -1218,7 +1229,7 @@ mod tests {
         let size = Layout::new::<Payload>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once here.
-        let queue = unsafe { SharedQueue::<Payload>::create_in_region(&region, &config) }.unwrap();
+        let queue = unsafe { SharedQueue::create_in_region::<Payload>(&region, &config) }.unwrap();
         Producer::from_queue(queue).unwrap()
     }
 
@@ -1369,7 +1380,7 @@ mod tests {
         let file = create_temp_shmem_file().expect("temp file");
         file.set_len(size as u64).expect("set_len");
         // SAFETY: sized-but-zeroed file → magic mismatch.
-        let err = unsafe { SharedQueue::<Payload>::join(&file) };
+        let err = unsafe { SharedQueue::join::<Payload>(&file) };
         assert!(matches!(err, Err(Error::InvalidMagic)));
     }
 
@@ -1383,7 +1394,7 @@ mod tests {
         let size = Layout::new::<Payload>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
-        let queue = unsafe { SharedQueue::<Payload>::create_in_region(&region, &config) }.unwrap();
+        let queue = unsafe { SharedQueue::create_in_region::<Payload>(&region, &config) }.unwrap();
 
         assert_eq!(queue.header().payload_size, size_of::<Payload>());
         assert_eq!(queue.header().payload_align, align_of::<Payload>());
@@ -1399,16 +1410,16 @@ mod tests {
         let size = Layout::new::<u64>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
-        unsafe { SharedQueue::<u64>::create_in_region(&region, &config) }.unwrap();
+        unsafe { SharedQueue::create_in_region::<u64>(&region, &config) }.unwrap();
 
         // Same payload size as `u64`, but different alignment.
         // SAFETY: the region is a live broadcast queue; validation should fail.
-        let err = unsafe { SharedQueue::<[u8; 8]>::join_region(&region) };
+        let err = unsafe { SharedQueue::join_region::<[u8; 8]>(&region) };
         assert!(matches!(err, Err(Error::InvalidBufferSize)));
 
         // Different payload size.
         // SAFETY: the region is a live broadcast queue; validation should fail.
-        let err = unsafe { SharedQueue::<[u8; 4]>::join_region(&region) };
+        let err = unsafe { SharedQueue::join_region::<[u8; 4]>(&region) };
         assert!(matches!(err, Err(Error::InvalidBufferSize)));
     }
 
@@ -1829,11 +1840,11 @@ mod tests {
 
     /// Allocates a heap-backed queue and returns the shared handle (recovery
     /// tests need the queue directly to simulate a crashed handle).
-    fn recovery_queue(config: &BroadcastConfig) -> SharedQueue<Payload> {
+    fn recovery_queue(config: &BroadcastConfig) -> SharedQueue {
         let size = Layout::new::<Payload>(config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
-        unsafe { SharedQueue::<Payload>::create_in_region(&region, config) }.unwrap()
+        unsafe { SharedQueue::create_in_region::<Payload>(&region, config) }.unwrap()
     }
 
     #[test]
@@ -1858,12 +1869,12 @@ mod tests {
 
         // The only lane is held, so a normal join is refused.
         assert!(matches!(
-            Producer::from_queue(queue.clone()),
+            Producer::<Payload>::from_queue(queue.clone()),
             Err(Error::ProducerSlotsExhausted)
         ));
 
         // Recover the lane and keep publishing where the dead producer stopped.
-        let mut recovered = Producer::recover_in_queue(queue.clone(), 0).unwrap();
+        let mut recovered = Producer::<Payload>::recover_in_queue(queue.clone(), 0).unwrap();
         assert_eq!(recovered.index(), 0);
         assert!(recovered.try_write(3).is_ok());
 
@@ -1892,7 +1903,7 @@ mod tests {
         assert_eq!(lane.published(), 0);
 
         // Recovery rewinds the reservation back to the publication.
-        let recovered = Producer::recover_in_queue(queue.clone(), 0).unwrap();
+        let recovered = Producer::<Payload>::recover_in_queue(queue.clone(), 0).unwrap();
         assert_eq!(recovered.lane.reserved(), 0);
         assert_eq!(recovered.lane.published(), 0);
     }
@@ -1950,7 +1961,7 @@ mod tests {
 
         // A fresh join can't proceed — the index is still owned.
         assert!(matches!(
-            Consumer::from_queue(queue.clone(), false),
+            Consumer::<Payload>::from_queue(queue.clone(), false),
             Err(Error::ConsumerSlotsExhausted)
         ));
 
@@ -1977,11 +1988,11 @@ mod tests {
         };
         let queue = recovery_queue(&config);
         assert!(matches!(
-            Producer::recover_in_queue(queue.clone(), 1),
+            Producer::<Payload>::recover_in_queue(queue.clone(), 1),
             Err(Error::InvalidIndex)
         ));
         assert!(matches!(
-            Consumer::recover_in_queue(queue.clone(), 1),
+            Consumer::<Payload>::recover_in_queue(queue.clone(), 1),
             Err(Error::InvalidIndex)
         ));
     }
