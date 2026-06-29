@@ -359,7 +359,7 @@ fn run_mpmc_producer(
         for index in 0..batch.len() {
             // SAFETY: reserve_batch() yields valid contiguous slots.
             unsafe {
-                batch.as_mut(index).data.fill(42);
+                batch.as_mut(index).write(Item { data: [42u8; _] });
             }
         }
         Some(batch.len())
@@ -492,7 +492,7 @@ fn run_broadcast_producer(
         };
         for index in 0..batch.len() {
             // SAFETY: `index < len`; the reserved cell is ours to initialize.
-            unsafe { batch.as_mut_ref(index).write(Item { data: [42; 512] }) };
+            unsafe { batch.as_mut(index).write(Item { data: [42; 512] }) };
         }
         Some(batch.len())
     });

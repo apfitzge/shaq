@@ -622,13 +622,15 @@ pub struct WriteGuard<'a, T> {
     start: usize,
 }
 
-impl<T> WriteGuard<'_, T> {
+impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
     /// Mutable reference to the reserved cell.
-    pub fn as_mut_ref(&mut self) -> &mut MaybeUninit<T> {
+    fn as_mut(&mut self) -> &mut MaybeUninit<T> {
         // SAFETY: forwarded; the cell is reserved for this producer.
         unsafe { &mut *self.producer.lane.payload_ptr(self.start).as_ptr().cast() }
     }
+}
 
+impl<T> WriteGuard<'_, T> {
     /// Writes `value` into the reserved cell; the guard publishes it on drop.
     pub fn write(self, value: T) {
         // SAFETY: the cell is reserved and not yet published; `T` is moved in.
@@ -671,7 +673,7 @@ impl<T> WriteBatch<'_, T> {
     ///
     /// # Safety
     /// - `index < len`.
-    pub unsafe fn as_mut_ref(&mut self, index: usize) -> &mut MaybeUninit<T> {
+    pub unsafe fn as_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
         debug_assert!(index < self.count.get());
         let ptr = self
             .producer
@@ -688,7 +690,7 @@ impl<T> WriteBatch<'_, T> {
     /// - `index < len`.
     pub unsafe fn write(&mut self, index: usize, value: T) {
         // SAFETY: forwarded; `index < len` and the cell is reserved.
-        unsafe { self.as_mut_ref(index).write(value) };
+        unsafe { self.as_mut(index).write(value) };
     }
 }
 
@@ -1101,26 +1103,19 @@ impl<T> ReadBatch<'_, T> {
         false
     }
 
-    /// Pointer to the value at `index`.
-    ///
-    /// # Safety
-    /// - `index < len`.
-    pub unsafe fn as_ptr(&self, index: usize) -> *const T {
-        debug_assert!(index < self.count.get());
-        self.consumer
-            .lane(self.lane)
-            .payload_ptr(self.start.wrapping_add(index))
-            .as_ptr()
-    }
-
     /// Reference to the value at `index`.
     ///
     /// # Safety
     /// - `index < len`
     pub unsafe fn as_ref(&self, index: usize) -> &T {
+        debug_assert!(index < self.count.get());
         // SAFETY: the cell is published and held by this consumer's
         // cursor.
-        unsafe { &*self.as_ptr(index) }
+        unsafe {
+            &*self.consumer.lanes[self.lane]
+                .payload_ptr(self.start.wrapping_add(index))
+                .as_ptr()
+        }
     }
 
     /// Copies the value at `index` out.
@@ -1131,9 +1126,15 @@ impl<T> ReadBatch<'_, T> {
     where
         T: Copy,
     {
-        // SAFETY: forwarded; the cell is published and held by this consumer's
-        // cursor until the batch is dropped.
-        unsafe { self.as_ptr(index).read() }
+        debug_assert!(index < self.count.get());
+        // SAFETY: the cell is published and held by this consumer's
+        // cursor.
+        unsafe {
+            self.consumer.lanes[self.lane]
+                .payload_ptr(self.start.wrapping_add(index))
+                .as_ptr()
+                .read()
+        }
     }
 }
 
@@ -1501,7 +1502,7 @@ mod tests {
             {
                 // SAFETY: the reserved slot is initialized before `guard` is dropped.
                 let mut guard = unsafe { p.try_reserve_write() }.unwrap();
-                guard.as_mut_ref().write(42);
+                guard.as_mut().write(42);
             }
             // `write` consumes the guard and publishes on drop too.
             // SAFETY: `write` initializes the reserved slot before publishing.
@@ -1616,7 +1617,7 @@ mod tests {
         let mut consumer = Consumer::from_queue(queue.clone(), false).unwrap();
 
         assert!(consumer.try_reserve_read().is_none());
-        guard.as_mut_ref().write(42);
+        guard.as_mut().write(42);
         drop(guard);
 
         assert_eq!(consumer.try_read(), Some(42));

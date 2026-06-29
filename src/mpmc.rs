@@ -7,7 +7,7 @@ use crate::{
     shmem::Region,
     CacheAlignedAtomicSize, VERSION,
 };
-use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
+use core::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull, sync::atomic::Ordering};
 use std::{
     fs::File,
     num::NonZeroUsize,
@@ -800,20 +800,15 @@ pub struct WriteGuard<'a, T> {
     _marker: PhantomData<&'a mut T>,
 }
 
-impl<'a, T> WriteGuard<'a, T> {
-    /// Returns a mutable reference to the slot.
-    ///
-    /// # Safety
-    /// - T must be be valid for any bytes.
-    pub unsafe fn as_mut_ref(&mut self) -> &mut T {
+impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
+    /// Mutable reference to the reserved cell.
+    fn as_mut(&mut self) -> &mut MaybeUninit<T> {
         // SAFETY: The cell was reserved for writing.
-        unsafe { self.cell.as_mut() }
+        unsafe { &mut *self.cell.as_ptr().cast() }
     }
+}
 
-    pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.cell.as_ptr()
-    }
-
+impl<'a, T> WriteGuard<'a, T> {
     pub fn write(self, value: T) {
         // SAFETY: The cell was reserved for writing.
         unsafe { self.cell.as_ptr().write(value) };
@@ -842,11 +837,6 @@ pub struct ReadGuard<'a, T> {
 }
 
 impl<'a, T> ReadGuard<'a, T> {
-    pub fn as_ptr(&self) -> *const T {
-        // SAFETY: The cell was reserved for reading.
-        self.cell.as_ptr()
-    }
-
     pub fn read(self) -> T {
         // SAFETY: The cell was reserved for reading and holds an initialized value.
         unsafe { self.cell.as_ptr().read() }
@@ -900,23 +890,11 @@ impl<'a, T> WriteBatch<'a, T> {
     /// - The slot is uninitialized; caller must fully initialize `T`.
     /// - `index < count`
     /// - `T` must be valid for any bytes.
-    pub unsafe fn as_mut(&mut self, index: usize) -> &mut T {
+    pub unsafe fn as_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
         debug_assert!(index < self.count.get());
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for writing.
-        unsafe { self.buffer.add(position & self.buffer_mask).as_mut() }
-    }
-
-    /// Returns a mutable pointer to the reserved slot.
-    ///
-    /// # Safety
-    /// - The slot is uninitialized; caller must fully initialize `T`.
-    /// - `index < count`
-    pub unsafe fn as_mut_ptr(&mut self, index: usize) -> *mut T {
-        debug_assert!(index < self.count.get());
-        let position = self.start.wrapping_add(index);
-        // SAFETY: The position was reserved for writing.
-        unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
+        unsafe { self.buffer.add(position & self.buffer_mask).cast().as_mut() }
     }
 
     /// Writes a value into the slot at index.
@@ -969,17 +947,6 @@ impl<'a, T> ReadBatch<'a, T> {
         let position = self.start.wrapping_add(index);
         // SAFETY: The position was reserved for reading and is initialized.
         unsafe { self.buffer.add(position & self.buffer_mask).as_ref() }
-    }
-
-    /// Returns a pointer to the reserved slot.
-    ///
-    /// # Safety
-    /// - `index` must be less than `self.len()`
-    pub unsafe fn as_ptr(&self, index: usize) -> *const T {
-        debug_assert!(index < self.count.get());
-        let position = self.start.wrapping_add(index);
-        // SAFETY: The position was reserved for reading.
-        unsafe { self.buffer.add(position & self.buffer_mask).as_ptr() }
     }
 
     /// Read the value at index
@@ -1124,16 +1091,12 @@ mod tests {
             let (producer, consumer) = create_queue(BUFFER_CAPACITY);
 
             let mut guard = unsafe { producer.try_reserve_write() }.expect("reserve failed");
-            unsafe {
-                *guard.as_mut_ptr() = 42;
-            }
+            guard.as_mut().write(42);
             drop(guard);
 
             let guard = consumer.try_reserve_read().expect("try_read_ptr failed");
-            unsafe {
-                assert_eq!(*guard.as_ptr(), 42);
-            }
             assert_eq!(*guard.as_ref(), 42);
+            assert_eq!(guard.read(), 42);
         }
     }
 
@@ -1147,7 +1110,7 @@ mod tests {
                 .expect("reserve_batch failed");
             for index in 0..batch.len() {
                 unsafe {
-                    *batch.as_mut_ptr(index) = index as u64;
+                    batch.as_mut(index).write(index as u64);
                 }
             }
             drop(batch);
@@ -1157,7 +1120,7 @@ mod tests {
                 .expect("try_read_batch failed");
             for index in 0..batch.len() {
                 unsafe {
-                    assert_eq!(*batch.as_ptr(index), index as u64);
+                    assert_eq!(*batch.as_ref(index), index as u64);
                 }
                 assert_eq!(unsafe { batch.read(index) }, index as u64);
             }
@@ -1185,7 +1148,7 @@ mod tests {
             for index in 0..batch.len() {
                 // SAFETY: `batch` has exactly 4 readable items.
                 unsafe {
-                    assert_eq!(*batch.as_ptr(index), index as u64);
+                    assert_eq!(*batch.as_ref(index), index as u64);
                 }
             }
         }
@@ -1392,9 +1355,7 @@ mod tests {
             producer.try_write(10).unwrap();
 
             let mut guard = unsafe { producer.try_reserve_write() }.expect("reserve write");
-            unsafe {
-                guard.as_mut_ptr().write(99);
-            }
+            guard.as_mut().write(99);
             core::mem::forget(guard);
 
             unsafe {
