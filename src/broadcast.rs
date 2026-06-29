@@ -32,7 +32,7 @@ mod consumer_state;
 mod producer_lane;
 
 use core::marker::PhantomData;
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -71,6 +71,8 @@ struct SharedQueueHeader {
     capacity: u32, // per-lane ring capacity (power of two)
     producer_slots: u32,
     consumer_slots: u32,
+    payload_size: usize,
+    payload_align: usize,
     /// Count of consumers blocked waiting for any lane to publish.
     waiters: Waiters,
     /// Futex word for blocked consumers: bumped only when a publish wakes one
@@ -95,6 +97,8 @@ impl SharedQueueHeader {
                 capacity: layout.capacity,
                 producer_slots: layout.producer_slots as u32,
                 consumer_slots: layout.consumer_slots as u32,
+                payload_size: layout.payload_size,
+                payload_align: layout.payload_align,
                 waiters: Waiters::default(),
                 wake_seq: CacheAlignedAtomicSize::default(),
             });
@@ -114,6 +118,8 @@ struct Layout {
     capacity: u32,
     producer_slots: usize,
     consumer_slots: usize,
+    payload_size: usize,
+    payload_align: usize,
     consumer_state_offset: usize,
     producer_blocks_offset: usize,
     block_stride: usize,
@@ -162,6 +168,8 @@ impl Layout {
             capacity,
             producer_slots: config.producer_slots,
             consumer_slots: config.consumer_slots,
+            payload_size: size_of::<T>(),
+            payload_align: align_of::<T>(),
             consumer_state_offset,
             producer_blocks_offset,
             block_stride,
@@ -171,6 +179,10 @@ impl Layout {
 
     /// Reconstructs and validates the layout from an initialized header.
     fn from_header<T>(header: &SharedQueueHeader, region_size: usize) -> Result<Self, Error> {
+        if header.payload_size != size_of::<T>() || header.payload_align != align_of::<T>() {
+            return Err(Error::InvalidBufferSize);
+        }
+
         let capacity = header.capacity as usize;
         let config = BroadcastConfig {
             capacity,
@@ -1312,6 +1324,45 @@ mod tests {
         // SAFETY: sized-but-zeroed file → magic mismatch.
         let err = unsafe { SharedQueue::<Payload>::join(&file) };
         assert!(matches!(err, Err(Error::InvalidMagic)));
+    }
+
+    #[test]
+    fn header_records_payload_layout() {
+        let config = BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        };
+        let size = Layout::new::<Payload>(&config).expect("layout").total;
+        let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
+        // SAFETY: freshly allocated region, initialized exactly once.
+        let queue = unsafe { SharedQueue::<Payload>::create_in_region(&region, &config) }.unwrap();
+
+        assert_eq!(queue.header().payload_size, size_of::<Payload>());
+        assert_eq!(queue.header().payload_align, align_of::<Payload>());
+    }
+
+    #[test]
+    fn typed_join_rejects_payload_layout_mismatch() {
+        let config = BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        };
+        let size = Layout::new::<u64>(&config).expect("layout").total;
+        let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
+        // SAFETY: freshly allocated region, initialized exactly once.
+        unsafe { SharedQueue::<u64>::create_in_region(&region, &config) }.unwrap();
+
+        // Same payload size as `u64`, but different alignment.
+        // SAFETY: the region is a live broadcast queue; validation should fail.
+        let err = unsafe { SharedQueue::<[u8; 8]>::join_region(&region) };
+        assert!(matches!(err, Err(Error::InvalidBufferSize)));
+
+        // Different payload size.
+        // SAFETY: the region is a live broadcast queue; validation should fail.
+        let err = unsafe { SharedQueue::<[u8; 4]>::join_region(&region) };
+        assert!(matches!(err, Err(Error::InvalidBufferSize)));
     }
 
     #[test]
