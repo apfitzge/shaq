@@ -712,6 +712,13 @@ pub struct Consumer<T> {
     scan_start_lane: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ReadableLane {
+    lane: usize,
+    sequence: usize,
+    published: usize,
+}
+
 impl<T> Consumer<T> {
     /// Creates a broadcast queue in `file` and joins as a consumer.
     ///
@@ -851,17 +858,46 @@ impl<T> Consumer<T> {
         consumer_state.recover(index, lane.published(), || lane.reserved())
     }
 
-    /// Finds the next readable `(lane, sequence)`, scanning round-robin from
+    #[inline]
+    fn lane(&self, lane: usize) -> &ProducerLane<T> {
+        debug_assert!(lane < self.lanes.len());
+        // SAFETY: every caller passes a lane produced by this consumer's
+        // round-robin state or a guard/batch that was created from it.
+        unsafe { self.lanes.get_unchecked(lane) }
+    }
+
+    #[inline]
+    fn next_for_lane(&self, lane: usize) -> usize {
+        debug_assert!(lane < self.next_by_lane.len());
+        // SAFETY: `next_by_lane` is built with one entry per producer lane, and
+        // every caller passes a valid lane index.
+        unsafe { *self.next_by_lane.get_unchecked(lane) }
+    }
+
+    #[inline]
+    fn set_next_for_lane(&mut self, lane: usize, next: usize) {
+        debug_assert!(lane < self.next_by_lane.len());
+        // SAFETY: same invariant as `next_for_lane`.
+        unsafe { *self.next_by_lane.get_unchecked_mut(lane) = next };
+    }
+
+    /// Finds the next readable lane, scanning round-robin from
     /// `scan_start_lane`. A lane is readable when its publication is ahead of
-    /// this consumer's cursor.
-    fn next_readable(&self) -> Option<(usize, usize)> {
+    /// this consumer's cursor. The returned publication is the same load that
+    /// proved readability.
+    fn next_readable(&self) -> Option<ReadableLane> {
         let producer_slots = self.queue.producer_slots();
         let mut lane = self.scan_start_lane;
         for _ in 0..producer_slots {
-            let next = self.next_by_lane[lane];
+            let sequence = self.next_for_lane(lane);
+            let published = self.lane(lane).published();
             // Cursor wrap is not supported - simple comparison works here.
-            if self.lanes[lane].published() > next {
-                return Some((lane, next));
+            if published > sequence {
+                return Some(ReadableLane {
+                    lane,
+                    sequence,
+                    published,
+                });
             }
             lane = lane.wrapping_add(1);
             if lane == producer_slots {
@@ -876,9 +912,9 @@ impl<T> Consumer<T> {
     /// sole reader of its own cursor (`&mut self`), so the cursor only moves here
     /// and advancing is a plain increment.
     fn advance(&mut self, lane: usize, count: NonZeroUsize) {
-        let next = self.next_by_lane[lane].wrapping_add(count.get());
-        self.next_by_lane[lane] = next;
-        self.lanes[lane]
+        let next = self.next_for_lane(lane).wrapping_add(count.get());
+        self.set_next_for_lane(lane, next);
+        self.lane(lane)
             .consumer_state()
             .set_cursor(self.index, next);
         // `lane < producer_slots`, so the wrap is a conditional subtract.
@@ -895,12 +931,17 @@ impl<T> Consumer<T> {
     where
         T: Copy,
     {
-        let (lane, sequence) = self.next_readable()?;
+        let readable = self.next_readable()?;
         // SAFETY: `sequence < publication`, so the cell is published (initialized);
         // this consumer's cursor still protects it from being overwritten until we
         // advance below. The copy happens before the cursor advances.
-        let value = unsafe { self.lanes[lane].payload_ptr(sequence).as_ptr().read() };
-        self.advance(lane, NonZeroUsize::MIN);
+        let value = unsafe {
+            self.lane(readable.lane)
+                .payload_ptr(readable.sequence)
+                .as_ptr()
+                .read()
+        };
+        self.advance(readable.lane, NonZeroUsize::MIN);
         Some(value)
     }
 
@@ -910,13 +951,17 @@ impl<T> Consumer<T> {
     /// guard is dropped, which advances past it.
     #[must_use]
     pub fn try_reserve_read(&mut self) -> Option<ReadGuard<'_, T>> {
-        let (lane, sequence) = self.next_readable()?;
-        let payload = self.lanes[lane].payload_ptr(sequence);
-        Some(ReadGuard {
+        let readable = self.next_readable()?;
+        Some(self.reserve_read_at(readable))
+    }
+
+    fn reserve_read_at(&mut self, readable: ReadableLane) -> ReadGuard<'_, T> {
+        let payload = self.lane(readable.lane).payload_ptr(readable.sequence);
+        ReadGuard {
             consumer: self,
-            lane,
+            lane: readable.lane,
             payload,
-        })
+        }
     }
 
     /// Reserves up to `max` consecutive published values from the next readable
@@ -927,17 +972,25 @@ impl<T> Consumer<T> {
     /// is dropped, which advances past the whole batch.
     #[must_use]
     pub fn try_reserve_read_batch(&mut self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
-        let (lane, start) = self.next_readable()?;
-        // `next_readable` guarantees at least one published value past `start`.
-        let available = self.lanes[lane].published().wrapping_sub(start);
+        let readable = self.next_readable()?;
+        Some(self.reserve_read_batch_at(readable, max))
+    }
+
+    fn reserve_read_batch_at(
+        &mut self,
+        readable: ReadableLane,
+        max: NonZeroUsize,
+    ) -> ReadBatch<'_, T> {
+        // `next_readable` guarantees at least one published value past `sequence`.
+        let available = readable.published.wrapping_sub(readable.sequence);
         let count = available.min(max.get());
         let count = NonZeroUsize::new(count).expect("readable lane has at least one value");
-        Some(ReadBatch {
+        ReadBatch {
             consumer: self,
-            lane,
-            start,
+            lane: readable.lane,
+            start: readable.sequence,
             count,
-        })
+        }
     }
 
     /// Blocks until any lane has an unread value or `timeout` elapses, then
@@ -946,10 +999,8 @@ impl<T> Consumer<T> {
         &mut self,
         timeout: Duration,
     ) -> Result<ReadGuard<'_, T>, WaitError> {
-        self.wait_until_readable(timeout)?;
-        Ok(self
-            .try_reserve_read()
-            .expect("a lane is readable after a successful wait"))
+        let readable = self.wait_until_readable(timeout)?;
+        Ok(self.reserve_read_at(readable))
     }
 
     /// Blocks until any lane has unread values or `timeout` elapses, then returns
@@ -959,10 +1010,8 @@ impl<T> Consumer<T> {
         max: NonZeroUsize,
         timeout: Duration,
     ) -> Result<ReadBatch<'_, T>, WaitError> {
-        self.wait_until_readable(timeout)?;
-        Ok(self
-            .try_reserve_read_batch(max)
-            .expect("a lane is readable after a successful wait"))
+        let readable = self.wait_until_readable(timeout)?;
+        Ok(self.reserve_read_batch_at(readable, max))
     }
 
     /// Blocks until any lane has an unread value or `timeout` elapses, then
@@ -977,9 +1026,8 @@ impl<T> Consumer<T> {
 
     /// Blocks until [`Self::next_readable`] would succeed, sleeping on the queue's
     /// global wake counter (a publish on any lane wakes it).
-    fn wait_until_readable(&self, timeout: Duration) -> Result<(), WaitError> {
-        self.queue
-            .wait_for(timeout, || self.next_readable().map(|_| ()))
+    fn wait_until_readable(&self, timeout: Duration) -> Result<ReadableLane, WaitError> {
+        self.queue.wait_for(timeout, || self.next_readable())
     }
 }
 
@@ -1059,7 +1107,8 @@ impl<T> ReadBatch<'_, T> {
     /// - `index < len`.
     pub unsafe fn as_ptr(&self, index: usize) -> *const T {
         debug_assert!(index < self.count.get());
-        self.consumer.lanes[self.lane]
+        self.consumer
+            .lane(self.lane)
             .payload_ptr(self.start.wrapping_add(index))
             .as_ptr()
     }
