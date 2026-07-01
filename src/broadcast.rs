@@ -90,20 +90,20 @@ impl SharedQueueHeader {
     /// - Access to `header` must be unique.
     /// - The queue's non-header sections must already be initialized.
     unsafe fn init(header: NonNull<Self>, layout: &Layout) {
+        let value = Self {
+            magic: AtomicU64::new(0),
+            version: VERSION,
+            capacity: layout.capacity,
+            producer_slots: layout.producer_slots as u32,
+            consumer_slots: layout.consumer_slots as u32,
+            payload_size: layout.payload_size,
+            payload_align: layout.payload_align,
+            waiters: Waiters::default(),
+            wake_seq: CacheAlignedAtomicSize::default(),
+        };
+        let header_ptr = header.as_ptr();
         // SAFETY: caller guarantees valid, uniquely-owned storage for the header.
-        unsafe {
-            header.as_ptr().write(Self {
-                magic: AtomicU64::new(0),
-                version: VERSION,
-                capacity: layout.capacity,
-                producer_slots: layout.producer_slots as u32,
-                consumer_slots: layout.consumer_slots as u32,
-                payload_size: layout.payload_size,
-                payload_align: layout.payload_align,
-                waiters: Waiters::default(),
-                wake_seq: CacheAlignedAtomicSize::default(),
-            });
-        }
+        unsafe { header_ptr.write(value) };
 
         // Publish initialization last.
         // SAFETY: the header was initialized by the write above.
@@ -331,12 +331,10 @@ impl SharedQueue {
         let base = region.addr();
         let header = base.cast::<SharedQueueHeader>();
         // SAFETY: offsets lie within the region.
-        let consumer_state = unsafe {
-            ConsumerState::from_block(
-                base.byte_add(layout.consumer_state_offset),
-                layout.consumer_slots,
-            )
-        };
+        let consumer_state_block = unsafe { base.byte_add(layout.consumer_state_offset) };
+        // SAFETY: offsets lie within the region.
+        let consumer_state =
+            unsafe { ConsumerState::from_block(consumer_state_block, layout.consumer_slots) };
         // SAFETY: offsets lie within the region.
         let producer_blocks = unsafe { base.byte_add(layout.producer_blocks_offset) };
         Self {
@@ -738,15 +736,14 @@ impl<T> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
 impl<T> WriteGuard<'_, T> {
     /// Writes `value` into the reserved cell; the guard publishes it on drop.
     pub fn write(self, value: T) {
+        let ptr = self
+            .producer
+            .lane
+            .payload_ptr(self.start)
+            .cast::<T>()
+            .as_ptr();
         // SAFETY: the cell is reserved and not yet published; `T` is moved in.
-        unsafe {
-            self.producer
-                .lane
-                .payload_ptr(self.start)
-                .cast::<T>()
-                .as_ptr()
-                .write(value)
-        };
+        unsafe { ptr.write(value) };
     }
 }
 
@@ -1299,14 +1296,13 @@ impl<T> ReadBatch<'_, T> {
     /// - `index < len`
     pub unsafe fn as_ref(&self, index: usize) -> &T {
         debug_assert!(index < self.count.get());
+        let ptr = self.consumer.lanes[self.lane]
+            .payload_ptr(self.start.wrapping_add(index))
+            .as_ptr()
+            .cast();
         // SAFETY: the cell is published and held by this consumer's
         // cursor.
-        unsafe {
-            &*self.consumer.lanes[self.lane]
-                .payload_ptr(self.start.wrapping_add(index))
-                .as_ptr()
-                .cast()
-        }
+        unsafe { &*ptr }
     }
 
     /// Copies the value at `index` out.
@@ -1318,15 +1314,13 @@ impl<T> ReadBatch<'_, T> {
         T: Copy,
     {
         debug_assert!(index < self.count.get());
+        let ptr = self.consumer.lanes[self.lane]
+            .payload_ptr(self.start.wrapping_add(index))
+            .as_ptr()
+            .cast::<T>();
         // SAFETY: the cell is published and held by this consumer's
         // cursor.
-        unsafe {
-            self.consumer.lanes[self.lane]
-                .payload_ptr(self.start.wrapping_add(index))
-                .as_ptr()
-                .cast::<T>()
-                .read()
-        }
+        unsafe { ptr.read() }
     }
 }
 
@@ -1580,16 +1574,14 @@ impl SliceReadBatch<'_> {
     /// - `index < len`.
     pub unsafe fn as_slice(&self, index: usize) -> &[u8] {
         debug_assert!(index < self.count.get());
+        let ptr = self
+            .consumer
+            .lane(self.lane)
+            .payload_ptr(self.start.wrapping_add(index))
+            .as_ptr();
         // SAFETY: forwarded; the cell is published and held by this consumer's
         // cursor until the batch is dropped.
-        unsafe {
-            let ptr = self
-                .consumer
-                .lane(self.lane)
-                .payload_ptr(self.start.wrapping_add(index))
-                .as_ptr();
-            slice::from_raw_parts(ptr, self.payload_size)
-        }
+        unsafe { slice::from_raw_parts(ptr, self.payload_size) }
     }
 }
 

@@ -90,14 +90,14 @@ impl ProducerLane {
     ///   queue's `(capacity, consumer_slots, payload_size, payload_align)` and
     ///   be initialized at most once.
     pub(crate) unsafe fn init(block: NonNull<u8>, consumer_slots: usize) {
+        let header = LaneHeader {
+            state: AtomicU64::new(LANE_FREE),
+            producer_reservation: CacheAlignedAtomicSize::default(),
+            producer_publication: CacheAlignedAtomicSize::default(),
+        };
+        let header_ptr = block.cast::<LaneHeader>().as_ptr();
         // SAFETY: `block` begins with a `LaneHeader`.
-        unsafe {
-            block.cast::<LaneHeader>().as_ptr().write(LaneHeader {
-                state: AtomicU64::new(LANE_FREE),
-                producer_reservation: CacheAlignedAtomicSize::default(),
-                producer_publication: CacheAlignedAtomicSize::default(),
-            });
-        }
+        unsafe { header_ptr.write(header) };
         // SAFETY: layout reserves `consumer_slots` aligned slots here.
         let consumer_state = unsafe { block.byte_add(consumer_state_offset()) };
         // SAFETY: freshly initialized lane block; consumer slots are initialized once.
@@ -122,21 +122,17 @@ impl ProducerLane {
         let header = block.cast();
         // SAFETY: `block` is an initialized region - it must be large enough
         //         for consumer state to fit (if init succeeded).
+        let consumer_state_block = unsafe { block.byte_add(consumer_state_offset()) };
+        // SAFETY: `block` is an initialized region - it must be large enough
+        //         for consumer state to fit (if init succeeded).
         let consumer_state = unsafe {
-            LaneConsumerState::from_block(
-                block.byte_add(consumer_state_offset()),
-                consumer_slots,
-                capacity as usize,
-            )
+            LaneConsumerState::from_block(consumer_state_block, consumer_slots, capacity as usize)
         };
+        let ring_offset =
+            ring_offset_for_payload(consumer_slots, payload_align).expect("validated_lane layout");
         // SAFETY: `block` is an initialized region - it must be large enough
         //         for ring data to fit (if init succeeded).
-        let ring = unsafe {
-            block.byte_add(
-                ring_offset_for_payload(consumer_slots, payload_align)
-                    .expect("validated_lane layout"),
-            )
-        };
+        let ring = unsafe { block.byte_add(ring_offset) };
 
         Self {
             header,
