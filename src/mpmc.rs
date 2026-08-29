@@ -22,6 +22,10 @@ use std::{
     time::Duration,
 };
 
+mod channel;
+
+pub use channel::{channel, Receiver, Sender};
+
 /// Unique identifier for MPMC queue in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqmpmc");
 

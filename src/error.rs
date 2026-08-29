@@ -26,8 +26,38 @@ pub enum WaitError {
     Timeout,
 }
 
+/// Error returned by a disconnect-aware, nonblocking channel write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryWriteError<T> {
+    /// The queue has no capacity for the value at present.
+    Full(T),
+    /// Every receiver has been dropped.
+    Disconnected(T),
+}
+
+/// Error returned by a disconnect-aware, nonblocking channel read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryReadError {
+    /// The queue has no readable value at present.
+    Empty,
+    /// Every sender has been dropped and the queue is empty.
+    Disconnected,
+}
+
+/// Error returned by a timed, disconnect-aware channel read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadTimeoutError {
+    /// The timeout elapsed before a value became readable.
+    Timeout,
+    /// The wait timed out, every sender has been dropped, and the queue is empty.
+    Disconnected,
+}
+
 impl std::error::Error for Error {}
 impl std::error::Error for WaitError {}
+impl<T: std::fmt::Debug> std::error::Error for TryWriteError<T> {}
+impl std::error::Error for TryReadError {}
+impl std::error::Error for ReadTimeoutError {}
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -69,6 +99,33 @@ impl Display for WaitError {
     }
 }
 
+impl<T> Display for TryWriteError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full(_) => write!(f, "queue is full"),
+            Self::Disconnected(_) => write!(f, "channel is disconnected"),
+        }
+    }
+}
+
+impl Display for TryReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "queue is empty"),
+            Self::Disconnected => write!(f, "channel is disconnected"),
+        }
+    }
+}
+
+impl Display for ReadTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "read timed out"),
+            Self::Disconnected => write!(f, "channel is disconnected"),
+        }
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Self::Io(err)
@@ -90,5 +147,16 @@ mod tests {
     #[test]
     fn test_wait_timeout_display() {
         assert_eq!(WaitError::Timeout.to_string(), "wait timed out");
+    }
+
+    #[test]
+    fn test_channel_error_displays() {
+        assert_eq!(TryWriteError::Full(1).to_string(), "queue is full");
+        assert_eq!(
+            TryWriteError::Disconnected(1).to_string(),
+            "channel is disconnected"
+        );
+        assert_eq!(TryReadError::Empty.to_string(), "queue is empty");
+        assert_eq!(ReadTimeoutError::Timeout.to_string(), "read timed out");
     }
 }
