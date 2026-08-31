@@ -1,6 +1,7 @@
 //! DPDK-style bounded MPMC ring queue
 
 use crate::{
+    channel::ChannelWake,
     error::{Error, WaitError},
     futex::{Waiters, SPIN_ATTEMPTS},
     normalized_capacity,
@@ -94,8 +95,12 @@ impl<T> Producer<T> {
 
     /// Writes item into the queue or returns it if there is not enough space.
     pub fn try_write(&self, item: T) -> Result<(), T> {
+        self.try_write_with_wake(item, None)
+    }
+
+    fn try_write_with_wake(&self, item: T, channel_wake: Option<&ChannelWake>) -> Result<(), T> {
         // SAFETY: On successful reservation the item is written below.
-        let guard = match unsafe { self.try_reserve_write() } {
+        let guard = match unsafe { self.try_reserve_write_with_wake(channel_wake) } {
             Some(guard) => guard,
             None => return Err(item),
         };
@@ -110,12 +115,19 @@ impl<T> Producer<T> {
     where
         T: Copy,
     {
+        self.try_write_slice_with_wake(items, None)
+    }
+
+    fn try_write_slice_with_wake(&self, items: &[T], channel_wake: Option<&ChannelWake>) -> bool
+    where
+        T: Copy,
+    {
         let Some(len) = NonZeroUsize::new(items.len()) else {
             return true;
         };
 
         // SAFETY: if successful we write all items below.
-        let mut guard = match unsafe { self.try_reserve_write_batch(len) } {
+        let mut guard = match unsafe { self.try_reserve_write_batch_with_wake(len, channel_wake) } {
             Some(guard) => guard,
             None => return false,
         };
@@ -143,12 +155,21 @@ impl<T> Producer<T> {
     ///   before the guard is dropped.
     #[must_use]
     pub unsafe fn try_reserve_write(&self) -> Option<WriteGuard<'_, T>> {
+        // SAFETY: The caller accepts the returned guard's initialization contract.
+        unsafe { self.try_reserve_write_with_wake(None) }
+    }
+
+    unsafe fn try_reserve_write_with_wake<'a>(
+        &'a self,
+        channel_wake: Option<&'a ChannelWake>,
+    ) -> Option<WriteGuard<'a, T>> {
         self.queue
             .reserve_write()
             .map(|(cell, position)| WriteGuard {
                 header: self.queue.header,
                 cell,
                 start: position,
+                channel_wake,
                 _marker: PhantomData,
             })
     }
@@ -169,6 +190,15 @@ impl<T> Producer<T> {
     ///   before the batch is dropped.
     #[must_use]
     pub unsafe fn try_reserve_write_batch(&self, count: NonZeroUsize) -> Option<WriteBatch<'_, T>> {
+        // SAFETY: The caller accepts the returned batch's initialization contract.
+        unsafe { self.try_reserve_write_batch_with_wake(count, None) }
+    }
+
+    unsafe fn try_reserve_write_batch_with_wake<'a>(
+        &'a self,
+        count: NonZeroUsize,
+        channel_wake: Option<&'a ChannelWake>,
+    ) -> Option<WriteBatch<'a, T>> {
         let start = self.queue.reserve_write_batch(count)?;
         Some(WriteBatch {
             header: self.queue.header,
@@ -176,6 +206,7 @@ impl<T> Producer<T> {
             start,
             count,
             buffer_mask: self.queue.buffer_mask,
+            channel_wake,
             _marker: PhantomData,
         })
     }
@@ -851,6 +882,7 @@ impl SharedQueueHeader {
         header_ptr: NonNull<Self>,
         start: usize,
         count: NonZeroUsize,
+        channel_wake: Option<&ChannelWake>,
     ) {
         // SAFETY: `header_ptr` is a valid shared-memory header.
         let header = unsafe { header_ptr.as_ref() };
@@ -863,9 +895,12 @@ impl SharedQueueHeader {
         header
             .producer_publication
             .store(start.wrapping_add(count.get()), Ordering::Release);
-        header
-            .waiters
-            .wake(&header.producer_publication, count.get());
+        ChannelWake::notify_or_cursor(
+            channel_wake,
+            &header.waiters,
+            &header.producer_publication,
+            count.get(),
+        );
     }
 
     /// # Safety
@@ -896,6 +931,7 @@ pub struct WriteGuard<'a, T> {
     header: NonNull<SharedQueueHeader>,
     cell: NonNull<T>,
     start: usize,
+    channel_wake: Option<&'a ChannelWake>,
     _marker: PhantomData<&'a mut T>,
 }
 
@@ -928,6 +964,7 @@ impl<'a, T> Drop for WriteGuard<'a, T> {
                 self.header,
                 self.start,
                 NON_ZERO_USIZE_ONE,
+                self.channel_wake,
             );
         }
     }
@@ -1002,6 +1039,7 @@ pub struct WriteBatch<'a, T> {
     start: usize,
     count: NonZeroUsize,
     buffer_mask: usize,
+    channel_wake: Option<&'a ChannelWake>,
     _marker: PhantomData<&'a mut T>,
 }
 
@@ -1049,7 +1087,12 @@ impl<'a, T> Drop for WriteBatch<'a, T> {
     fn drop(&mut self) {
         // SAFETY: This batch owns `count` reserved producer slots.
         unsafe {
-            SharedQueueHeader::publish_producer_publication(self.header, self.start, self.count);
+            SharedQueueHeader::publish_producer_publication(
+                self.header,
+                self.start,
+                self.count,
+                self.channel_wake,
+            );
         }
     }
 }

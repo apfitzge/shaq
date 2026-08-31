@@ -5,8 +5,10 @@
 //! cursor itself — every publish advances it. A multi-cursor queue (the
 //! broadcast, which has one cursor per lane) instead points waiters at a
 //! dedicated wake counter that a publish bumps only when a waiter is present
-//! (see [`Waiters::bump_and_wake`]); there the caller's `check` is what gates
-//! on real data, and the counter exists only to break a racing `FUTEX_WAIT`.
+//! (see [`Waiters::bump_and_wake`]); the broadcast queue stores that counter in
+//! shared memory, while disconnect-aware heap channels use a heap sidecar. In
+//! those cases the caller's `check` is what gates on real data, and the counter
+//! exists only to break a racing `FUTEX_WAIT`.
 //!
 //! # Why no wake is lost
 //!
@@ -187,6 +189,16 @@ impl Waiters {
     /// Release store before calling; the fence here pairs that with a registering
     /// waiter (see module docs).
     pub(crate) fn bump_and_wake(&self, word: &AtomicUsize) {
+        self.bump_and_wake_count(word, MAX_WAKE_COUNT);
+    }
+
+    /// Bumps `word` and wakes up to `count` registered waiters.
+    ///
+    /// This is the bounded-wake counterpart to [`Self::bump_and_wake`], used
+    /// when the caller knows how many waiters can make progress.
+    pub(crate) fn bump_and_wake_count(&self, word: &AtomicUsize, count: usize) {
+        debug_assert!(count > 0);
+
         fence(Ordering::SeqCst);
         let waiters = self.waiters.load(Ordering::Relaxed);
         if waiters == 0 {
@@ -196,7 +208,7 @@ impl Waiters {
         // Change the futex word so a waiter that snapshotted it but has not yet
         // slept bounces out of `FUTEX_WAIT` with `EAGAIN`.
         word.fetch_add(1, Ordering::Relaxed);
-        let count = waiters.min(MAX_WAKE_COUNT) as u32;
+        let count = waiters.min(count).min(MAX_WAKE_COUNT) as u32;
         imp::wake(word, count);
     }
 }

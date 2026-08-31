@@ -1,4 +1,5 @@
 use crate::{
+    channel::ChannelWake,
     error::{Error, WaitError},
     futex::{Waiters, SPIN_ATTEMPTS},
     normalized_capacity,
@@ -147,8 +148,18 @@ impl<T> Producer<T> {
 
     /// Start a batched write.
     pub fn write_batch(&mut self) -> WriteBatch<'_, T> {
+        self.write_batch_with_wake(None)
+    }
+
+    fn write_batch_with_wake<'a>(
+        &'a mut self,
+        channel_wake: Option<&'a ChannelWake>,
+    ) -> WriteBatch<'a, T> {
         self.sync();
-        WriteBatch { producer: self }
+        WriteBatch {
+            producer: self,
+            channel_wake,
+        }
     }
 
     /// Writes item into the queue or returns it if there is not enough space.
@@ -156,9 +167,17 @@ impl<T> Producer<T> {
     /// When writing multiple items, prefer [`Self::write_batch`] to amortize
     /// synchronization and publication across the batch.
     pub fn try_write(&mut self, item: T) -> Result<(), T> {
+        self.try_write_with_wake(item, None)
+    }
+
+    fn try_write_with_wake(
+        &mut self,
+        item: T,
+        channel_wake: Option<&ChannelWake>,
+    ) -> Result<(), T> {
         self.sync();
         self.try_write_inner(item)?;
-        self.commit();
+        self.commit(channel_wake);
         Ok(())
     }
 
@@ -200,7 +219,7 @@ impl<T> Producer<T> {
     }
 
     /// Commits the reserved position, making it visible to the consumer.
-    fn commit(&self) {
+    fn commit(&self, channel_wake: Option<&ChannelWake>) {
         let header = self.queue.header();
         // Release publication; `wake` supplies the fence that pairs it with
         // a registering waiter and must be called unconditionally; see the
@@ -208,7 +227,7 @@ impl<T> Producer<T> {
         header
             .write
             .store(self.queue.cached_write, Ordering::Release);
-        header.waiters.wake(&header.write, 1);
+        ChannelWake::notify_or_cursor(channel_wake, &header.waiters, &header.write, 1);
     }
 
     /// Synchronize the producer's cached read position with the queue's read
@@ -227,6 +246,7 @@ unsafe impl<T: Send> Send for Producer<T> {}
 #[must_use]
 pub struct WriteBatch<'a, T> {
     producer: &'a mut Producer<T>,
+    channel_wake: Option<&'a ChannelWake>,
 }
 
 impl<'a, T> WriteBatch<'a, T> {
@@ -253,7 +273,7 @@ impl<'a, T> WriteBatch<'a, T> {
 impl<'a, T> Drop for WriteBatch<'a, T> {
     fn drop(&mut self) {
         // Commit any written items
-        self.producer.commit();
+        self.producer.commit(self.channel_wake);
     }
 }
 
@@ -1086,7 +1106,7 @@ mod tests {
             // SAFETY: spot is a valid reserved slot.
             unsafe { spot.as_ref() }.store(42, Ordering::Release);
             assert!(consumer.try_read().is_none()); // not committed yet
-            producer.commit();
+            producer.commit(None);
             let item = consumer.try_read().expect("Failed to read item");
             assert_eq!(item.load(Ordering::Acquire), 42);
             assert!(consumer.try_read().is_none()); // no more items to read
@@ -1219,7 +1239,7 @@ mod tests {
                 Err(WaitError::Timeout)
             ));
 
-            producer.commit();
+            producer.commit(None);
 
             let value = match consumer.read_timeout(Duration::ZERO) {
                 Ok(value) => value,

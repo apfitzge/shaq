@@ -49,7 +49,7 @@ pub enum TryReadError {
 pub enum ReadTimeoutError {
     /// The timeout elapsed before a value became readable.
     Timeout,
-    /// The wait timed out, every sender has been dropped, and the queue is empty.
+    /// Every sender has been dropped and the queue is empty.
     Disconnected,
 }
 

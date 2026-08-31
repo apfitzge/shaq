@@ -1,7 +1,7 @@
 use super::{Consumer as QueueConsumer, Producer as QueueProducer, ReadBatch, WriteBatch};
 use crate::{
-    channel::{channel_sides, ChannelSide},
-    error::{Error, ReadTimeoutError, TryReadError, TryWriteError, WaitError},
+    channel::{channel_sides, ChannelSide, ChannelWake},
+    error::{Error, ReadTimeoutError, TryReadError, TryWriteError},
 };
 use std::{num::NonZeroUsize, time::Duration};
 
@@ -11,7 +11,8 @@ use std::{num::NonZeroUsize, time::Duration};
 /// operations distinguish a full or empty queue from a dropped peer.
 pub fn channel<T: Send>(capacity: usize) -> Result<(Sender<T>, Receiver<T>), Error> {
     let (producer, consumer) = super::pair(capacity)?;
-    let (sender_side, receiver_side) = channel_sides();
+    let wake = ChannelWake::new();
+    let (sender_side, receiver_side) = channel_sides(wake);
     Ok((
         Sender {
             producer,
@@ -54,7 +55,7 @@ impl<T> Sender<T> {
     /// returned, the ordinary queue batch remains valid until it is dropped.
     pub fn write_batch(&mut self) -> Result<WriteBatch<'_, T>, TryWriteError<()>> {
         if self.side.is_peer_connected() {
-            Ok(self.producer.write_batch())
+            Ok(self.producer.write_batch_with_wake(Some(self.side.wake())))
         } else {
             Err(TryWriteError::Disconnected(()))
         }
@@ -66,7 +67,9 @@ impl<T> Sender<T> {
             return Err(TryWriteError::Disconnected(item));
         }
 
-        self.producer.try_write(item).map_err(TryWriteError::Full)
+        self.producer
+            .try_write_with_wake(item, Some(self.side.wake()))
+            .map_err(TryWriteError::Full)
     }
 }
 
@@ -121,31 +124,24 @@ impl<T> Receiver<T> {
         }
     }
 
-    /// Waits until data is readable or `timeout` expires.
-    ///
-    /// A sender disconnect does not wake the queue's futex. After a timeout,
-    /// this method returns [`ReadTimeoutError::Disconnected`] if every sender
-    /// has been dropped; otherwise it returns [`ReadTimeoutError::Timeout`].
+    /// Waits until data is readable, the sender disconnects, or `timeout`
+    /// expires.
     pub fn wait_readable_timeout(&mut self, timeout: Duration) -> Result<(), ReadTimeoutError> {
-        match self.consumer.wait_readable_timeout(timeout) {
-            Ok(()) => Ok(()),
-            Err(WaitError::Timeout) if self.side.is_peer_connected() => {
-                Err(ReadTimeoutError::Timeout)
+        let side = &self.side;
+        let consumer = &mut self.consumer;
+        side.wait_for(timeout, || {
+            consumer.sync();
+            if consumer.is_empty() {
+                None
+            } else {
+                Some(())
             }
-            Err(WaitError::Timeout) => {
-                self.consumer.sync();
-                if self.consumer.is_empty() {
-                    Err(ReadTimeoutError::Disconnected)
-                } else {
-                    Ok(())
-                }
-            }
-        }
+        })
     }
 
     /// Reads one item, waiting until data or timeout.
     ///
-    /// Disconnection is checked after the underlying queue wait times out.
+    /// Dropping the sender wakes this wait immediately.
     pub fn read_timeout(&mut self, timeout: Duration) -> Result<T, ReadTimeoutError> {
         let batch = self.reserve_read_batch_timeout(NonZeroUsize::MIN, timeout)?;
         Ok(batch
@@ -156,24 +152,17 @@ impl<T> Receiver<T> {
 
     /// Reserves up to `max` values, waiting until data or timeout.
     ///
-    /// Disconnection is checked after the underlying queue wait times out.
+    /// Dropping the sender wakes this wait immediately.
     pub fn reserve_read_batch_timeout(
         &mut self,
         max: NonZeroUsize,
         timeout: Duration,
     ) -> Result<ReadBatch<'_, T>, ReadTimeoutError> {
-        match self.consumer.wait_readable_timeout(timeout) {
-            Ok(()) => Ok(self
-                .consumer
-                .try_reserve_read_batch(max)
-                .expect("the unique consumer observed readable data")),
-            Err(WaitError::Timeout) if self.side.is_peer_connected() => {
-                Err(ReadTimeoutError::Timeout)
-            }
-            Err(WaitError::Timeout) => self
-                .try_reserve_read_batch(max)
-                .map_err(|_| ReadTimeoutError::Disconnected),
-        }
+        self.wait_readable_timeout(timeout)?;
+        Ok(self
+            .consumer
+            .try_reserve_read_batch(max)
+            .expect("the unique consumer observed readable data"))
     }
 }
 
@@ -184,7 +173,7 @@ unsafe impl<T: Send> Send for Receiver<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use std::{thread, time::Instant};
 
     #[test]
     fn reports_full_empty_and_disconnect_while_draining() {
@@ -233,13 +222,16 @@ mod tests {
     }
 
     #[test]
-    fn timed_read_reports_disconnect_after_queue_timeout() {
+    fn timed_read_wakes_on_disconnect() {
         let (sender, mut receiver) = channel::<u64>(1).unwrap();
-        let reader = thread::spawn(move || receiver.read_timeout(Duration::from_millis(10)));
+        let timeout = Duration::from_secs(2);
+        let reader = thread::spawn(move || receiver.read_timeout(timeout));
 
+        let dropped_at = Instant::now();
         thread::yield_now();
         drop(sender);
         assert_eq!(reader.join().unwrap(), Err(ReadTimeoutError::Disconnected));
+        assert!(dropped_at.elapsed() < timeout / 2);
     }
 
     #[test]
