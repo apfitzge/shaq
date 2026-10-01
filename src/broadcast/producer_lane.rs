@@ -353,6 +353,25 @@ impl ProducerLane {
             .producer_publication
             .store(start.wrapping_add(count.get()), Ordering::Release);
     }
+
+    /// Returns a synchronized, publication-bounded reclamation frontier.
+    /// Must be called by the lane's owning producer (including through a guard).
+    pub(crate) fn reclaimable_before(&self) -> usize {
+        let publication = self.published();
+        // The owner's reservation store covering `publication` precedes this
+        // fence. Pair with join's limit-store / fence / reservation-load:
+        // either this scan sees the joining limit (or its later progress), or
+        // the join's second sample sees at least that reservation frontier.
+        // Thus a missed join starts at or beyond publication, never in the
+        // reclaimed prefix. Acquire limit loads also order completed reads
+        // before reclamation; a released slot no longer has a reader.
+        // Slot reuse repeats the same handshake. Previously returned bounds
+        // remain safe even if a delayed provisional limit lowers a later scan:
+        // that joining consumer must resample before it can read anything.
+        fence(Ordering::SeqCst);
+        self.consumer_state.reclaimable_before(publication)
+    }
+
     #[inline]
     pub(crate) fn published(&self) -> usize {
         self.header().producer_publication.load(Ordering::Acquire)

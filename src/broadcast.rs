@@ -40,6 +40,13 @@
 //! receive these writes; a consumer joining at the advanced reservation frontier
 //! skips them, as with legacy writes. Initialization precedes Release publication.
 //!
+//! Prepared guards expose lane-local sequence identity. Use
+//! [`Producer::reclaimable_before`] (also available on prepared guards) to find
+//! the published prefix no current or future correctly joined consumer can read.
+//! This performs a synchronized consumer scan on demand, independently of ring
+//! exhaustion. Sequence identities and reclamation bounds belong to one lane
+//! in one queue instance, not to a global cross-lane sequence space.
+//!
 //! Counter wrap remains unsupported, as with legacy reservations.
 //! Legacy single-cell reservations require caller initialization before drop or
 //! any later write, even if their guard is forgotten. Forgetting a prepared guard leaves
@@ -82,6 +89,8 @@ mod producer_lane;
 pub use prepared_write::{PreparedWrite, PreparedWriteBatch};
 #[cfg(test)]
 mod prepared_tests;
+#[cfg(test)]
+mod reclamation_tests;
 #[cfg(test)]
 mod region_tests;
 
@@ -1164,6 +1173,23 @@ impl<T: Copy> Producer<T> {
     /// The [`ProducerId`] of this producer.
     pub fn producer_id(&self) -> ProducerId {
         self.producer_id
+    }
+
+    /// Sequences strictly below this bound can no longer be read through this
+    /// lane by any current or future correctly joined consumer.
+    ///
+    /// Scans consumer progress with the join-handshake synchronization, including
+    /// provisional joins, and clamps the result to committed publication.
+    /// With no consumers, returns the publication frontier. Held read guards
+    /// pin their sequences until released. No ring exhaustion is needed.
+    ///
+    /// A delayed provisional join may lower a later result; previously returned
+    /// bounds remain valid, so callers can retain their maximum. Bounds apply
+    /// only to this lane in this queue instance. Counter wrap is unsupported.
+    /// Existing external-serialization requirements for recovery and
+    /// [`Broadcast::force_release`] still apply.
+    pub fn reclaimable_before(&self) -> usize {
+        self.lane.reclaimable_before()
     }
 
     /// Proves capacity for one cell without reserving or publishing it.

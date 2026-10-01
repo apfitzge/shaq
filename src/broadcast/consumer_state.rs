@@ -215,6 +215,18 @@ impl LaneConsumerState {
             .unwrap_or(UNCLAIMED)
     }
 
+    /// Converts the minimum participating limit to a cursor, including
+    /// provisional joins. The producer must perform the join-handshake fence
+    /// before calling this scan; the scan alone does not establish reclamation.
+    pub(crate) fn reclaimable_before(&self, publication: usize) -> usize {
+        let limit = self.reserve_limit();
+        if limit == UNCLAIMED {
+            publication
+        } else {
+            publication.min(limit.wrapping_sub(self.capacity))
+        }
+    }
+
     /// Joins `consumer_index` to this lane at the current reservation frontier.
     ///
     /// The caller must already own `consumer_index` through the broadcast's

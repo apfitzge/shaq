@@ -46,6 +46,24 @@ impl<T: Copy> AsMut<MaybeUninit<T>> for PreparedWrite<'_, T> {
 }
 
 impl<T: Copy> PreparedWrite<'_, T> {
+    /// Lane-local sequence of this cell if committed. Identify an event by its
+    /// queue instance, [`Self::producer_index`], and sequence together.
+    /// Cancellation can reuse the sequence; preparation alone is not publication.
+    pub fn sequence(&self) -> usize {
+        self.start
+    }
+
+    /// Producer lane owning this preparation, as returned by [`Producer::index`].
+    pub fn producer_index(&self) -> usize {
+        self.producer.index()
+    }
+
+    /// Queries [`Producer::reclaimable_before`] while holding the producer borrow.
+    /// The prepared cell remains unpublished and is not included in the bound.
+    pub fn reclaimable_before(&self) -> usize {
+        self.producer.reclaimable_before()
+    }
+
     /// Writes `value` and publishes it. No capacity check remains at commit.
     pub fn commit(mut self, value: T) {
         self.as_mut().write(value);
@@ -96,6 +114,25 @@ pub struct PreparedWriteBatch<'a, T: Copy> {
 }
 
 impl<T: Copy> PreparedWriteBatch<'_, T> {
+    /// First lane-local sequence in this batch. Cell `i` has sequence
+    /// `start_sequence() + i`. Identity includes the queue instance and
+    /// [`Self::producer_index`]; counter wrap is unsupported.
+    /// Cancelled cells, including an uncommitted suffix, can reuse sequences.
+    pub fn start_sequence(&self) -> usize {
+        self.start
+    }
+
+    /// Producer lane owning this batch, as returned by [`Producer::index`].
+    pub fn producer_index(&self) -> usize {
+        self.producer.index()
+    }
+
+    /// Queries [`Producer::reclaimable_before`] while holding the producer borrow.
+    /// Prepared cells remain unpublished and are not included in the bound.
+    pub fn reclaimable_before(&self) -> usize {
+        self.producer.reclaimable_before()
+    }
+
     /// Number of cells available for initialization; always nonzero.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
