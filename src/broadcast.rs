@@ -75,9 +75,12 @@
 //! or that embedded pointers and references are valid in every process that
 //! reads them.
 //!
-//! Recovery is an externally serialized operation. Do not race recovery or
-//! force-release with other recovery operations, with joins/drops for the same
-//! queue, or with a still-live owner of the index being recovered.
+//! Recovery and force-release require exclusive access to the target consumer
+//! index, with no live owner or held read guards/batches at that index. Serialize
+//! joins, drops, recovery, and force-release at that index externally. Operations
+//! on other consumer indices and producer operations (including joins and drops)
+//! may overlap. Automatic consumer joins must not claim the target while cleanup
+//! is in progress, including when the target is free.
 //!
 //! The region is a fixed header (magic/version, the global consumer-ownership
 //! table, and the blocked-consumer wake counter) followed by one lane block per
@@ -349,9 +352,12 @@ where
     /// - The consumer that previously owned `consumer_index` must be dead and
     ///   no other live handle may use it. Two consumers sharing an index
     ///   corrupts each other's cursor.
-    /// - Recovery must be serialized externally; it must not race with other
-    ///   recovery/force-release operations or with producer/consumer joins or
-    ///   drops on the same queue.
+    /// - Exclusively control the target index for the duration of recovery:
+    ///   no live owner, held read guards/batches, or concurrent joins, drops,
+    ///   recovery, or force-release at that index. This includes automatic joins
+    ///   that could claim the target when it is free.
+    /// - Operations on other consumer indices and producer operations (including
+    ///   joins and drops) may overlap.
     pub unsafe fn recover_consumer(&self, consumer_index: usize) -> Result<Consumer<T>, Error> {
         Consumer::recover_in_queue(self.shared_queue.clone(), consumer_index)
     }
@@ -492,11 +498,14 @@ impl<T> Broadcast<T> {
     /// current reservation frontier.
     ///
     /// # Safety
-    /// - the consumer that owned `index` must be dead and no other live handle
-    ///   may use it.
-    /// - Recovery must be serialized externally; it must not race with other
-    ///   recovery/force-release operations or with producer/consumer joins or
-    ///   drops on the same queue.
+    /// - The consumer that owned `consumer_index` must be dead and no other
+    ///   live handle may use it.
+    /// - Exclusively control the target index for the duration of recovery:
+    ///   no live owner, held read guards/batches, or concurrent joins, drops,
+    ///   recovery, or force-release at that index. This includes automatic joins
+    ///   that could claim the target when it is free.
+    /// - Operations on other consumer indices and producer operations (including
+    ///   joins and drops) may overlap.
     pub unsafe fn recover_slice_consumer(
         &self,
         consumer_index: usize,
@@ -508,10 +517,12 @@ impl<T> Broadcast<T> {
     /// free pool.
     ///
     /// # Safety
-    /// - `index` must be dead
-    ///   and no other live handle may use it.
-    /// - Force-release must be serialized externally, with the same restrictions
-    ///   as [`Self::recover_consumer`]/[`Self::recover_slice_consumer`].
+    /// - Exclusively control `index` for the duration of force-release: no live
+    ///   owner, held read guards/batches, or concurrent joins, drops, recovery,
+    ///   or force-release at that index. This includes automatic joins that
+    ///   could claim the target when it is free.
+    /// - Operations on other consumer indices and producer operations (including
+    ///   joins and drops) may overlap.
     pub unsafe fn force_release(&self, index: usize) -> Result<(), Error> {
         ConsumerCore::force_release(&self.shared_queue, index)
     }
@@ -1231,7 +1242,7 @@ impl<T: Copy> Producer<T> {
     /// A delayed provisional join may lower a later result; previously returned
     /// bounds remain valid, so callers can retain their maximum. Bounds apply
     /// only to this lane in this queue instance. Counter wrap is unsupported.
-    /// Existing external-serialization requirements for recovery and
+    /// The per-index exclusivity requirements for recovery and
     /// [`Broadcast::force_release`] still apply.
     pub fn reclaimable_before(&self) -> usize {
         self.lane.reclaimable_before()
@@ -1537,6 +1548,10 @@ impl ConsumerCore {
         if index >= queue.consumer_slots() {
             return Err(Error::InvalidIndex);
         }
+        // Lane storage and counters are initialized once, before any joins.
+        // Producer acquisition/retirement never resets consumer limits. Recovery
+        // touches only this index: active cursors remain pinned, while incomplete
+        // joins use the normal handshake with concurrent producers.
         let recovery_mode = queue.begin_consumer_recovery(index);
         let lanes: Box<[ProducerLane]> = queue.producer_lanes().collect();
         let next_by_lane = match recovery_mode {
@@ -1566,6 +1581,9 @@ impl ConsumerCore {
         if index >= queue.consumer_slots() {
             return Err(Error::InvalidIndex);
         }
+        // Clear only the target's limits, then release ownership last so a new
+        // owner cannot install a limit that this cleanup would erase. Other
+        // indices retain their limits, including those pinned by held guards.
         for producer_lane in queue.producer_lanes() {
             producer_lane.consumer_state().release(index);
         }
@@ -1764,21 +1782,27 @@ impl<T: Copy> Consumer<T> {
     /// - All of [`Self::join`]'s requirements, plus: the consumer that owned
     ///   `index` must be dead and no other live handle may use it — two consumers
     ///   sharing an index corrupts each other's cursor.
-    /// - Recovery must be serialized externally; it must not race with other
-    ///   recovery/force-release operations or with producer/consumer joins or
-    ///   drops on the same queue.
+    /// - Exclusively control the target index for the duration of recovery:
+    ///   no live owner, held read guards/batches, or concurrent joins, drops,
+    ///   recovery, or force-release at that index. This includes automatic joins
+    ///   that could claim the target when it is free.
+    /// - Operations on other consumer indices and producer operations (including
+    ///   joins and drops) may overlap.
     pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
         // SAFETY: the caller upholds the shared queue join requirements.
         let broadcast = unsafe { Broadcast::<T>::join(file) }?;
         // SAFETY: the caller guarantees the previous owner is dead and
-        // serializes recovery.
+        // exclusively controls the target index with no held guards/batches.
         unsafe { broadcast.recover_consumer(index) }
     }
 
     /// # Safety
-    /// - Recovery must be serialized externally; it must not race with other
-    ///   recovery/force-release operations or with producer/consumer joins or
-    ///   drops on the same queue.
+    /// - Exclusively control the target index for the duration of recovery:
+    ///   no live owner, held read guards/batches, or concurrent joins, drops,
+    ///   recovery, or force-release at that index. This includes automatic joins
+    ///   that could claim the target when it is free.
+    /// - Operations on other consumer indices and producer operations (including
+    ///   joins and drops) may overlap.
     fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
         Ok(Self {
             core: ConsumerCore::recover_in_queue(queue, index)?,
@@ -1795,13 +1819,14 @@ impl<T: Copy> Consumer<T> {
     /// # Safety
     /// - As [`Self::join`], plus: the consumer that owned `index` must be dead and
     ///   no other live handle may use it.
-    /// - Force-release must be serialized externally, with the same restrictions
-    ///   as [`Self::recover`].
+    /// - Exclusively control the target index, with no held read guards/batches,
+    ///   under the same per-index restrictions as [`Self::recover`]. Operations
+    ///   on other consumer indices and producer joins/drops may overlap.
     pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
         // SAFETY: the caller upholds the Broadcast::join requirements.
         let broadcast = unsafe { Broadcast::<T>::join(file) }?;
         // SAFETY: the caller guarantees the previous owner is dead and
-        // serializes force-release.
+        // exclusively controls the target index with no held guards/batches.
         unsafe { broadcast.force_release(index) }
     }
 
@@ -2112,14 +2137,17 @@ impl SliceConsumer {
     /// # Safety
     /// - All of [`Self::join`]'s requirements, plus: the consumer that owned
     ///   `index` must be dead and no other live handle may use it.
-    /// - Recovery must be serialized externally; it must not race with other
-    ///   recovery/force-release operations or with producer/consumer joins or
-    ///   drops on the same queue.
+    /// - Exclusively control the target index for the duration of recovery:
+    ///   no live owner, held read guards/batches, or concurrent joins, drops,
+    ///   recovery, or force-release at that index. This includes automatic joins
+    ///   that could claim the target when it is free.
+    /// - Operations on other consumer indices and producer operations (including
+    ///   joins and drops) may overlap.
     pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
         // SAFETY: the caller upholds the untyped shared queue join requirements.
         let broadcast = unsafe { Broadcast::join_untyped(file) }?;
         // SAFETY: the caller guarantees the previous owner is dead and
-        // serializes recovery.
+        // exclusively controls the target index with no held guards/batches.
         unsafe { broadcast.recover_slice_consumer(index) }
     }
 
@@ -2135,13 +2163,14 @@ impl SliceConsumer {
     /// # Safety
     /// - As [`Self::join`], plus: the consumer that owned `index` must be dead
     ///   and no other live handle may use it.
-    /// - Force-release must be serialized externally, with the same restrictions
-    ///   as [`Self::recover`].
+    /// - Exclusively control the target index, with no held read guards/batches,
+    ///   under the same per-index restrictions as [`Self::recover`]. Operations
+    ///   on other consumer indices and producer joins/drops may overlap.
     pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
         // SAFETY: the caller upholds the untyped shared queue join requirements.
         let broadcast = unsafe { Broadcast::join_untyped(file) }?;
         // SAFETY: the caller guarantees the previous owner is dead and
-        // serializes force-release.
+        // exclusively controls the target index with no held guards/batches.
         unsafe { broadcast.force_release(index) }
     }
 
@@ -3832,6 +3861,77 @@ mod tests {
         assert!(producer.try_write(99).is_ok());
         assert_eq!(fresh.try_read(), Some(99));
         assert_eq!(fresh.try_read(), None);
+    }
+
+    #[test]
+    fn cleanup_can_overlap_other_consumers_and_producer_joins_and_drops() {
+        // Exercise active recovery, interrupted-join recovery, and force-release.
+        for mode in 0..3 {
+            let queue = recovery_queue(&BroadcastConfig {
+                capacity: 2,
+                producer_slots: 2,
+                consumer_slots: 3,
+            });
+            let broadcast = Broadcast::<Payload>::from_queue(queue.clone());
+            // Simulate a dead owner without retaining a live handle or guards.
+            queue.consumer_state.acquire_at(0).unwrap();
+            for lane in queue.producer_lanes() {
+                ConsumerCore::join_lane(&lane, 0);
+            }
+            if mode != 1 {
+                queue.activate_consumer_index(0);
+            }
+            let mut producer = broadcast.producer(BOGUS_ID).unwrap();
+            let mut reader = broadcast.consumer_at(1).unwrap();
+            assert!(producer.try_write(10).is_ok());
+            assert!(producer.try_write(11).is_ok());
+            let guard = reader.try_reserve_read().unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let concurrent = broadcast.clone();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let mut other = concurrent.consumer_at(2).unwrap();
+                    let mut new_producer = concurrent.producer(BOGUS_ID).unwrap();
+                    assert!(new_producer.try_write(99).is_ok());
+                    drop(new_producer);
+                    assert_eq!(other.try_read(), Some(99));
+                    assert_eq!(other.try_read(), None);
+                    drop(other);
+                });
+                barrier.wait();
+                if mode == 2 {
+                    // SAFETY: index 0 has no live owner/guards and only this
+                    // thread accesses it; the other consumer uses index 2.
+                    unsafe { broadcast.force_release(0) }.unwrap();
+                } else {
+                    // SAFETY: index 0 has no live owner/guards and only this
+                    // thread accesses it; the other consumer uses index 2.
+                    let mut recovered = unsafe { broadcast.recover_consumer(0) }.unwrap();
+                    // Check the first lane's cursor directly: the concurrent
+                    // producer may publish on the second lane at any time.
+                    assert_eq!(
+                        recovered.core.next_for_lane(0),
+                        if mode == 0 { 0 } else { 2 }
+                    );
+                    if mode == 0 {
+                        assert_eq!(recovered.try_read(), Some(10));
+                    }
+                    drop(recovered);
+                }
+            });
+            // Cleanup cannot release the other index's held guard or permit
+            // its payload to be overwritten, even after the target is free.
+            assert_eq!(*guard.as_ref(), 10);
+            assert_eq!(producer.reclaimable_before(), 0);
+            assert!(producer.try_write(12).is_err());
+            drop(guard);
+            assert_eq!(producer.reclaimable_before(), 1);
+            assert!(producer.try_write(12).is_ok());
+            assert_eq!(broadcast.consumer_at(0).unwrap().index(), 0);
+            assert_eq!(broadcast.consumer_at(2).unwrap().index(), 2);
+        }
     }
 
     #[test]

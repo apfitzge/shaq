@@ -128,8 +128,9 @@ impl ConsumerState {
     /// has complete lane cursors and can resume them. A free or joining index is
     /// kept in the joining phase so recovery can restart every lane safely.
     ///
-    /// The caller guarantees that no live handle uses the index and serializes
-    /// recovery with joins, drops, and other recovery operations.
+    /// The caller exclusively controls this index, with no live owner or held
+    /// guards/batches, and excludes joins, drops, recovery, and force-release at
+    /// this index. Other consumer indices and producer operations may overlap.
     pub(crate) fn begin_recovery(&self, index: usize) -> ConsumerRecoveryMode {
         let slot = self.slot(index);
         if slot.load(Ordering::Acquire) == CONSUMER_ACTIVE {
