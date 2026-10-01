@@ -17,7 +17,7 @@ pub enum Error {
     Mmap(std::io::Error),
     ProducerSlotsExhausted,
     ConsumerSlotsExhausted,
-    /// A recovery index was out of range for the queue's slot count.
+    /// A requested index was out of range for the queue's slot count.
     InvalidIndex,
 }
 

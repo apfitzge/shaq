@@ -90,20 +90,27 @@ impl ConsumerState {
     /// remains in the joining phase until every lane has installed its cursor.
     pub(crate) fn acquire(&self) -> Result<usize, Error> {
         for index in 0..self.slot_count {
-            if self
-                .slot(index)
-                .compare_exchange(
-                    CONSUMER_FREE,
-                    CONSUMER_JOINING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
+            if self.acquire_at(index).is_ok() {
                 return Ok(index);
             }
         }
         Err(Error::ConsumerSlotsExhausted)
+    }
+
+    /// Claims the specified free consumer index for normal initialization.
+    pub(crate) fn acquire_at(&self, index: usize) -> Result<usize, Error> {
+        if index >= self.slot_count {
+            return Err(Error::InvalidIndex);
+        }
+        self.slot(index)
+            .compare_exchange(
+                CONSUMER_FREE,
+                CONSUMER_JOINING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| index)
+            .map_err(|_| Error::ConsumerSlotsExhausted)
     }
 
     /// Marks a joining consumer active after all of its lane cursors have been

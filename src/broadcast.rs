@@ -325,6 +325,19 @@ where
         Consumer::from_queue(self.shared_queue.clone())
     }
 
+    /// Creates a new [`Consumer`] at `index`, starting at each lane's
+    /// reservation frontier, just like [`Self::consumer`].
+    ///
+    /// Returns [`Error::InvalidIndex`] if `index` is out of range, or
+    /// [`Error::ConsumerSlotsExhausted`] if that index is occupied.
+    pub fn consumer_at(&self, index: usize) -> Result<Consumer<T>, Error> {
+        Ok(Consumer {
+            core: ConsumerCore::from_queue_at(self.shared_queue.clone(), index)?,
+            _marker: PhantomData,
+            _invariant: PhantomData,
+        })
+    }
+
     /// Takes over a consumer index whose owner died. A fully joined consumer
     /// **resumes where the dead owner left off** on each lane — its unread items
     /// are still pinned by its reserve limit, so they are delivered. If the
@@ -456,6 +469,21 @@ impl<T> Broadcast<T> {
     ///   requirement.
     pub unsafe fn slice_consumer(&self) -> Result<SliceConsumer, Error> {
         SliceConsumer::from_queue(self.shared_queue.clone())
+    }
+
+    /// Creates a new [`SliceConsumer`] at `index`, starting at each lane's
+    /// reservation frontier, just like [`Self::slice_consumer`].
+    ///
+    /// Returns [`Error::InvalidIndex`] if `index` is out of range, or
+    /// [`Error::ConsumerSlotsExhausted`] if that index is occupied.
+    ///
+    /// # Safety
+    /// - The payload must satisfy [`SliceConsumer`]'s full-byte initialization
+    ///   requirement.
+    pub unsafe fn slice_consumer_at(&self, index: usize) -> Result<SliceConsumer, Error> {
+        Ok(SliceConsumer {
+            core: ConsumerCore::from_queue_at(self.shared_queue.clone(), index)?,
+        })
     }
 
     /// Takes over a consumer index whose owner died. A fully joined consumer
@@ -1479,6 +1507,15 @@ struct ConsumerCore {
 impl ConsumerCore {
     fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
         let index = queue.acquire_consumer_index()?;
+        Ok(Self::from_claimed_index(queue, index))
+    }
+
+    fn from_queue_at(queue: SharedQueue, index: usize) -> Result<Self, Error> {
+        queue.consumer_state.acquire_at(index)?;
+        Ok(Self::from_claimed_index(queue, index))
+    }
+
+    fn from_claimed_index(queue: SharedQueue, index: usize) -> Self {
         // Cache a view per lane (independent of `queue`) and join each at its
         // reservation frontier.
         let lanes: Box<[ProducerLane]> = queue.producer_lanes().collect();
@@ -1487,13 +1524,13 @@ impl ConsumerCore {
             .map(|lane| Self::join_lane(lane, index))
             .collect();
         queue.activate_consumer_index(index);
-        Ok(Self {
+        Self {
             queue,
             index,
             lanes,
             next_by_lane,
             scan_start_lane: 0,
-        })
+        }
     }
 
     fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
@@ -3599,6 +3636,68 @@ mod tests {
             SharedQueue::create_in_region::<Payload>(&region, config, DEFAULT_QUEUE_IDENTIFIER)
         }
         .unwrap()
+    }
+
+    #[test]
+    fn indexed_consumers_claim_only_free_slots_and_start_fresh() {
+        let queue = recovery_queue(&BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 3,
+        });
+        let broadcast = Broadcast::<Payload>::from_queue(queue.clone());
+        let mut producer = broadcast.producer(BOGUS_ID).unwrap();
+        assert!(producer.try_write(10).is_ok());
+        let mut consumer = broadcast.consumer_at(2).unwrap();
+        assert_eq!(consumer.index(), 2);
+        assert_eq!(consumer.try_read(), None);
+        assert!(matches!(
+            broadcast.consumer_at(2),
+            Err(Error::ConsumerSlotsExhausted)
+        ));
+        assert!(matches!(
+            // SAFETY: Payload is u64, with no uninitialized padding.
+            unsafe { broadcast.slice_consumer_at(2) },
+            Err(Error::ConsumerSlotsExhausted)
+        ));
+        assert_eq!(broadcast.consumer().unwrap().index(), 0);
+        assert!(producer.try_write(11).is_ok());
+        assert_eq!(consumer.try_read(), Some(11));
+        assert!(producer.try_write(12).is_ok());
+        drop(consumer);
+
+        // A normal join skips even the previous owner's unread values.
+        // SAFETY: Payload is u64, with no uninitialized padding.
+        let mut consumer = unsafe { broadcast.slice_consumer_at(2) }.unwrap();
+        assert_eq!(consumer.index(), 2);
+        assert!(consumer.try_read().is_none());
+        assert!(matches!(
+            broadcast.consumer_at(2),
+            Err(Error::ConsumerSlotsExhausted)
+        ));
+        assert!(producer.try_write(13).is_ok());
+        assert_eq!(
+            consumer.try_read().unwrap().as_slice(),
+            &13u64.to_ne_bytes()
+        );
+
+        // An interrupted join remains occupied, without being recovered.
+        queue.consumer_state.acquire_at(1).unwrap();
+        assert!(matches!(
+            broadcast.consumer_at(1),
+            Err(Error::ConsumerSlotsExhausted)
+        ));
+        assert!(matches!(
+            // SAFETY: Payload is u64, with no uninitialized padding.
+            unsafe { broadcast.slice_consumer_at(1) },
+            Err(Error::ConsumerSlotsExhausted)
+        ));
+        assert!(matches!(broadcast.consumer_at(3), Err(Error::InvalidIndex)));
+        assert!(matches!(
+            // SAFETY: Payload is u64, with no uninitialized padding.
+            unsafe { broadcast.slice_consumer_at(3) },
+            Err(Error::InvalidIndex)
+        ));
     }
 
     #[test]
