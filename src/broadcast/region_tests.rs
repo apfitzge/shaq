@@ -162,6 +162,27 @@ mod file {
     }
 
     #[test]
+    fn custom_identifier_survives_relocated_typed_and_untyped_joins() {
+        let layout = config().layout::<u64>().unwrap();
+        let offset = layout.align() as u64;
+        let extent = layout.size() as u64;
+        let identifier = 0x1234_5678_9abc_def0;
+        let file = filled_file(layout.align() + layout.size());
+        // SAFETY: fresh aligned queue storage with portable u64 payloads, initialized once.
+        let queue = unsafe {
+            Broadcast::<u64>::create_at_with_identifier(&file, offset, extent, config(), identifier)
+        }
+        .unwrap();
+        assert_eq!(queue.queue_identifier(), identifier);
+        // SAFETY: same live u64 queue and bounds; the file is not resized.
+        let typed = unsafe { Broadcast::<u64>::join_at(&file, offset, extent) }.unwrap();
+        assert_eq!(typed.queue_identifier(), identifier);
+        // SAFETY: same live queue; u64 has no uninitialized padding.
+        let untyped = unsafe { Broadcast::join_untyped_at(&file, offset, extent) }.unwrap();
+        assert_eq!(untyped.queue_identifier(), identifier);
+    }
+
+    #[test]
     fn region_roundtrip_preserves_surroundings_and_mapping_lifetimes() {
         let layout = config().layout::<u64>().unwrap();
         for offset in [0, layout.align(), 3 * layout.align(), 4096 + layout.align()] {

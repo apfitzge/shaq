@@ -254,11 +254,28 @@ where
         extent: u64,
         config: BroadcastConfig,
     ) -> Result<Self, Error> {
+        // SAFETY: the caller upholds the same requirements as create_at_with_identifier.
+        unsafe {
+            Self::create_at_with_identifier(file, offset, extent, config, DEFAULT_QUEUE_IDENTIFIER)
+        }
+    }
+
+    /// Creates a queue in a bounded file region with a caller chosen identifier.
+    /// The identifier is not enforced to be unique.
+    ///
+    /// # Safety
+    /// The same requirements as [`Self::create_at`] apply.
+    pub unsafe fn create_at_with_identifier(
+        file: &File,
+        offset: u64,
+        extent: u64,
+        config: BroadcastConfig,
+        queue_identifier: u64,
+    ) -> Result<Self, Error> {
         let layout = QueueLayout::new::<T>(&config)?;
         let region = QueueRegion::map_file(file, offset, extent)?;
         // SAFETY: caller guarantees exclusive, one-time initialization.
-        let queue =
-            unsafe { SharedQueue::create_in_view(region, layout, DEFAULT_QUEUE_IDENTIFIER) }?;
+        let queue = unsafe { SharedQueue::create_in_view(region, layout, queue_identifier) }?;
         Ok(Self::from_queue(queue))
     }
 
