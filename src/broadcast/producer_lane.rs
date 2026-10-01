@@ -28,7 +28,7 @@ pub(super) struct LaneHeader {
     producer_id: AtomicU64,
     /// Count of messages refused by backpressure.
     rejected_items: AtomicU64,
-    /// Claimed-up-to sequence: advanced before a ring cell is written.
+    /// Claimed-up-to sequence: advanced before legacy writes, or at prepared commit.
     producer_reservation: CacheAlignedAtomicSize,
     /// Visible-up-to sequence: advanced after a ring cell is written; consumers
     /// read sequences `< producer_publication`.
@@ -285,18 +285,16 @@ impl ProducerLane {
         );
     }
 
-    /// Reserves `count` consecutive sequences for writing, returning the first.
-    /// `None` on backpressure: the batch would overwrite a cell an active
-    /// consumer has not yet read, or it exceeds the ring capacity.
-    /// On success this returns Some(seqnum) - with seqnum being
-    /// the starting sequence number of the reservation.
+    /// Checks capacity without changing either shared frontier.
     ///
-    /// Write each reserved cell via [`Self::payload_ptr`], then [`Self::publish`].
-    pub(crate) fn try_reserve(&mut self, count: NonZeroUsize) -> Option<usize> {
+    /// The producer must remain exclusively borrowed until preparation is
+    /// discarded or committed. No other write may intervene.
+    pub(crate) fn try_prepare(&mut self, count: NonZeroUsize) -> Option<usize> {
         if count.get() > self.capacity() {
             return None;
         }
-        let start = self.header().producer_reservation.load(Ordering::Acquire);
+        let start = self.reserved();
+        let end = start.wrapping_add(count.get());
         // Producer half of the join handshake: order the previous reserve's
         // `producer_reservation` store before this reserve's limit loads. A
         // racing consumer publishes a limit from its first reservation sample,
@@ -309,17 +307,43 @@ impl ProducerLane {
         // plain comparison: rejecting once the batch would reach a sequence a
         // consumer still needs. Unowned slots sit at the top, so they never
         // gate.
-        if start.wrapping_add(count.get()) > self.consumer_state.reserve_limit() {
+        if end > self.consumer_state.reserve_limit() {
             self.header()
                 .rejected_items
                 .fetch_add(count.get() as u64, Ordering::Relaxed);
             return None;
         }
-        // Claim before the writes; consumers only read `< producer_publication`.
+        // The Acquire loads prove prior readers have finished before we write
+        // the reused cells. A racing join either constrains this scan or sees
+        // the previous reservation frontier (at least `start`) in its second
+        // sample, via the matching SeqCst fences. Such a join cannot read the
+        // overwritten prefix. Existing consumers only advance/release; a new
+        // join at `start` permits a full ring. Even if an older provisional
+        // limit arrives after this scan, the join must resample before reading.
+        // Thus count <= capacity remains safe throughout an exclusive borrow,
+        // with no capacity recheck at commit and no rollback on cancellation.
+        Some(start)
+    }
+
+    /// Legacy reservation: claim immediately and publish after initialization.
+    /// Returns None for any preparation failure, preserving the legacy API.
+    pub(crate) fn try_reserve(&mut self, count: NonZeroUsize) -> Option<usize> {
+        let start = self.try_prepare(count)?;
         self.header()
             .producer_reservation
             .store(start.wrapping_add(count.get()), Ordering::Release);
         Some(start)
+    }
+
+    /// Commits an initialized, nonempty prefix of a successful preparation.
+    /// The exclusive borrow must have prevented any intervening reservation;
+    /// count must not exceed the prepared count. There is no fallible work here.
+    pub(crate) fn commit_prepared(&mut self, start: usize, count: NonZeroUsize) {
+        self.header()
+            .producer_reservation
+            .store(start.wrapping_add(count.get()), Ordering::Release);
+        // Release publication orders all payload writes before consumer reads.
+        self.publish(start, count);
     }
 
     /// Publishes `start..start + count`, making it visible to consumers. Call

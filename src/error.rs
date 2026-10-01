@@ -28,7 +28,6 @@ pub enum WaitError {
 
 impl std::error::Error for Error {}
 impl std::error::Error for WaitError {}
-
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

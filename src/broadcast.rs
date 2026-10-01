@@ -33,6 +33,18 @@
 //! resumes where the dead owner was; an interrupted join restarts at each
 //! lane's current reservation frontier.
 //!
+//! [`Producer::try_prepare_write`] and [`Producer::try_prepare_write_batch`]
+//! check capacity before caller work but leave both frontiers unchanged. Their
+//! guards cancel on drop and publish only on explicit commit, including an
+//! initialized-prefix option for batches. A consumer joining before commit can
+//! receive these writes; a consumer joining at the advanced reservation frontier
+//! skips them, as with legacy writes. Initialization precedes Release publication.
+//!
+//! Counter wrap remains unsupported, as with legacy reservations.
+//! Legacy single-cell reservations require caller initialization before drop or
+//! any later write, even if their guard is forgotten. Forgetting a prepared guard leaves
+//! both frontiers unchanged and permits subsequent writes.
+//!
 //! Producer lanes bind to at most one producer for the queue's lifetime: a lane
 //! is claimed on join and permanently retired when its producer drops; a
 //! crashed producer's lane stays claimed. Neither returns to the free pool, so
@@ -65,7 +77,11 @@
 //! producer.
 
 mod consumer_state;
+mod prepared_write;
 mod producer_lane;
+pub use prepared_write::{PreparedWrite, PreparedWriteBatch};
+#[cfg(test)]
+mod prepared_tests;
 #[cfg(test)]
 mod region_tests;
 
@@ -1150,6 +1166,44 @@ impl<T: Copy> Producer<T> {
         self.producer_id
     }
 
+    /// Proves capacity for one cell without reserving or publishing it.
+    ///
+    /// Initialize and explicitly commit the returned guard. Dropping it,
+    /// including during unwinding, cancels; forgetting it also leaves both
+    /// shared frontiers unchanged. Consumers joining during preparation can
+    /// receive the value if they complete their join before commit.
+    ///
+    /// Returns `None` on backpressure, before any caller initialization work is done.
+    pub fn try_prepare_write(&mut self) -> Option<PreparedWrite<'_, T>> {
+        let start = self.lane.try_prepare(NonZeroUsize::MIN)?;
+        Some(PreparedWrite {
+            producer: self,
+            start,
+        })
+    }
+
+    /// Proves capacity for `count` cells without advancing either frontier.
+    ///
+    /// The guard supports full or initialized-prefix publication with one
+    /// commit. Dropping or forgetting it cancels the entire preparation.
+    /// Returns `None` if the count exceeds capacity or consumers hold needed cells.
+    pub fn try_prepare_write_batch(
+        &mut self,
+        count: NonZeroUsize,
+    ) -> Option<PreparedWriteBatch<'_, T>> {
+        let start = self.lane.try_prepare(count)?;
+        Some(PreparedWriteBatch {
+            producer: self,
+            start,
+            count,
+        })
+    }
+
+    fn commit_prepared(&mut self, start: usize, count: NonZeroUsize) {
+        self.lane.commit_prepared(start, count);
+        self.queue.wake();
+    }
+
     /// Publishes one value, or returns it on backpressure (the slowest consumer
     /// has not freed the cell that publishing would overwrite).
     pub fn try_write(&mut self, value: T) -> Result<(), T> {
@@ -1167,6 +1221,7 @@ impl<T: Copy> Producer<T> {
     /// Writes items from a slice into this producer's lane.
     ///
     /// Returns `false` if there is not enough space.
+    /// An empty slice always succeeds without publishing anything.
     #[must_use]
     pub fn try_write_slice(&mut self, items: &[T]) -> bool {
         let Some(len) = NonZeroUsize::new(items.len()) else {
@@ -1188,10 +1243,12 @@ impl<T: Copy> Producer<T> {
 
     /// Reserves a single cell for an in-place write, or `None` on backpressure.
     /// The cell becomes visible when the returned guard is dropped.
+    /// Use [`Self::try_prepare_write`] for cancellation.
     ///
     /// # Safety
     /// - The caller must initialize the reserved cell before the guard is
-    ///   dropped.
+    ///   dropped or the producer is used for another write, even if this guard
+    ///   is forgotten. A subsequent write can publish the earlier reservation.
     #[must_use]
     pub unsafe fn try_reserve_write(&mut self) -> Option<WriteGuard<'_, T>> {
         let start = self.lane.try_reserve(NonZeroUsize::MIN)?;
@@ -1203,20 +1260,20 @@ impl<T: Copy> Producer<T> {
 
     /// Reserves `count` consecutive cells for in-place writes, or `None` on
     /// backpressure. The cells become visible when the returned batch is dropped.
+    /// Also returns `None` if `count` exceeds capacity.
+    /// Reservation is deferred until drop, so consumers joining while the batch
+    /// is being filled can receive it. Forgetting the batch publishes nothing.
     ///
     /// # Safety
     /// - The caller must initialize every reserved cell before the batch is
-    ///   dropped.
+    ///   dropped, including during unwinding.
     #[must_use]
     pub unsafe fn try_reserve_write_batch(
         &mut self,
         count: NonZeroUsize,
     ) -> Option<WriteBatch<'_, T>> {
-        let start = self.lane.try_reserve(count)?;
         Some(WriteBatch {
-            producer: self,
-            start,
-            count,
+            prepared: Some(self.try_prepare_write_batch(count)?),
         })
     }
 }
@@ -1275,18 +1332,19 @@ impl<T: Copy> Drop for WriteGuard<'_, T> {
 
 /// A reservation of `count` cells in a producer's lane. Write every cell via
 /// [`Self::write`]/[`Self::as_mut`], then drop the batch to publish them.
+/// Wraps a prepared batch, advancing reservation and publication only on drop.
 #[must_use]
 pub struct WriteBatch<'a, T: Copy> {
-    producer: &'a mut Producer<T>,
-    start: usize,
-    count: NonZeroUsize,
+    // Taken only by Drop to call the consuming commit operation.
+    prepared: Option<PreparedWriteBatch<'a, T>>,
 }
 
 impl<T: Copy> core::fmt::Debug for WriteBatch<'_, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let producer = &self.prepared.as_ref().unwrap().producer;
         f.debug_struct("WriteBatch")
-            .field("lane_index", &self.producer.index())
-            .field("producer_id", &self.producer.producer_id())
+            .field("lane_index", &producer.index())
+            .field("producer_id", &producer.producer_id())
             .field("len", &self.len())
             .finish_non_exhaustive()
     }
@@ -1295,7 +1353,7 @@ impl<T: Copy> core::fmt::Debug for WriteBatch<'_, T> {
 impl<T: Copy> WriteBatch<'_, T> {
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        self.count.get()
+        self.prepared.as_ref().unwrap().len()
     }
 
     /// Mutable reference to the reserved cell at `index`.
@@ -1303,14 +1361,7 @@ impl<T: Copy> WriteBatch<'_, T> {
     /// # Safety
     /// - `index < len`.
     pub unsafe fn as_mut(&mut self, index: usize) -> &mut MaybeUninit<T> {
-        debug_assert!(index < self.count.get());
-        let mut ptr = self
-            .producer
-            .lane
-            .payload_ptr(self.start.wrapping_add(index))
-            .cast();
-        // SAFETY: forwarded; the cell is reserved for this producer.
-        unsafe { ptr.as_mut() }
+        self.prepared.as_mut().unwrap().as_mut(index)
     }
 
     /// Writes `value` into the reserved cell at `index`.
@@ -1325,8 +1376,9 @@ impl<T: Copy> WriteBatch<'_, T> {
 
 impl<T: Copy> Drop for WriteBatch<'_, T> {
     fn drop(&mut self) {
-        self.producer.lane.publish(self.start, self.count);
-        self.producer.queue.wake();
+        let prepared = self.prepared.take().unwrap();
+        // SAFETY: try_reserve_write_batch requires every cell initialized before drop.
+        unsafe { prepared.commit() };
     }
 }
 
