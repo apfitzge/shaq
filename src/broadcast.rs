@@ -14,6 +14,14 @@
 //! [`Consumer::join`], and [`SliceConsumer::join`] are convenience entry points
 //! for processes that only need one endpoint.
 //!
+//! To embed a queue in a larger file, query [`BroadcastConfig::layout`], size
+//! the enclosing file, and use [`Broadcast::create_at`]/[`Broadcast::join_at`]
+//! or [`Broadcast::join_untyped_at`]. These APIs preserve the file size and
+//! bytes outside the queue layout; the original `create` API still resizes the
+//! file. Queue offsets need only satisfy the queried alignment, not OS page
+//! alignment. The enclosing file is mapped in full and must remain its original
+//! size for the lifetime of every handle or guard.
+//!
 //! [`Producer`] writes via by-value [`Producer::try_write`], an in-place
 //! [`WriteGuard`], or a [`WriteBatch`]; [`Consumer`] reads via
 //! [`Consumer::try_read`], a [`ReadGuard`], or a [`ReadBatch`], with blocking
@@ -58,12 +66,14 @@
 
 mod consumer_state;
 mod producer_lane;
+#[cfg(test)]
+mod region_tests;
 
 pub use producer_lane::LaneMetadata;
 
 use core::alloc::Layout;
 use core::marker::PhantomData;
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -91,6 +101,27 @@ pub struct BroadcastConfig {
     pub capacity: usize,
     pub producer_slots: usize,
     pub consumer_slots: usize,
+}
+
+impl BroadcastConfig {
+    /// Returns the queue's byte size and required base alignment for `T`.
+    ///
+    /// Uses the actual capacity rounded up to a power of two. The returned
+    /// layout includes all producer lanes and consumer state, not just payloads.
+    pub fn layout<T>(&self) -> Result<Layout, Error> {
+        self.layout_for_payload(Layout::new::<T>())
+    }
+
+    /// Like [`Self::layout`], with an explicit payload layout.
+    ///
+    /// Returns an error for unsupported payload alignment, invalid configuration,
+    /// or a queue size that cannot be represented by a [`Layout`]. This describes
+    /// the native queue format; it does not make payloads process-portable.
+    pub fn layout_for_payload(&self, payload: Layout) -> Result<Layout, Error> {
+        let layout = QueueLayout::new_for_payload(self, payload)?;
+        Layout::from_size_align(layout.total, QueueLayout::alignment())
+            .map_err(|_| Error::InvalidBufferSize)
+    }
 }
 
 pub struct Broadcast<MessageType> {
@@ -154,6 +185,58 @@ where
         Ok(Self::from_queue(shared_queue))
     }
 
+    /// Creates a queue in `file[offset..offset + extent]` without resizing it.
+    ///
+    /// The caller must size the file first. `offset` must satisfy the alignment
+    /// returned by [`BroadcastConfig::layout`], but need not be page-aligned.
+    /// `extent` must fit the file and contain the entire queue. Bytes outside
+    /// the queue's layout, including any unused extent suffix, are untouched.
+    ///
+    /// ```no_run
+    /// use shaq::broadcast::{Broadcast, BroadcastConfig};
+    /// use std::fs::OpenOptions;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = BroadcastConfig {
+    ///     capacity: 100, producer_slots: 2, consumer_slots: 4,
+    /// };
+    /// let layout = config.layout::<u64>()?;
+    /// let offset = layout.align() as u64; // room for an application prefix
+    /// let extent = layout.size() as u64;
+    /// let file = OpenOptions::new().read(true).write(true).create_new(true)
+    ///     .open("broadcast-region.bin")?;
+    /// file.set_len(offset + extent)?;
+    /// // SAFETY: fresh storage; all participants use portable u64 values and
+    /// // keep the file size fixed while the queue is in use.
+    /// let queue = unsafe { Broadcast::<u64>::create_at(&file, offset, extent, config) }?;
+    /// let mut producer = queue.producer(shaq::broadcast::ProducerId::new(1))?;
+    /// let mut consumer = queue.consumer()?;
+    /// assert!(producer.try_write(42).is_ok());
+    /// assert_eq!(consumer.try_read(), Some(42));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    /// - The queue storage must be initialized exactly once, with exclusive
+    ///   access during initialization, and must not overlap another live queue.
+    /// - The enclosing file must not be resized while any mapping is alive, and
+    ///   queue storage must not be modified outside the queue protocol.
+    /// - All participants must use the same `T` and layout, with values valid in
+    ///   every reading process, as required by [`Self::create`].
+    pub unsafe fn create_at(
+        file: &File,
+        offset: u64,
+        extent: u64,
+        config: BroadcastConfig,
+    ) -> Result<Self, Error> {
+        let layout = QueueLayout::new::<T>(&config)?;
+        let region = QueueRegion::map_file(file, offset, extent)?;
+        // SAFETY: caller guarantees exclusive, one-time initialization.
+        let queue =
+            unsafe { SharedQueue::create_in_view(region, layout, DEFAULT_QUEUE_IDENTIFIER) }?;
+        Ok(Self::from_queue(queue))
+    }
+
     /// Joins an existing broadcast queue in `file`.
     ///
     /// # Safety
@@ -170,6 +253,24 @@ where
             _message_type: PhantomData,
             _payload_invariant: PhantomData,
         })
+    }
+
+    /// Joins a queue contained in `file[offset..offset + extent]`.
+    ///
+    /// Alignment and extent requirements are the same as [`Self::create_at`].
+    /// Validation uses only the declared extent, even if the file is larger.
+    ///
+    /// # Safety
+    /// - The region must hold a live queue; the enclosing file must not be
+    ///   resized while any mapping is alive.
+    /// - Queue storage must only be modified through the queue protocol, and
+    ///   all participants must satisfy [`Self::join`]'s payload requirements.
+    pub unsafe fn join_at(file: &File, offset: u64, extent: u64) -> Result<Self, Error> {
+        let region = QueueRegion::map_file(file, offset, extent)?;
+        // SAFETY: caller guarantees a live queue and compatible payloads.
+        let queue =
+            unsafe { SharedQueue::join_region_with(region, QueueLayout::from_header::<T>) }?;
+        Ok(Self::from_queue(queue))
     }
 
     /// Creates a new [`Producer`] if there is a free producer slot.
@@ -272,6 +373,26 @@ impl Broadcast<UnknownType> {
             _message_type: PhantomData,
             _payload_invariant: PhantomData,
         })
+    }
+
+    /// Joins a queue in a bounded file region without checking a Rust type.
+    ///
+    /// `offset` must satisfy the queue layout's alignment, not necessarily page
+    /// alignment. The complete queue must fit `extent` and the enclosing file.
+    ///
+    /// # Safety
+    /// - The region must hold a live queue and the enclosing file must not be
+    ///   resized while any mapping is alive.
+    /// - Queue storage must only be modified through the queue protocol.
+    /// - Payloads must satisfy [`SliceConsumer`]'s full-byte initialization
+    ///   requirement and be meaningful without Rust type validation, as required
+    ///   by [`Self::join_untyped`].
+    pub unsafe fn join_untyped_at(file: &File, offset: u64, extent: u64) -> Result<Self, Error> {
+        let region = QueueRegion::map_file(file, offset, extent)?;
+        // SAFETY: caller guarantees a live queue and fully initialized payload bytes.
+        let queue =
+            unsafe { SharedQueue::join_region_with(region, QueueLayout::from_header_payload) }?;
+        Ok(Self::from_queue(queue))
     }
 }
 
@@ -460,6 +581,12 @@ struct QueueLayout {
 }
 
 impl QueueLayout {
+    fn alignment() -> usize {
+        align_of::<SharedQueueHeader>()
+            .max(ConsumerState::block_align())
+            .max(ProducerLane::block_align())
+    }
+
     fn new<T>(config: &BroadcastConfig) -> Result<Self, Error> {
         Self::checked_new_for_payload(config, Layout::new::<T>()).ok_or(Error::InvalidBufferSize)
     }
@@ -504,6 +631,9 @@ impl QueueLayout {
                 .checked_next_multiple_of(block_align)?;
         let producer_blocks_bytes = block_stride.checked_mul(config.producer_slots)?;
         let total = producer_blocks_offset.checked_add(producer_blocks_bytes)?;
+        // Keep every queue and its pointer offsets within Rust's object-size
+        // limit, including for file-backed storage.
+        Layout::from_size_align(total, Self::alignment()).ok()?;
 
         Some(Self {
             capacity,
@@ -560,9 +690,63 @@ impl QueueLayout {
     }
 }
 
+/// A checked queue view retaining the owner of the entire mapping/allocation.
+/// The view's alignment is independent of the OS mapping granularity.
+#[derive(Clone)]
+struct QueueRegion {
+    _owner: Arc<Region>,
+    base: NonNull<u8>,
+    extent: usize,
+}
+
+impl QueueRegion {
+    fn new(owner: Arc<Region>, offset: usize, extent: usize) -> Result<Self, Error> {
+        let end = offset.checked_add(extent).ok_or(Error::InvalidBufferSize)?;
+        if owner.size() > isize::MAX as usize
+            || end > owner.size()
+            || extent < size_of::<SharedQueueHeader>()
+        {
+            return Err(Error::InvalidBufferSize);
+        }
+        // SAFETY: the checked range is within the owner's addressable storage.
+        let base = unsafe { owner.addr().byte_add(offset) };
+        let actual = base.align_offset(QueueLayout::alignment());
+        if actual != 0 {
+            return Err(Error::InvalidRegionAlignment {
+                minimum: QueueLayout::alignment(),
+                actual,
+            });
+        }
+        Ok(Self {
+            _owner: owner,
+            base,
+            extent,
+        })
+    }
+
+    fn map_file(file: &File, offset: u64, extent: u64) -> Result<Self, Error> {
+        let file_size = file.metadata()?.len();
+        let end = offset.checked_add(extent).ok_or(Error::InvalidBufferSize)?;
+        if end > file_size || extent < size_of::<SharedQueueHeader>() as u64 {
+            return Err(Error::InvalidBufferSize);
+        }
+        let file_size = usize::try_from(file_size).map_err(|_| Error::InvalidBufferSize)?;
+        let offset = usize::try_from(offset).map_err(|_| Error::InvalidBufferSize)?;
+        let extent = usize::try_from(extent).map_err(|_| Error::InvalidBufferSize)?;
+        if file_size > isize::MAX as usize {
+            return Err(Error::InvalidBufferSize);
+        }
+        // Mapping from zero works on both Unix and Windows, including when the
+        // queue offset does not satisfy the OS's mapping granularity. The range
+        // has already been checked against the file, so mapping cannot grow it.
+        let owner = Region::map_file(file, file_size)?;
+        Self::new(owner, offset, extent)
+    }
+}
+
 /// A handle onto the shared region: the header plus the section base pointers.
 struct SharedQueue {
-    region: Arc<Region>,
+    region: QueueRegion,
     header: NonNull<SharedQueueHeader>,
     consumer_state: ConsumerState,
     producer_blocks: NonNull<u8>,
@@ -584,12 +768,24 @@ impl SharedQueue {
         identifier: u64,
     ) -> Result<Self, Error> {
         let layout = QueueLayout::new::<T>(config)?;
-        if region.size() < layout.total {
+        let region = QueueRegion::new(Arc::clone(region), 0, region.size())?;
+        // SAFETY: caller guarantees one-time initialization of the storage.
+        unsafe { Self::create_in_view(region, layout, identifier) }
+    }
+
+    /// # Safety
+    /// - The view must be exclusively initialized at most once.
+    unsafe fn create_in_view(
+        region: QueueRegion,
+        layout: QueueLayout,
+        identifier: u64,
+    ) -> Result<Self, Error> {
+        if region.extent < layout.total {
             return Err(Error::InvalidBufferSize);
         }
         // SAFETY: region is large enough and (per the contract) initialized once.
-        unsafe { Self::initialize(region, &layout, identifier) };
-        Ok(Self::from_region(Arc::clone(region), layout))
+        unsafe { Self::initialize(&region, &layout, identifier) };
+        Ok(Self::from_region(region, layout))
     }
 
     /// Validates an initialized broadcast region and returns a handle.
@@ -597,6 +793,7 @@ impl SharedQueue {
     /// # Safety
     /// - `region` must reference memory laid out by [`Self::create_in_region`].
     unsafe fn join_region<T>(region: &Arc<Region>) -> Result<Self, Error> {
+        let region = QueueRegion::new(Arc::clone(region), 0, region.size())?;
         // SAFETY: caller guarantees `region` was laid out by `create_in_region`.
         unsafe { Self::join_region_with(region, QueueLayout::from_header::<T>) }
     }
@@ -607,16 +804,18 @@ impl SharedQueue {
     /// # Safety
     /// - `region` must reference memory laid out by [`Self::create_in_region`].
     unsafe fn join_region_untyped(region: &Arc<Region>) -> Result<Self, Error> {
+        let region = QueueRegion::new(Arc::clone(region), 0, region.size())?;
         // SAFETY: caller guarantees `region` was laid out by `create_in_region`.
         unsafe { Self::join_region_with(region, QueueLayout::from_header_payload) }
     }
 
     unsafe fn join_region_with(
-        region: &Arc<Region>,
+        region: QueueRegion,
         layout_from_header: impl FnOnce(&SharedQueueHeader, usize) -> Result<QueueLayout, Error>,
     ) -> Result<Self, Error> {
-        let header = region.addr().cast::<SharedQueueHeader>();
-        // SAFETY: regions are page-aligned (>= align_of::<SharedQueueHeader>()).
+        let header = region.base.cast::<SharedQueueHeader>();
+        // SAFETY: QueueRegion checks alignment and minimum header size before
+        // any dereference; the caller guarantees live queue storage.
         let header_ref = unsafe { header.as_ref() };
         if header_ref.magic.load(Ordering::Acquire) != MAGIC {
             return Err(Error::InvalidMagic);
@@ -627,14 +826,14 @@ impl SharedQueue {
                 actual: header_ref.version,
             });
         }
-        let layout = layout_from_header(header_ref, region.size())?;
-        Ok(Self::from_region(Arc::clone(region), layout))
+        let layout = layout_from_header(header_ref, region.extent)?;
+        Ok(Self::from_region(region, layout))
     }
 
     /// # Safety
     /// - `region` must be at least `layout.total` bytes and initialized once.
-    unsafe fn initialize(region: &Arc<Region>, layout: &QueueLayout, identifier: u64) {
-        let base = region.addr();
+    unsafe fn initialize(region: &QueueRegion, layout: &QueueLayout, identifier: u64) {
+        let base = region.base;
 
         // Global consumer-ownership table: every index free.
         // SAFETY: `consumer_state_offset` lies within the region (>= `layout.total`).
@@ -655,13 +854,13 @@ impl SharedQueue {
         // Header initialization publishes the queue, so it runs after every
         // other region section is initialized.
         let header = base.cast();
-        // SAFETY: region is page-aligned, large enough for the header, uniquely
+        // SAFETY: region is queue-aligned, large enough for the header, uniquely
         // initialized here, and all non-header sections are initialized above.
         unsafe { SharedQueueHeader::init(header, layout, identifier) };
     }
 
-    fn from_region(region: Arc<Region>, layout: QueueLayout) -> Self {
-        let base = region.addr();
+    fn from_region(region: QueueRegion, layout: QueueLayout) -> Self {
+        let base = region.base;
         let header = base.cast();
         // SAFETY: offsets lie within the region.
         let consumer_state_block = unsafe { base.byte_add(layout.consumer_state_offset) };
@@ -810,7 +1009,7 @@ impl SharedQueue {
         identifier: u64,
     ) -> Result<Self, Error> {
         let layout = QueueLayout::new::<T>(config)?;
-        file.set_len(layout.total as u64)?;
+        file.set_len(u64::try_from(layout.total).map_err(|_| Error::InvalidBufferSize)?)?;
         let region = Region::map_file(file, layout.total)?;
         // SAFETY: caller guarantees this mapping is initialized exactly once.
         unsafe { Self::create_in_region::<T>(&region, config, identifier) }
@@ -821,7 +1020,11 @@ impl SharedQueue {
     /// # Safety
     /// - `file` must refer to a live broadcast queue, not resized while joined.
     unsafe fn join<T>(file: &File) -> Result<Self, Error> {
-        let file_size = file.metadata()?.len() as usize;
+        let file_size =
+            usize::try_from(file.metadata()?.len()).map_err(|_| Error::InvalidBufferSize)?;
+        if file_size < size_of::<SharedQueueHeader>() || file_size > isize::MAX as usize {
+            return Err(Error::InvalidBufferSize);
+        }
         let region = Region::map_file(file, file_size)?;
         // SAFETY: validated against the stored header.
         unsafe { Self::join_region::<T>(&region) }
@@ -833,7 +1036,11 @@ impl SharedQueue {
     /// # Safety
     /// - `file` must refer to a live broadcast queue, not resized while joined.
     unsafe fn join_untyped(file: &File) -> Result<Self, Error> {
-        let file_size = file.metadata()?.len() as usize;
+        let file_size =
+            usize::try_from(file.metadata()?.len()).map_err(|_| Error::InvalidBufferSize)?;
+        if file_size < size_of::<SharedQueueHeader>() || file_size > isize::MAX as usize {
+            return Err(Error::InvalidBufferSize);
+        }
         let region = Region::map_file(file, file_size)?;
         // SAFETY: validated against the stored header.
         unsafe { Self::join_region_untyped(&region) }
@@ -843,7 +1050,7 @@ impl SharedQueue {
 impl Clone for SharedQueue {
     fn clone(&self) -> Self {
         Self {
-            region: Arc::clone(&self.region),
+            region: self.region.clone(),
             header: self.header,
             consumer_state: self.consumer_state,
             producer_blocks: self.producer_blocks,
