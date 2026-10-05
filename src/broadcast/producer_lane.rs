@@ -15,14 +15,12 @@ use crate::CacheAlignedAtomicSize;
 use super::consumer_state::LaneConsumerState;
 
 const LANE_FREE: u64 = 0;
-const LANE_CLAIMING: u64 = 1;
-const LANE_ACTIVE: u64 = 2;
-const LANE_RETIRED: u64 = 3;
+const LANE_ACTIVE: u64 = 1;
 
 /// Fixed-size head of a producer-lane block.
 #[repr(C)]
 pub(super) struct LaneHeader {
-    /// Lane ownership: `LANE_FREE`, `LANE_CLAIMING`, `LANE_ACTIVE`, or `LANE_RETIRED`.
+    /// Lane ownership: `LANE_FREE` or `LANE_ACTIVE`.
     state: AtomicU64,
     /// Count of messages refused by backpressure.
     rejected_items: AtomicU64,
@@ -62,22 +60,15 @@ pub struct LaneMetadata<'a> {
 }
 
 impl<'a> LaneMetadata<'a> {
-    /// Builds a metadata view if the lane has completed acquisition.
-    pub(super) fn try_new(header: &'a LaneHeader, lane: LaneIndex<UnverifiedLane>) -> Option<Self> {
-        let state = header.state.load(Ordering::Acquire);
-
-        let lane_is_acquired = matches!(state, LANE_ACTIVE | LANE_RETIRED);
-        if !lane_is_acquired {
-            return None;
-        }
-
-        Some(Self {
+    /// Builds a metadata view over an initialized lane header.
+    pub(super) fn new(header: &'a LaneHeader, lane: LaneIndex<UnverifiedLane>) -> Self {
+        Self {
             header,
             lane: LaneIndex {
                 index: lane.get(),
                 _state: PhantomData,
             },
-        })
+        }
     }
 
     /// Builds a metadata view over a borrowed lane header.
@@ -94,7 +85,7 @@ impl<'a> LaneMetadata<'a> {
         self.lane.get()
     }
 
-    /// Count of messages refused by backpressure on this lane.
+    /// Count of messages refused by backpressure over this lane's lifetime.
     #[inline]
     pub fn rejected_items(&self) -> u64 {
         self.header.rejected_items.load(Ordering::Relaxed)
@@ -244,28 +235,23 @@ impl ProducerLane {
     /// `false` if already owned.
     #[must_use]
     pub(crate) fn try_acquire(&self) -> bool {
-        let acquire_result = self.header().state.compare_exchange(
-            LANE_FREE,
-            LANE_CLAIMING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        if acquire_result.is_err() {
-            return false;
-        }
-
-        self.header().state.store(LANE_ACTIVE, Ordering::Release);
-
-        true
+        self.header()
+            .state
+            .compare_exchange(LANE_FREE, LANE_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
-    /// Permanently retires the lane. A retired lane never returns to the free
-    /// pool, so a lane binds to at most one producer for the queue's lifetime.
-    pub(crate) fn retire(&self) {
+    /// Releases the lane for reuse, preserving its cursors and rejection count.
+    pub(crate) fn release(&self) {
+        // A forgotten write guard can leave uninitialized cells reserved. Reuse
+        // would publish that gap, while rewinding the reservation cursor would
+        // break the concurrent consumer-join handshake. Keep this lane claimed.
+        if self.reserved() != self.published() {
+            return;
+        }
         let _ = self.header().state.compare_exchange(
             LANE_ACTIVE,
-            LANE_RETIRED,
+            LANE_FREE,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
@@ -359,7 +345,7 @@ mod tests {
     }
 
     fn metadata(lane: &ProducerLane) -> LaneMetadata<'_> {
-        LaneMetadata::try_new(lane.header(), LaneIndex::new(0)).expect("lane is active or retired")
+        LaneMetadata::new(lane.header(), LaneIndex::new(0))
     }
 
     /// Reserves, writes, and publishes one value; `false` on backpressure.
@@ -382,39 +368,20 @@ mod tests {
     }
 
     #[test]
-    fn retired_lane_is_never_reclaimed() {
+    fn released_lane_can_be_reclaimed() {
         let (_region, lane) = lane(4, 1);
         assert!(lane.try_acquire());
-        lane.retire();
+        lane.release();
+        assert!(lane.try_acquire());
         assert!(!lane.try_acquire());
     }
 
     #[test]
-    fn never_owned_lane_has_not_completed_acquisition() {
+    fn never_owned_lane_has_metadata() {
         let (_region, lane) = lane(4, 1);
-
-        let metadata = LaneMetadata::try_new(lane.header(), LaneIndex::new(0));
-
-        assert!(metadata.is_none());
-    }
-
-    #[test]
-    fn claiming_lane_has_not_completed_acquisition() {
-        let (_region, lane) = lane(4, 1);
-        let header = lane.header();
-        header
-            .state
-            .compare_exchange(
-                LANE_FREE,
-                LANE_CLAIMING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .expect("lane is free");
-
-        let metadata = LaneMetadata::try_new(lane.header(), LaneIndex::new(0));
-
-        assert!(metadata.is_none());
+        let metadata = metadata(&lane);
+        assert_eq!(metadata.lane(), 0);
+        assert_eq!(metadata.rejected_items(), 0);
     }
 
     #[test]
@@ -433,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_lane_keeps_the_rejected_items_count() {
+    fn released_lane_keeps_the_rejected_items_count() {
         let (_region, mut lane) = lane(4, 1);
         let _ = lane.try_acquire();
         let _ = join_consumer(&lane, 0);
@@ -442,7 +409,7 @@ mod tests {
         }
         let _ = publish_value(&mut lane, 99);
 
-        lane.retire();
+        lane.release();
 
         assert_eq!(metadata(&lane).rejected_items(), 1);
     }
