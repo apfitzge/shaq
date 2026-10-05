@@ -9,7 +9,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{fence, AtomicU64, Ordering};
 use std::marker::PhantomData;
 
-use crate::broadcast::{InitializedLane, LaneIndex, ProducerId, UnverifiedLane};
+use crate::broadcast::{InitializedLane, LaneIndex, UnverifiedLane};
 use crate::CacheAlignedAtomicSize;
 
 use super::consumer_state::LaneConsumerState;
@@ -24,8 +24,6 @@ const LANE_RETIRED: u64 = 3;
 pub(super) struct LaneHeader {
     /// Lane ownership: `LANE_FREE`, `LANE_CLAIMING`, `LANE_ACTIVE`, or `LANE_RETIRED`.
     state: AtomicU64,
-    /// Supplied [`ProducerId`], meaningful once the lane is active or retired.
-    producer_id: AtomicU64,
     /// Count of messages refused by backpressure.
     rejected_items: AtomicU64,
     /// Claimed-up-to sequence: advanced before a ring cell is written.
@@ -96,12 +94,6 @@ impl<'a> LaneMetadata<'a> {
         self.lane.get()
     }
 
-    /// The producer chosen [`ProducerId`] permanently associated with this lane.
-    #[inline]
-    pub fn producer_id(&self) -> ProducerId {
-        ProducerId::new(self.header.producer_id.load(Ordering::Relaxed))
-    }
-
     /// Count of messages refused by backpressure on this lane.
     #[inline]
     pub fn rejected_items(&self) -> u64 {
@@ -113,7 +105,6 @@ impl core::fmt::Debug for LaneMetadata<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LaneMetadata")
             .field("lane", &self.lane())
-            .field("producer_id", &self.producer_id())
             .field("rejected_items", &self.rejected_items())
             .finish()
     }
@@ -162,7 +153,6 @@ impl ProducerLane {
     pub(crate) unsafe fn init(block: NonNull<u8>, consumer_slots: usize) {
         let header = LaneHeader {
             state: AtomicU64::new(LANE_FREE),
-            producer_id: AtomicU64::new(0),
             rejected_items: AtomicU64::new(0),
             producer_reservation: CacheAlignedAtomicSize::default(),
             producer_publication: CacheAlignedAtomicSize::default(),
@@ -250,10 +240,10 @@ impl ProducerLane {
         unsafe { self.ring.byte_add(offset) }
     }
 
-    /// Claims the lane for a producer, installing its `producer_id`. Returns
+    /// Claims the lane for a producer. Returns
     /// `false` if already owned.
     #[must_use]
-    pub(crate) fn try_acquire(&self, producer_id: ProducerId) -> bool {
+    pub(crate) fn try_acquire(&self) -> bool {
         let acquire_result = self.header().state.compare_exchange(
             LANE_FREE,
             LANE_CLAIMING,
@@ -264,10 +254,6 @@ impl ProducerLane {
         if acquire_result.is_err() {
             return false;
         }
-
-        self.header()
-            .producer_id
-            .store(producer_id.get(), Ordering::Relaxed);
 
         self.header().state.store(LANE_ACTIVE, Ordering::Release);
 
@@ -348,8 +334,6 @@ mod tests {
 
     type Payload = u64;
 
-    const BOGUS_PRODUCER_ID: ProducerId = ProducerId::new(1111);
-
     /// Allocates and initializes a standalone lane block.
     fn lane(capacity: u32, consumer_slots: usize) -> (std::sync::Arc<Region>, ProducerLane) {
         let payload_layout = Layout::new::<Payload>();
@@ -393,16 +377,16 @@ mod tests {
     #[test]
     fn lane_ownership_is_exclusive() {
         let (_region, lane) = lane(4, 1);
-        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
-        assert!(!lane.try_acquire(BOGUS_PRODUCER_ID));
+        assert!(lane.try_acquire());
+        assert!(!lane.try_acquire());
     }
 
     #[test]
     fn retired_lane_is_never_reclaimed() {
         let (_region, lane) = lane(4, 1);
-        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
+        assert!(lane.try_acquire());
         lane.retire();
-        assert!(!lane.try_acquire(BOGUS_PRODUCER_ID));
+        assert!(!lane.try_acquire());
     }
 
     #[test]
@@ -427,7 +411,6 @@ mod tests {
                 Ordering::Acquire,
             )
             .expect("lane is free");
-        header.producer_id.store(42, Ordering::Relaxed);
 
         let metadata = LaneMetadata::try_new(lane.header(), LaneIndex::new(0));
 
@@ -435,19 +418,9 @@ mod tests {
     }
 
     #[test]
-    fn acquiring_installs_the_producer_id() {
-        let (_region, lane) = lane(4, 1);
-        let producer_id = ProducerId::new(42);
-
-        let _ = lane.try_acquire(producer_id);
-
-        assert_eq!(metadata(&lane).producer_id(), producer_id);
-    }
-
-    #[test]
     fn refused_reserves_count_rejected_items() {
         let (_region, mut lane) = lane(4, 1);
-        let _ = lane.try_acquire(BOGUS_PRODUCER_ID);
+        let _ = lane.try_acquire();
         let _ = join_consumer(&lane, 0);
         for value in 0..4u64 {
             let _ = publish_value(&mut lane, value);
@@ -460,20 +433,9 @@ mod tests {
     }
 
     #[test]
-    fn retired_lane_keeps_the_last_owner_id() {
-        let (_region, lane) = lane(4, 1);
-        let producer_id = ProducerId::new(42);
-        let _ = lane.try_acquire(producer_id);
-
-        lane.retire();
-
-        assert_eq!(metadata(&lane).producer_id(), producer_id);
-    }
-
-    #[test]
     fn retired_lane_keeps_the_rejected_items_count() {
         let (_region, mut lane) = lane(4, 1);
-        let _ = lane.try_acquire(ProducerId::new(42));
+        let _ = lane.try_acquire();
         let _ = join_consumer(&lane, 0);
         for value in 0..4u64 {
             let _ = publish_value(&mut lane, value);
@@ -488,7 +450,7 @@ mod tests {
     #[test]
     fn publishes_and_advances_cursors() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
+        assert!(lane.try_acquire());
         for value in 0..4u64 {
             assert!(publish_value(&mut lane, value * 10));
         }
@@ -502,7 +464,7 @@ mod tests {
     #[test]
     fn reserves_and_publishes_a_batch() {
         let (_region, mut lane) = lane(8, 1);
-        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
+        assert!(lane.try_acquire());
         let count = NonZeroUsize::new(3).unwrap();
         let start = lane.try_reserve(count).expect("reserve");
         for offset in 0..count.get() {
@@ -526,7 +488,7 @@ mod tests {
     #[test]
     fn reserve_rejects_count_above_capacity() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
+        assert!(lane.try_acquire());
         assert!(lane.try_reserve(NonZeroUsize::new(5).unwrap()).is_none());
         // A caller error is not backpressure, so it is not counted as
         // rejected items.
@@ -536,7 +498,7 @@ mod tests {
     #[test]
     fn no_active_consumers_allows_free_overwrite() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
+        assert!(lane.try_acquire());
         // Publish well past one revolution; with no active consumer there is
         // nothing to protect, so every reserve succeeds.
         for value in 0..16u64 {
@@ -552,7 +514,7 @@ mod tests {
     #[test]
     fn backpressure_when_consumer_lags() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
+        assert!(lane.try_acquire());
         // Join consumer 0; nothing published yet, so it starts at sequence 0.
         assert_eq!(join_consumer(&lane, 0), 0);
 
@@ -578,7 +540,7 @@ mod tests {
     #[test]
     fn released_consumer_no_longer_constrains() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
+        assert!(lane.try_acquire());
         assert_eq!(join_consumer(&lane, 0), 0);
         for value in 0..4u64 {
             assert!(publish_value(&mut lane, value));
