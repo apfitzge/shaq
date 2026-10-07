@@ -9,6 +9,9 @@ repository = "https://github.com/anza-xyz/shaq"
 license = "Apache-2.0"
 edition = "2021"
 
+[dependencies]
+loom = { version = "0.7.2", optional = true }
+
 [target."cfg(unix)".dependencies]
 libc = { version = "0.2.180" }
 
