@@ -2,11 +2,11 @@
 //! ownership state, its reserve/publication cursors, the per-consumer reserve
 //! limits, and the ring of payloads. See [`ProducerLane`].
 
+use crate::sync::atomic::{fence, AtomicU64, Ordering};
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::sync::atomic::{fence, AtomicU64, Ordering};
 use std::marker::PhantomData;
 
 use crate::broadcast::{InitializedLane, LaneIndex, UnverifiedLane};
@@ -312,7 +312,7 @@ impl ProducerLane {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     use crate::shmem::Region;

@@ -30,11 +30,9 @@
 //! and compare the wait oversleeps; that is bounded by the timeout and
 //! astronomically unlikely.
 
+use crate::sync::atomic::{fence, AtomicUsize, Ordering};
 use crate::{error::WaitError, CacheAlignedAtomicSize};
-use core::{
-    hint::spin_loop,
-    sync::atomic::{fence, AtomicUsize, Ordering},
-};
+use core::hint::spin_loop;
 use std::time::{Duration, Instant};
 
 /// Snapshot of a queue's 64-bit publication cursor.
@@ -45,6 +43,7 @@ fn deadline_from_timeout(timeout: Duration) -> Option<Instant> {
     Instant::now().checked_add(timeout)
 }
 
+#[cfg(not(feature = "loom"))]
 fn remaining_until(deadline: Instant) -> Result<Duration, WaitError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -208,11 +207,11 @@ const MAX_WAKE_COUNT: usize = i32::MAX as usize;
 /// `check` scale this down so the total spin work stays comparable.
 pub(crate) const SPIN_ATTEMPTS: usize = 2048;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "loom")))]
 mod imp {
     use super::{remaining_until, SequenceNumber};
     use crate::error::WaitError;
-    use core::sync::atomic::AtomicUsize;
+    use crate::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
     /// Returns the futex word: the low 32 bits of the 64-bit cursor, the
@@ -337,11 +336,11 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(feature = "loom")))]
 mod imp {
     use super::{remaining_until, SequenceNumber};
     use crate::error::WaitError;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use crate::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     /// Polls until `cursor` no longer equals `expected` or timeout elapses,
@@ -368,4 +367,89 @@ mod imp {
 
     /// No-ops because spin waiters observe the shared cursor directly.
     pub(super) fn wake(_cursor: &AtomicUsize, _count: u32) {}
+}
+
+// Model the kernel's atomic compare-and-sleep operation. Timeouts and spurious
+// wakes are omitted; threads remain asleep until explicitly woken.
+#[cfg(feature = "loom")]
+mod imp {
+    use super::SequenceNumber;
+    use crate::{
+        error::WaitError,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use loom::{sync::Mutex, thread};
+    use std::time::Instant;
+
+    loom::lazy_static! {
+        static ref SLEEPERS: Mutex<Vec<(usize, thread::Thread)>> = Mutex::new(Vec::new());
+    }
+
+    pub(super) fn wait(
+        cursor: &AtomicUsize,
+        expected: SequenceNumber,
+        deadline: Option<Instant>,
+    ) -> Result<(), WaitError> {
+        assert!(
+            deadline.is_none(),
+            "Loom futex model does not model timeouts"
+        );
+        {
+            // Serialize the comparison and sleeper registration against wake.
+            let mut sleepers = SLEEPERS.lock().unwrap();
+            if cursor.load(Ordering::Relaxed) as u32 != expected as u32 {
+                return Ok(());
+            }
+            sleepers.push((cursor as *const AtomicUsize as usize, thread::current()));
+        }
+        // Unpark retains a token if wake happens between registration and park.
+        thread::park();
+        Ok(())
+    }
+
+    pub(super) fn wake(cursor: &AtomicUsize, mut count: u32) {
+        let address = cursor as *const AtomicUsize as usize;
+        let mut sleepers = SLEEPERS.lock().unwrap();
+        let mut index = 0;
+        while index < sleepers.len() && count > 0 {
+            if sleepers[index].0 == address {
+                let (_, sleeper) = sleepers.swap_remove(index);
+                sleeper.unpark();
+                count -= 1;
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use loom::{sync::Arc, thread};
+
+    #[test]
+    fn publication_wakes_waiter() {
+        loom::model(|| {
+            let waiters = Arc::new(Waiters::default());
+            let published = Arc::new(AtomicUsize::new(0));
+            let wake_word = Arc::new(AtomicUsize::new(0));
+            let consumer = {
+                let waiters = waiters.clone();
+                let published = published.clone();
+                let wake_word = wake_word.clone();
+                thread::spawn(move || {
+                    waiters
+                        .wait_for(&wake_word, 0, Duration::MAX, || {
+                            (published.load(Ordering::Acquire) == 1).then_some(())
+                        })
+                        .unwrap();
+                })
+            };
+
+            published.store(1, Ordering::Release);
+            waiters.bump_and_wake(&wake_word);
+            consumer.join().unwrap();
+        });
+    }
 }

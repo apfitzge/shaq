@@ -1,4 +1,4 @@
-use core::sync::atomic::AtomicUsize;
+use crate::sync::atomic::AtomicUsize;
 
 // NB: To simplify casting we only support 64bit or wider systems.
 const _: () = assert!(size_of::<usize>() >= size_of::<u64>());
@@ -9,6 +9,7 @@ mod futex;
 pub mod mpmc;
 mod shmem;
 pub mod spsc;
+mod sync;
 
 /// Stored queue identifier when no identifier is supplied.
 pub(crate) const DEFAULT_QUEUE_IDENTIFIER: u64 = 0;
@@ -54,7 +55,7 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::{checked_queue_size, error::Error::InvalidBufferSize, mpmc, spsc};
 

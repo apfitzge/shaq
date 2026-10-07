@@ -58,12 +58,12 @@ mod producer_lane;
 
 pub use producer_lane::LaneMetadata;
 
+use crate::sync::atomic::{AtomicU64, Ordering};
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
 use std::fs::File;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -221,6 +221,8 @@ impl Broadcast<UnknownType> {
     /// Only untyped consumers are reachable from [`Broadcast<UnknownType>`]
     ///
     /// ```
+    /// # #[cfg(not(feature = "loom"))]
+    /// # {
     /// use shaq::broadcast::{Broadcast, BroadcastConfig, UnknownType};
     /// use std::fs::OpenOptions;
     ///
@@ -233,6 +235,7 @@ impl Broadcast<UnknownType> {
     /// // SAFETY: `u64`'s entire representation is initialized.
     /// assert!(unsafe { broadcast.slice_consumer() }.is_ok());
     /// # std::fs::remove_file(&path).ok();
+    /// # }
     /// ```
     ///
     /// #### [`producer`](Broadcast::producer)/[`consumer`](Broadcast::consumer) can not be created
@@ -1949,7 +1952,7 @@ impl Drop for SliceReadBatch<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     #[cfg(not(miri))]
