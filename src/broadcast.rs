@@ -1952,6 +1952,9 @@ impl Drop for SliceReadBatch<'_> {
     }
 }
 
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests;
+
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;

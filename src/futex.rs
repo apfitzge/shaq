@@ -422,34 +422,3 @@ mod imp {
         }
     }
 }
-
-#[cfg(all(test, feature = "loom"))]
-mod loom_tests {
-    use super::*;
-    use loom::{sync::Arc, thread};
-
-    #[test]
-    fn publication_wakes_waiter() {
-        loom::model(|| {
-            let waiters = Arc::new(Waiters::default());
-            let published = Arc::new(AtomicUsize::new(0));
-            let wake_word = Arc::new(AtomicUsize::new(0));
-            let consumer = {
-                let waiters = waiters.clone();
-                let published = published.clone();
-                let wake_word = wake_word.clone();
-                thread::spawn(move || {
-                    waiters
-                        .wait_for(&wake_word, 0, Duration::MAX, || {
-                            (published.load(Ordering::Acquire) == 1).then_some(())
-                        })
-                        .unwrap();
-                })
-            };
-
-            published.store(1, Ordering::Release);
-            waiters.bump_and_wake(&wake_word);
-            consumer.join().unwrap();
-        });
-    }
-}
