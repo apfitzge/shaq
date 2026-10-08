@@ -84,7 +84,7 @@ jobs:
       - name: Run Loom tests
         env:
           RUSTFLAGS: "--cfg loom"
-        run: cargo test --locked --lib broadcast::loom_tests
+        run: cargo test --locked --release --lib broadcast::loom_tests
 
   minimal-versions:
     name: Check minimal-versions
