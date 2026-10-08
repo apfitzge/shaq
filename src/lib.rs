@@ -55,7 +55,7 @@ impl core::ops::Deref for CacheAlignedAtomicSize {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::{checked_queue_size, error::Error::InvalidBufferSize, mpmc, spsc};
 

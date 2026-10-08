@@ -302,7 +302,7 @@ impl LaneConsumerState {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::shmem::Region;

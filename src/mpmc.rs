@@ -1403,7 +1403,7 @@ impl<T> Drop for ReadBatchIntoIter<'_, T> {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     #[cfg(not(miri))]

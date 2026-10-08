@@ -9,8 +9,8 @@ repository = "https://github.com/anza-xyz/shaq"
 license = "Apache-2.0"
 edition = "2021"
 
-[dependencies]
-loom = { version = "0.7.2", optional = true }
+[target."cfg(loom)".dependencies]
+loom = "0.7.2"
 
 [target."cfg(unix)".dependencies]
 libc = { version = "0.2.180" }
@@ -31,6 +31,7 @@ core_affinity = "0.8.3"
 ctrlc = "3.5.2"
 
 [lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]

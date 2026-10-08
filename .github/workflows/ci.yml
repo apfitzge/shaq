@@ -82,7 +82,9 @@ jobs:
           toolchain: stable
 
       - name: Run Loom tests
-        run: cargo test --locked --features loom --lib broadcast::loom_tests
+        env:
+          RUSTFLAGS: "--cfg loom"
+        run: cargo test --locked --lib broadcast::loom_tests
 
   minimal-versions:
     name: Check minimal-versions

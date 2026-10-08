@@ -221,7 +221,7 @@ impl Broadcast<UnknownType> {
     /// Only untyped consumers are reachable from [`Broadcast<UnknownType>`]
     ///
     /// ```
-    /// # #[cfg(not(feature = "loom"))]
+    /// # #[cfg(not(loom))]
     /// # {
     /// use shaq::broadcast::{Broadcast, BroadcastConfig, UnknownType};
     /// use std::fs::OpenOptions;
@@ -1952,10 +1952,10 @@ impl Drop for SliceReadBatch<'_> {
     }
 }
 
-#[cfg(all(test, feature = "loom"))]
+#[cfg(all(test, loom))]
 mod loom_tests;
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     #[cfg(not(miri))]

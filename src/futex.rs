@@ -43,7 +43,7 @@ fn deadline_from_timeout(timeout: Duration) -> Option<Instant> {
     Instant::now().checked_add(timeout)
 }
 
-#[cfg(not(feature = "loom"))]
+#[cfg(not(loom))]
 fn remaining_until(deadline: Instant) -> Result<Duration, WaitError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -207,7 +207,7 @@ const MAX_WAKE_COUNT: usize = i32::MAX as usize;
 /// `check` scale this down so the total spin work stays comparable.
 pub(crate) const SPIN_ATTEMPTS: usize = 2048;
 
-#[cfg(all(target_os = "linux", not(feature = "loom")))]
+#[cfg(all(target_os = "linux", not(loom)))]
 mod imp {
     use super::{remaining_until, SequenceNumber};
     use crate::error::WaitError;
@@ -336,7 +336,7 @@ mod imp {
     }
 }
 
-#[cfg(all(not(target_os = "linux"), not(feature = "loom")))]
+#[cfg(all(not(target_os = "linux"), not(loom)))]
 mod imp {
     use super::{remaining_until, SequenceNumber};
     use crate::error::WaitError;
@@ -371,7 +371,7 @@ mod imp {
 
 // Model the kernel's atomic compare-and-sleep operation. Timeouts and spurious
 // wakes are omitted; threads remain asleep until explicitly woken.
-#[cfg(feature = "loom")]
+#[cfg(loom)]
 mod imp {
     use super::SequenceNumber;
     use crate::{

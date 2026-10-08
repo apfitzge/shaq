@@ -1,7 +1,7 @@
 //! Synchronization primitives selected for production or Loom model checking.
 
-#[cfg(not(feature = "loom"))]
+#[cfg(not(loom))]
 pub(crate) use core::sync::atomic;
 
-#[cfg(feature = "loom")]
+#[cfg(loom)]
 pub(crate) use loom::sync::atomic;
