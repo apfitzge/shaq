@@ -66,9 +66,10 @@ fn joining_consumer_protects_unread_cell() {
 
 // Tests the release/acquire producer ownership handover. A replacement that
 // acquires a released lane must observe the previous owner's reservation and
-// publication cursors and continue from them rather than restarting at zero.
+// publication cursors and respect a racing consumer's join limit. Ownership
+// transfer must preserve the ordering required by the join handshake.
 #[test]
-fn replacement_producer_preserves_cursors() {
+fn replacement_producer_respects_joining_consumer() {
     loom::model(|| {
         let broadcast = broadcast();
         let mut producer = broadcast.producer().unwrap();
@@ -78,18 +79,35 @@ fn replacement_producer_preserves_cursors() {
             drop(producer);
         });
 
-        // Attempt acquisition concurrently; failure means the old owner is live.
-        // On success, acquisition must observe its completed write.
-        if let Ok(mut replacement) = broadcast.producer() {
-            assert_eq!(replacement.lane.reserved(), 1);
-            assert_eq!(replacement.lane.published(), 1);
-            // No consumers: the replacement can reuse the cell at sequence one.
-            assert!(replacement.try_write(1).is_ok());
-            assert_eq!(replacement.lane.reserved(), 2);
-            assert_eq!(replacement.lane.published(), 2);
-        }
+        let replacement_broadcast = broadcast.clone();
+        let replacement = thread::spawn(move || {
+            // Failure means the old owner is live. Successful acquisition must
+            // observe its completed write before checking the consumer's limit.
+            if let Ok(mut replacement) = replacement_broadcast.producer() {
+                assert_eq!(replacement.lane.reserved(), 1);
+                assert_eq!(replacement.lane.published(), 1);
+                // Refuse this write if the joining consumer pins the only cell.
+                if replacement.try_write(1).is_ok() {
+                    assert_eq!(replacement.lane.published(), 2);
+                }
+            }
+        });
 
+        let mut consumer = broadcast.consumer().unwrap();
+        let next = consumer.core.next_for_lane(0);
+        let guard = consumer.try_reserve_read();
         writer.join().unwrap();
+        replacement.join().unwrap();
+
+        // Neither owner may advance past the cell protected by the consumer.
+        let lane = broadcast.shared_queue.producer_lanes().next().unwrap();
+        let reserved = lane.reserved();
+        assert!(reserved >= next, "reservation precedes the join position");
+        assert!(
+            reserved - next <= CAPACITY,
+            "replacement reserved an unread cell"
+        );
+        drop(guard);
     });
 }
 
