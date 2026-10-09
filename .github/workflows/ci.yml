@@ -84,6 +84,7 @@ jobs:
 
       - name: Run Loom tests
         env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
           RUSTFLAGS: "--cfg loom"
         run: cargo test --locked --release --lib broadcast::loom_tests
 
