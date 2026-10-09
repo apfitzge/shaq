@@ -3,6 +3,7 @@ use crate::{
     error::{Error, WaitError},
     futex::{Waiters, SPIN_ATTEMPTS},
     shmem::Region,
+    sync::atomic::{AtomicU64, Ordering},
     CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION,
 };
 use core::{
@@ -12,15 +13,7 @@ use core::{
     ops::{Index, Range},
     ptr::NonNull,
 };
-use std::{
-    fs::File,
-    num::NonZeroUsize,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{fs::File, num::NonZeroUsize, sync::Arc, time::Duration};
 
 /// Magic signature for SPSC queues in shared memory.
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqspsc");
@@ -1116,7 +1109,7 @@ impl SharedQueueHeader {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     #[cfg(not(miri))]

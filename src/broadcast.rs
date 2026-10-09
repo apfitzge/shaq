@@ -58,12 +58,12 @@ mod producer_lane;
 
 pub use producer_lane::LaneMetadata;
 
+use crate::sync::atomic::{AtomicU64, Ordering};
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
 use std::fs::File;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -1949,7 +1949,10 @@ impl Drop for SliceReadBatch<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, loom))]
+mod loom_tests;
+
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     #[cfg(not(miri))]

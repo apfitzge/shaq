@@ -3,9 +3,9 @@
 //! This module owns the global consumer-index ownership table and the per-lane
 //! reserve-limit slots that publish each consumer's read progress.
 
+use crate::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use core::mem::{align_of, size_of, MaybeUninit};
 use core::ptr::NonNull;
-use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 
 use crate::error::Error;
 use crate::CacheAlignedAtomicSize;
@@ -302,7 +302,7 @@ impl LaneConsumerState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::shmem::Region;
