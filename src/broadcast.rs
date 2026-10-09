@@ -221,8 +221,6 @@ impl Broadcast<UnknownType> {
     /// Only untyped consumers are reachable from [`Broadcast<UnknownType>`]
     ///
     /// ```
-    /// # #[cfg(not(loom))]
-    /// # {
     /// use shaq::broadcast::{Broadcast, BroadcastConfig, UnknownType};
     /// use std::fs::OpenOptions;
     ///
@@ -235,7 +233,6 @@ impl Broadcast<UnknownType> {
     /// // SAFETY: `u64`'s entire representation is initialized.
     /// assert!(unsafe { broadcast.slice_consumer() }.is_ok());
     /// # std::fs::remove_file(&path).ok();
-    /// # }
     /// ```
     ///
     /// #### [`producer`](Broadcast::producer)/[`consumer`](Broadcast::consumer) can not be created
