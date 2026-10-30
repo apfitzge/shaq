@@ -649,6 +649,11 @@ impl<T> SharedQueue<T> {
         loop {
             let consumer_release = header.consumer_release.load(Ordering::Acquire);
             let used = producer_reservation.wrapping_sub(consumer_release);
+            let reservation_is_stale = used > capacity;
+            if reservation_is_stale {
+                producer_reservation = header.producer_reservation.load(Ordering::Relaxed);
+                continue;
+            }
             let limit = capacity.wrapping_sub(count.get());
             if used > limit {
                 return None;
@@ -681,7 +686,12 @@ impl<T> SharedQueue<T> {
         loop {
             let producer_publication = header.producer_publication.load(Ordering::Acquire);
             let available = producer_publication.wrapping_sub(consumer_reservation);
-            if available == 0 || available > capacity {
+            let reservation_is_stale = available > capacity;
+            if reservation_is_stale {
+                consumer_reservation = header.consumer_reservation.load(Ordering::Relaxed);
+                continue;
+            }
+            if available == 0 {
                 return None;
             }
 
