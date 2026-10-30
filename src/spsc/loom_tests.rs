@@ -8,8 +8,8 @@
 use super::*;
 use loom::{cell::UnsafeCell, sync::Arc, thread};
 
-fn queue(capacity: usize, position: usize) -> (Producer<usize>, Consumer<usize>) {
-    let size = minimum_region_size::<usize>(capacity);
+fn queue<T>(capacity: usize, position: usize) -> (Producer<T>, Consumer<T>) {
+    let size = minimum_region_size::<T>(capacity);
     let region = Region::alloc(NonZeroUsize::new(size).unwrap()).unwrap();
     let header = region.addr().cast::<SharedQueueHeader>();
     // Zeroed memory does not construct atomic objects in Loom's runtime.
@@ -156,6 +156,49 @@ fn batch_publication_orders_payload_across_buffer_wrap() {
 }
 
 #[test]
+fn repeated_batches_preserve_fifo_during_slot_reuse() {
+    loom::model(|| {
+        let (mut producer, mut consumer, cells) = queue_with_payloads(2, 0);
+        write_batch(&mut producer, &cells, &[10, 11]);
+        assert_eq!(producer.try_write(0), Err(0));
+
+        let writer_cells = cells.clone();
+        let writer = thread::spawn(move || {
+            let mut written = 0;
+            // Bounded attempts let Loom explore both full and reusable slots
+            // without an unbounded retry loop.
+            for _ in 0..2 {
+                let mut batch = producer.write_batch();
+                let index = batch.producer.queue.mask(batch.producer.queue.cached_write);
+                if write(&mut batch, &writer_cells[index], 12 + written) {
+                    written += 1;
+                }
+            }
+            (producer, written)
+        });
+
+        let mut next = 10;
+        for _ in 0..2 {
+            if let Some(items) = read_batch(&mut consumer, &cells, 2) {
+                for value in items {
+                    assert_eq!(value, next);
+                    next += 1;
+                }
+            }
+        }
+        let (_producer, written) = writer.join().unwrap();
+        if let Some(items) = read_batch(&mut consumer, &cells, 2) {
+            for value in items {
+                assert_eq!(value, next);
+                next += 1;
+            }
+        }
+        assert_eq!(next, 12 + written);
+        assert!(read_batch(&mut consumer, &cells, 2).is_none());
+    });
+}
+
+#[test]
 fn read_reservation_orders_slot_reuse_across_cursor_wrap() {
     loom::model(|| {
         let (mut producer, mut consumer) = queue(1, usize::MAX);
@@ -201,6 +244,114 @@ fn consuming_iterator_keeps_entire_reservation_until_drop() {
         drop(iter);
         producer.try_write(2).unwrap();
         assert_eq!(consumer.try_read(), Some(2));
+    });
+}
+
+struct DropPayload(Option<(Payloads, usize)>);
+
+impl Drop for DropPayload {
+    fn drop(&mut self) {
+        if let Some((cells, index)) = &self.0 {
+            cells[*index].with_mut(|ptr| {
+                // SAFETY: the consumer still owns this slot while dropping its
+                // value. Loom checks that reuse cannot race the destructor.
+                assert_eq!(unsafe { *ptr }, 1);
+                thread::yield_now();
+                // SAFETY: the same tracked exclusive access is still held.
+                unsafe { *ptr = 2 };
+            });
+        }
+    }
+}
+
+fn queue_with_drop_payloads() -> (Producer<DropPayload>, Consumer<DropPayload>, Payloads) {
+    // The two-item reservation crosses the physical buffer boundary.
+    let (mut producer, consumer) = queue(2, 1);
+    let cells = Arc::new(vec![UnsafeCell::new(1), UnsafeCell::new(1)]);
+    for index in [1, 0] {
+        assert!(producer
+            .try_write(DropPayload(Some((cells.clone(), index))))
+            .is_ok());
+    }
+    (producer, consumer, cells)
+}
+
+fn try_reuse_after_drops(
+    producer: &mut Producer<DropPayload>,
+    cells: &[UnsafeCell<usize>],
+) -> bool {
+    producer.sync();
+    // SAFETY: a successful reservation is initialized below before commit.
+    let Some(slot) = (unsafe { producer.reserve() }) else {
+        return false;
+    };
+    // The complete read reservation must remain pinned until every destructor
+    // finishes. Check tracked state before writing to the actual raw slot.
+    for cell in cells {
+        assert_eq!(
+            read(cell),
+            2,
+            "slot released before all destructors finished"
+        );
+    }
+    // SAFETY: this slot was exclusively reserved, and DropPayload(None) is valid.
+    unsafe { slot.write(DropPayload(None)) };
+    producer.commit();
+    true
+}
+
+#[test]
+fn batch_drop_finishes_all_destructors_before_slot_reuse() {
+    loom::model(|| {
+        let (mut producer, mut consumer, cells) = queue_with_drop_payloads();
+        let batch = consumer
+            .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+
+        let writer_cells = cells.clone();
+        let writer = thread::spawn(move || {
+            let reused = try_reuse_after_drops(&mut producer, &writer_cells);
+            (producer, reused)
+        });
+        drop(batch);
+        let (mut producer, reused) = writer.join().unwrap();
+        if !reused {
+            assert!(try_reuse_after_drops(&mut producer, &cells));
+        }
+        // Both slots become available together once all destructors finish.
+        assert!(try_reuse_after_drops(&mut producer, &cells));
+        assert!(!try_reuse_after_drops(&mut producer, &cells));
+    });
+}
+
+#[test]
+fn partial_iterator_drop_finishes_suffix_before_slot_reuse() {
+    loom::model(|| {
+        let (mut producer, mut consumer, cells) = queue_with_drop_payloads();
+        let batch = consumer
+            .try_reserve_read_batch(NonZeroUsize::new(2).unwrap())
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        let mut iter = batch.into_iter();
+        drop(iter.next().unwrap());
+        assert_eq!(read(&cells[1]), 2);
+        assert_eq!(read(&cells[0]), 1);
+
+        let writer_cells = cells.clone();
+        let writer = thread::spawn(move || {
+            let reused = try_reuse_after_drops(&mut producer, &writer_cells);
+            (producer, reused)
+        });
+        // The first item is gone, but its slot stays reserved along with the
+        // suffix until dropping the iterator finishes the remaining destructor.
+        drop(iter);
+        let (mut producer, reused) = writer.join().unwrap();
+        if !reused {
+            assert!(try_reuse_after_drops(&mut producer, &cells));
+        }
+        assert!(try_reuse_after_drops(&mut producer, &cells));
+        assert!(!try_reuse_after_drops(&mut producer, &cells));
     });
 }
 
