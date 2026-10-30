@@ -3,7 +3,8 @@
 //! Raw buffer accesses are invisible to Loom. Shadow cells model payload reads
 //! and writes inside the real queue's reservations, so missing synchronization
 //! is detected without concurrently dereferencing untracked queue payloads.
-//! These bounded models do not cover shared-memory initialization or timeouts.
+//! Initialization uses shadow metadata; allocation and mapping are not modeled.
+//! These bounded models do not cover timeouts or OS futex behavior.
 
 use super::*;
 use loom::{cell::UnsafeCell, sync::Arc, thread};
@@ -87,6 +88,51 @@ fn read_batch(
             })
             .collect(),
     )
+}
+
+#[test]
+fn initialization_publishes_header_metadata() {
+    loom::model(|| {
+        // Raw metadata accesses are invisible to Loom. The shadow starts empty
+        // and is filled before the real header publication operation.
+        let metadata = Arc::new(UnsafeCell::new((0, 0, 0)));
+        let header = Arc::new(SharedQueueHeader {
+            magic: AtomicU64::new(0),
+            version: VERSION,
+            buffer_mask: 1,
+            identifier: 42,
+            write: CacheAlignedAtomicSize::default(),
+            read: CacheAlignedAtomicSize::default(),
+            waiters: Waiters::default(),
+        });
+        assert!(!header.is_initialized());
+        let initializer_header = header.clone();
+        let initializer_metadata = metadata.clone();
+        let initializer = thread::spawn(move || {
+            initializer_metadata.with_mut(|ptr| {
+                // SAFETY: the sole initializer owns the metadata until it
+                // publishes magic. Loom checks the joining reader's ordering.
+                unsafe { *ptr = (VERSION, 1, 42) };
+            });
+            initializer_header.publish_initialization();
+        });
+
+        // The join may reject an unfinished header. Observing magic must make
+        // all initialized metadata visible without joining the writer first.
+        if header.is_initialized() {
+            metadata.with(|ptr| {
+                // SAFETY: successful initialization publication protects this
+                // access. Loom detects missing release/acquire synchronization.
+                let initialized = unsafe { *ptr };
+                assert_eq!(
+                    initialized,
+                    (header.version, header.buffer_mask, header.identifier)
+                );
+            });
+        }
+        initializer.join().unwrap();
+        assert!(header.is_initialized());
+    });
 }
 
 #[test]
@@ -352,6 +398,69 @@ fn partial_iterator_drop_finishes_suffix_before_slot_reuse() {
         }
         assert!(try_reuse_after_drops(&mut producer, &cells));
         assert!(!try_reuse_after_drops(&mut producer, &cells));
+    });
+}
+
+#[test]
+fn last_endpoint_reclaims_buffered_values() {
+    loom::model(|| {
+        let (producer, consumer, cells) = queue_with_drop_payloads();
+        let writer_cells = cells.clone();
+        let writer = thread::spawn(move || {
+            // Even if the consumer is gone, this endpoint keeps the values live.
+            for cell in writer_cells.iter() {
+                assert_eq!(read(cell), 1);
+            }
+            drop(producer);
+        });
+
+        // Either endpoint may disappear first, but neither may reclaim values
+        // while the other still owns the queue.
+        for cell in cells.iter() {
+            assert_eq!(read(cell), 1);
+        }
+        drop(consumer);
+        writer.join().unwrap();
+        for cell in cells.iter() {
+            assert_eq!(read(cell), 2);
+        }
+        // Loom checks the queue and region Arc owners for leaks as the model ends.
+    });
+}
+
+#[test]
+fn reclamation_observes_final_publication_and_consumer_progress() {
+    loom::model(|| {
+        let (mut producer, mut consumer) = queue::<DropPayload>(2, usize::MAX);
+        let cells = Arc::new(vec![UnsafeCell::new(1), UnsafeCell::new(0)]);
+        assert!(producer
+            .try_write(DropPayload(Some((cells.clone(), 0))))
+            .is_ok());
+
+        let writer_cells = cells.clone();
+        let writer = thread::spawn(move || {
+            writer_cells[1].with_mut(|ptr| {
+                // SAFETY: this value has not been published yet, so its shadow
+                // metadata is exclusively owned by the producer.
+                unsafe { *ptr = 1 };
+            });
+            assert!(producer
+                .try_write(DropPayload(Some((writer_cells, 1))))
+                .is_ok());
+            drop(producer);
+        });
+
+        // Consume only the first value. Cleanup must skip its released slot
+        // and destroy the final publication exactly once, across cursor wrap.
+        let batch = consumer.try_reserve_read_batch(NonZeroUsize::MIN).unwrap();
+        drop(batch);
+        assert_eq!(read(&cells[0]), 2);
+        drop(consumer);
+        writer.join().unwrap();
+        for cell in cells.iter() {
+            assert_eq!(read(cell), 2);
+        }
+        // Loom checks the queue and region Arc owners for leaks as the model ends.
     });
 }
 
