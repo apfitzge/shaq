@@ -1109,6 +1109,9 @@ impl SharedQueueHeader {
     }
 }
 
+#[cfg(all(test, loom))]
+mod loom_tests;
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
